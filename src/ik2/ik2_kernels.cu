@@ -3,7 +3,9 @@
 #include "ik2_iq_tables.h"
 
 #include <cuda_fp16.h>
+#ifndef STRATA_USE_HIP
 #include <cuda_fp8.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -12,6 +14,12 @@
 #include <cstring>
 
 namespace ik2::k {
+#ifdef STRATA_USE_HIP
+[[noreturn]] static void unavailable_mma(const char* name) {
+    std::fprintf(stderr, "ik2::k::%s requires CUDA tensor cores\n", name);
+    std::abort();
+}
+#endif
 namespace {
 
 void check(const char* what) {
@@ -886,6 +894,7 @@ __global__ void attn_probs_bias_f16_kernel(const float* lg, uint16_t* out16, int
     for (int j = j_hi + tid; j < nk; j += kBlk) row_out[j] = 0;
 }
 
+#ifndef STRATA_USE_HIP
 // Prefill attention in one pass (FlashAttention-2 style, tensor cores via mma.sync m16n8k16, FP16 in / F32
 // accumulate): the logits never leave registers.  A block: 64 queries (4 warps x 16) of one head against one split of
 // its keys, in tiles of 64; the online softmax in the log2 domain.  Each split writes its unnormalised output and its
@@ -1600,6 +1609,7 @@ __global__ void attn_decode_mma_combine_kernel(const float* __restrict__ o_part,
     out[(size_t) h * kFaD + d] = res;
     if (out16) out16[(size_t) h * kFaD + d] = f2h(res);
 }
+#endif
 
 template <bool WRITE_F16, bool WRITE_F32>
 __global__ void gate_mul_impl_kernel(float* o, const float* g, size_t n, uint16_t* o16) {
@@ -1979,14 +1989,14 @@ static const uint32_t h_iq3xxs_grid[256] = {IK2_IQ3XXS_GRID};
 __device__ const int8_t d_iq4nl[16] = {IK2_IQ4NL_VALUES};
 static const int8_t h_iq4nl[16] = {IK2_IQ4NL_VALUES};
 __host__ __device__ __forceinline__ uint32_t iq3xxs_grid_at(int i) {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     return __ldg(d_iq3xxs_grid + i);
 #else
     return h_iq3xxs_grid[i];
 #endif
 }
 __host__ __device__ __forceinline__ int iq4nl_at(int i) {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     return d_iq4nl[i];
 #else
     return h_iq4nl[i];
@@ -1994,7 +2004,7 @@ __host__ __device__ __forceinline__ int iq4nl_at(int i) {
 }
 // ggml's ksigns_iq2xs[s]: the 7 sign bits plus an 8th that makes the count of set bits even
 __host__ __device__ __forceinline__ uint32_t iq_signs8(uint32_t s7) {
-#ifdef __CUDA_ARCH__
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     return s7 | ((uint32_t) (__popc(s7) & 1) << 7);
 #else
     uint32_t p = s7 ^ (s7 >> 4);   // (the parity by folding: no GNU builtin, no C++20 <bit> - MSVC builds this too)
@@ -2654,6 +2664,7 @@ __global__ void nv_limb_mv(const uint8_t* const* blobs, const NvInput* packed, s
 }
 
 // Each warp multiplies 16 expert rows by the distinct token inputs in its group.
+#ifndef STRATA_USE_HIP
 __device__ __forceinline__ uint32_t ik2_fp4pair(uint32_t v, uint32_t scale) {
     const uint32_t mag = __byte_perm(0x42403c00u, 0x4a484644u, (v & 0x0707u) << 4);
     const uint32_t sign = ((v & 8u) << 12) | ((v & 0x800u) << 20);
@@ -2854,6 +2865,7 @@ experts_mma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, i
         y[(size_t) slot * C + r + 8] = tot.y;
     }
 }
+#endif
 
 template <int WARPS, int ROWS>
 __global__ void experts_gate_up_kernel(const uint8_t* const* blob, const int* tok, int ty_gate, int ty_up, size_t eb0,
@@ -3738,6 +3750,7 @@ __device__ __forceinline__ bool mv_conv_row(const MvConv& cv, int row, float x_n
 // Quantized planar Q8 GEMM for the small verify/prefill tiles. One scale covers
 // both 16-wide MMA instructions. Packing the signed bytes via 1024+u is exact
 // for all 256 inputs; the product rounds to half as in decode_q8p_f16_kernel.
+#ifndef STRATA_USE_HIP
 template <int Splits>
 __global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int K, const uint16_t* x, int T, float* out,
                             int ldy) {
@@ -3785,6 +3798,7 @@ __global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int 
         if (row + 8 < N) out[(size_t)(token0 + 1) * ldy + row + 8] = v.w;
     }
 }
+#endif
 
 template <int WARPS, int StaticK = 0>
 __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int runtime_k,
@@ -4429,6 +4443,7 @@ unsigned grid(size_t n, int b = kBlk) { return (unsigned) ((n + b - 1) / b); }
 // ---- the block path: a few tokens at once (2 .. 8, a speculative step's verify window) on the resident path
 
 // the keys of a window of T tokens at pos0 .. pos0 + T - 1: steps of 16 from the first token's k_lo to the last token
+#ifndef STRATA_USE_HIP
 __device__ __forceinline__ int wa_active_block(int pos0, int T, int window, int nw, int& k_lo, int& n_steps) {
     k_lo = window < (1 << 30) ? max(0, pos0 - window + 1) : 0;
     n_steps = (pos0 + T - k_lo + 15) >> 4;
@@ -4690,6 +4705,7 @@ __global__ void attn_block_combine_kernel(const float* __restrict__ o_part, cons
     out[(size_t) ix * kFaD + d] = res;
     if (out16) out16[(size_t) ix * kFaD + d] = f2h(res);
 }
+#endif
 
 // a few tokens' short conv (conv4_fused_kernel's arithmetic) with row strides; the history before and the inputs
 // kept for a rollback (rec_old [3][C], rec_x [T][C]: conv_hist_after's) when given
@@ -4798,6 +4814,7 @@ __global__ void group_route_kernel(const int* __restrict__ top, const float* __r
     inv[i] = i;
 }
 
+#ifndef STRATA_USE_HIP
 // A group's NVFP4 experts on the tensor cores (experts_mma_kernel for the tokens of a group): gate | up, a block 8
 // gate rows and the same 8 of up, SPLIT warps each a stride of the 64-value blocks; the B columns are (member,
 // limb) pairs - column c the member c / 2's limb c % 2 of its input (limbs [T][2][C]) - NT tiles of 8 (members <=
@@ -4926,6 +4943,7 @@ experts_block_down_kernel(const uint8_t* const* __restrict__ blob, const int* __
         y[(size_t) slot * C + r] = tot.y, y[(size_t) slot * C + r + 8] = tot.w;
     }
 }
+#endif
 
 
 // route() for a window, a block of E threads a token (route_token_kernel's picks: the same weights to the bit)
@@ -4965,6 +4983,7 @@ __global__ void route_rows_kernel(const float* __restrict__ logits, const float*
 
 // a lane's part of a Q8_0 block of its two rows (34 bytes: the FP16 scale, 32 int8): the scales, and the values
 // 8 t .. 8 t + 7 as four pairs (2-byte loads: a block is 2-byte aligned)
+#ifndef STRATA_USE_HIP
 struct Q8Step {
     uint32_t sa, sb;
     uint32_t a[4], b[4];
@@ -5096,6 +5115,7 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
         y[(size_t) slot * C + r] = tot.y, y[(size_t) slot * C + r + 8] = tot.w;
     }
 }
+#endif
 
 }  // namespace
 
@@ -5210,6 +5230,7 @@ void attn_probs_bias_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk
                                                                                    qk_scale, bias, extent, window, sink);
     check("attn_probs_bias_f16");
 }
+#ifndef STRATA_USE_HIP
 // the Hopper kernel (wgmma) on a 9.x GPU of a build with sm_90a; IK2_WGMMA=0: the mma.sync one everywhere
 bool fa_wgmma() {
     static const int on = [] {
@@ -5239,10 +5260,14 @@ void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* 
                                                                      ml_part);
     check("attn_flash");
 }
+#endif
 void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window,
                     const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats, int n_split,
                     cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    unavailable_mma(__func__);
+#else
     if (Tq <= 0) return;
     if (D != kFaD) {
         std::fprintf(stderr, "ik2::k::attn_flash_f16: D = %d, not 128\n", D);
@@ -5261,11 +5286,15 @@ void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uin
     attn_flash_combine_kernel<<<dim3((unsigned) Tq, (unsigned) H), kFaD, 0, s>>>(o_part, ml_part, n_split, Tq, H, sink,
                                                                                  out, o_ld, 1.0f);
     check("attn_flash_combine");
+#endif
 }
 void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, float v_inv_scale, const float* bias, int extent,
                     int window, const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats,
                     int n_split, cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    unavailable_mma(__func__);
+#else
     if (Tq <= 0) return;
     if (D != kFaD) {
         std::fprintf(stderr, "ik2::k::attn_flash_fp8: D = %d, not 128\n", D);
@@ -5280,12 +5309,17 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
     attn_flash_combine_kernel<<<dim3((unsigned) Tq, (unsigned) H), kFaD, 0, s>>>(o_part, ml_part, n_split, Tq, H, sink,
                                                                                  out, o_ld, v_inv_scale);
     check("attn_flash_combine");
+#endif
 }
 int attn_flash_splits(int Tq, int H, int nk, int n_sm) {
+#ifdef STRATA_USE_HIP
+    unavailable_mma(__func__);
+#else
     const int blocks = (Tq + 16 * kFaNW - 1) / (16 * kFaNW) * H;
     const int want = (6 * n_sm + blocks - 1) / blocks;   // (about three waves of two blocks an SM)
     const int most = std::max(1, (nk + 16 * kFaBN - 1) / (16 * kFaBN));   // (>= 1024 keys a split)
     return std::max(1, std::min({want, most, 16}));
+#endif
 }
 void attn_probs_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0, float qk_scale,
                     const float* r, int d_rel, const float* proj, int extent, int window, const float* sink,
@@ -5617,8 +5651,13 @@ void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C,
     check("nv_expert_limb");
 }
 bool experts_mma_fits(int ty_gate, int ty_up, int ty_down, int C, int F) {
+#ifdef STRATA_USE_HIP
+    return false;
+#else
     return ty_gate == kNVFP4 && ty_up == kNVFP4 && ty_down == kNVFP4 && C % 64 == 0 && F % 64 == 0;
+#endif
 }
+#ifndef STRATA_USE_HIP
 static int experts_mma_split(bool gate) {
     static const int wg = getenv("IK2_EXPERT_MMA_SPLIT") ? atoi(getenv("IK2_EXPERT_MMA_SPLIT")) : 8;
     static const int wd = getenv("IK2_EXPERT_MMA_SPLIT_DOWN") ? atoi(getenv("IK2_EXPERT_MMA_SPLIT_DOWN")) : 4;
@@ -5639,18 +5678,27 @@ static void launch_experts_mma(const uint8_t* const* blob, int S, size_t off, co
     else IK2_MMA_LAUNCH(4);
 #undef IK2_MMA_LAUNCH
 }
+#endif
 void experts_gate_up_swiglu_mma(const uint8_t* const* blob, int S, size_t eb0, const uint16_t* x16, int C, int F,
                                 const float* sg, const float* su, float gcap, float ucap, uint16_t* h,
                                 cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    unavailable_mma(__func__);
+#else
     if (S <= 0) return;
     launch_experts_mma<true>(blob, S, eb0, x16, 0, C, F, sg, su, gcap, ucap, h, nullptr, s);
     check("experts_gate_up_swiglu_mma");
+#endif
 }
 void experts_down_mma(const uint8_t* const* blob, int S, size_t off_down, const uint16_t* h, int C, int F, float* y,
                       cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    unavailable_mma(__func__);
+#else
     if (S <= 0) return;
     launch_experts_mma<false>(blob, S, off_down, h, F, C, F, nullptr, nullptr, 0.0f, 0.0f, nullptr, y, s);
     check("experts_down_mma");
+#endif
 }
 void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                      const float* x, int C, int F, float* gu, cudaStream_t s) {
@@ -5682,6 +5730,7 @@ void enable_grouped_tensor_products(bool enabled) { grouped_tensor_products = en
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
                     const uint16_t* h, int C, int F, float* y, cudaStream_t s) {
     if (G <= 0) return;
+#ifndef STRATA_USE_HIP
     static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 2);
     if (grouped_tensor_products && use_group_mma && ty_down == kNVFP4 && C % 16 == 0 && F % 64 == 0) {
         grouped_expert_mma<false, 4><<<dim3(C / 16, G), 128, 0, s>>>(blob, nullptr, off_down, C, F, h, nullptr, y,
@@ -5696,6 +5745,7 @@ void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, in
         check("q8 grouped MMA");
         return;
     }
+#endif
     const dim3 g((unsigned) ((C + kGroupWarps * kGroupRows - 1) / (kGroupWarps * kGroupRows)), (unsigned) G);
     experts_down_g_kernel<<<g, kGroupWarps * 32, 0, s>>>(blob, n, row, ty_down, off_down, h, C, F,
                                                          mv_row_bytes(ty_down, F), y);
@@ -5736,6 +5786,7 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
                               const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s,
                               const uint16_t* input16) {
     if (G <= 0) return;
+#ifndef STRATA_USE_HIP
     static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 1);
     if (grouped_tensor_products && use_group_mma && input16 && ty_gate == kNVFP4 && ty_up == kNVFP4 && F % 8 == 0 && C % 64 == 0) {
         grouped_expert_mma<true, 4><<<dim3(F / 8, G), 128, 0, s>>>(blob, tok, eb0, C, F, nullptr, h, nullptr, sg, su,
@@ -5750,6 +5801,7 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
         check("q8 grouped MMA");
         return;
     }
+#endif
     const dim3 g((unsigned) ((F + kGroupWarps * kGroupSwigluRows - 1) / (kGroupWarps * kGroupSwigluRows)), (unsigned) G);
     experts_gate_up_swiglu_g_kernel<<<g, kGroupWarps * 32, 0, s>>>(blob, n, tok, row, ty_gate, ty_up, eb0, x, C, F,
                                                                    mv_row_bytes(ty_gate, C), mv_row_bytes(ty_up, C),
@@ -5886,8 +5938,12 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
 
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
              cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    unavailable_mma(__func__);
+#else
     q8_mma_tile<4><<<dim3((N + 15) / 16, (T + 7) / 8), 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
     check("q8_mma_tile");
+#endif
 }
 
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
@@ -5994,6 +6050,9 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
 }
 
 int attn_decode_mma_blocks(int Hkv) {
+#ifdef STRATA_USE_HIP
+    return 1;
+#else
     int dev = 0, n_sm = 0, occ16 = 0, occ8 = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);
@@ -6001,13 +6060,23 @@ int attn_decode_mma_blocks(int Hkv) {
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, attn_decode_mma_kernel<uint8_t>, kWaNW * 32, 0);
     check("attn_decode_mma (occupancy)");
     return std::max(1, n_sm * std::min(occ16, occ8) / std::max(1, Hkv));
+#endif
 }
-size_t attn_decode_mma_scratch(int H, int n_split) { return (size_t) n_split * kWaNW * H * (kFaD + 2); }
+size_t attn_decode_mma_scratch(int H, int n_split) {
+#ifdef STRATA_USE_HIP
+    return 0;
+#else
+    return (size_t) n_split * kWaNW * H * (kFaD + 2);
+#endif
+}
 template <class KV>
 void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink, const KV* kc, const KV* vc, int kv_cap,
                           int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale, float v_inv,
                           const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
                           const float* gate, uint16_t* out16, cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    unavailable_mma(__func__);
+#else
     if (H % Hkv || H / Hkv > 8 || n_split < 1 || (kv_cap > 0 && kv_cap < 16)) {
         std::fprintf(stderr, "ik2::k::attn_decode_mma: %d heads on %d, %d splits, a cache of %d\n", H, Hkv, n_split,
                      kv_cap);
@@ -6023,6 +6092,7 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
     attn_decode_mma_combine_kernel<<<(unsigned) H, kFaD, (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
         o_part, ml_part, n_split, H, sink, v_inv, pos, qpos, window, gate, out, out16);
     check("attn_decode_mma (combine)");
+#endif
 }
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
@@ -6098,6 +6168,7 @@ void decode_host(int type, const uint8_t* blocks, size_t n, float* out) {
 
 // ---- the block path's launchers
 
+#ifndef STRATA_USE_HIP
 template <class KV, int NT>
 static void attn_block_launch(const uint16_t* q16, const float* r, int r_ld, const float* sink, const KV* kc,
                               const KV* vc, int kv_cap, int H, int Hkv, const int* pos, int T, int n_split,
@@ -6116,12 +6187,16 @@ static void attn_block_launch(const uint16_t* q16, const float* r, int r_ld, con
         o_part, ml_part, n_split, H, T, sink, v_inv, pos, window, gate, gate_ld, out, out16);
     check("attn_block_mma (combine)");
 }
+#endif
 template <class KV>
 static void attn_block_impl(const uint16_t* q16, const float* r, int r_ld, const float* sink, const KV* kc,
                             const KV* vc, int kv_cap, int H, int Hkv, const int* pos, int T, int n_split,
                             float qk_scale, float v_inv, const float* proj, int d_rel, int extent, int window,
                             float* scratch, float* out, const float* gate, int gate_ld, uint16_t* out16,
                             cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    unavailable_mma(__func__);
+#else
     const int R = H / Hkv, NC = T * R;
     if (H % Hkv || T < 1 || NC > 24 || n_split < 1 || (kv_cap > 0 && kv_cap < 16 + T)) {
         std::fprintf(stderr, "ik2::k::attn_block: %d heads on %d, %d tokens, %d splits, a cache of %d\n", H, Hkv, T,
@@ -6137,6 +6212,7 @@ static void attn_block_impl(const uint16_t* q16, const float* r, int r_ld, const
     else
         attn_block_launch<KV, 3>(q16, r, r_ld, sink, kc, vc, kv_cap, H, Hkv, pos, T, n_split, qk_scale, v_inv, proj,
                                  d_rel, extent, window, scratch, out, gate, gate_ld, out16, s);
+#endif
 }
 void attn_block_f16(const uint16_t* q16, const float* r, int r_ld, const float* sink, const uint16_t* kc,
                     const uint16_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T, int n_split, float qk_scale,
@@ -6152,7 +6228,13 @@ void attn_block_fp8(const uint16_t* q16, const float* r, int r_ld, const float* 
     attn_block_impl<uint8_t>(q16, r, r_ld, sink, kc, vc, kv_cap, H, Hkv, pos, T, n_split, qk_scale, v_inv_scale,
                              proj, d_rel, extent, window, scratch, out, gate, gate_ld, out16, s);
 }
-size_t attn_block_scratch(int H, int T, int n_split) { return (size_t) n_split * kWaNW * T * H * (kFaD + 2); }
+size_t attn_block_scratch(int H, int T, int n_split) {
+#ifdef STRATA_USE_HIP
+    return 0;
+#else
+    return (size_t) n_split * kWaNW * T * H * (kFaD + 2);
+#endif
+}
 
 void conv_block(const float* x, int x_ld, float* hist, const float* w, const float* dyn, int d_ld, int heads, int T,
                 int C, const float* res, int res_ld, float* y, int y_ld, float* rec_old, float* rec_x,
@@ -6191,18 +6273,26 @@ void group_route(const int* top, const float* w, int S, int K, const uint8_t* co
 void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                       size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su, float gcap,
                       float ucap, uint16_t* h, cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    unavailable_mma(__func__);
+#else
     if (G <= 0) return;
     const dim3 g((unsigned) (F / 8), (unsigned) G);
     if (T <= 4) experts_block_gu_kernel<8, 1><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
     else experts_block_gu_kernel<8, 2><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
     check("experts_block_gu");
+#endif
 }
 void experts_block_down(const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
                         int F, const uint16_t* h, float* y, cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    unavailable_mma(__func__);
+#else
     if (G <= 0) return;
     experts_block_down_kernel<4><<<dim3((unsigned) (C / 16), (unsigned) G), 128, 0, s>>>(blob, n, row, off_down, C, F,
                                                                                          h, y);
     check("experts_block_down");
+#endif
 }
 void prep_qkv_r_fp8_block(float* q, int q_ld, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in,
                           uint8_t* vc, float* r, int r_ld, const float* r_clip, int T, int H, int KV, int D, int d_rel,
@@ -6244,18 +6334,26 @@ void route_rows(const float* logits, const float* bias, int T, int E, int K, flo
 void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                          size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su,
                          float gcap, float ucap, uint16_t* h, cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    unavailable_mma(__func__);
+#else
     if (G <= 0) return;
     const dim3 g((unsigned) (F / 8), (unsigned) G);
     if (T <= 4) experts_block_gu_q8_kernel<8, 1><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
     else experts_block_gu_q8_kernel<8, 2><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
     check("experts_block_gu_q8");
+#endif
 }
 void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
                            int F, const uint16_t* h, float* y, cudaStream_t s) {
+#ifdef STRATA_USE_HIP
+    unavailable_mma(__func__);
+#else
     if (G <= 0) return;
     experts_block_down_q8_kernel<4><<<dim3((unsigned) (C / 16), (unsigned) G), 128, 0, s>>>(blob, n, row, off_down, C,
                                                                                             F, h, y);
     check("experts_block_down_q8");
+#endif
 }
 
 }  // namespace ik2::k

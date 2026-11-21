@@ -4122,7 +4122,17 @@ int main(int argc, char** argv) {
         else die("unknown argument " + a);
     }
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
+#ifdef STRATA_USE_HIP
+    for (const char* flag : {"IK2_FLASH", "IK2_ATTN_MMA", "IK2_EXPERT_MMA", "IK2_GROUP_MMA",
+                             "IK2_Q8_TILE", "IK2_BLOCK", "IK2_WGMMA"}) {
+        if (getenv(flag) && std::atoi(getenv(flag))) die(std::string(flag) + " requires CUDA tensor cores");
+    }
+    if (n_gpu != 1) die("HIP supports one gfx1100 device");
+    g_flash = false;
+    std::fprintf(stderr, "ik2 HIP gfx1100: scalar experts and decode attention, hipBLAS prefill\n");
+#else
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
+#endif
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
     g_group = !getenv("IK2_GROUP") || std::atoi(getenv("IK2_GROUP"));
     if (getenv("IK2_GROUP")) {
@@ -4302,9 +4312,14 @@ int main(int argc, char** argv) {
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
+#ifdef STRATA_USE_HIP
+    g_block = false;
+    g_attn_mma = 0;
+#else
     g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
+#endif
     if (n_gpu == 1 && getenv("IK2_KV_MANAGED") && atoi(getenv("IK2_KV_MANAGED"))) {
         int concurrent = 0;
         CU(cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentManagedAccess, 0));

@@ -2698,13 +2698,19 @@ int main() {
     test_round2_fused();
     test_fp8_kv();
     test_round6();
+#ifndef STRATA_USE_HIP
     test_attn_flash();   // (last: its random data leaves the others' as they were)
     test_attn_decode_mma();
+#endif
     test_cand_topk();
     test_token_path();
     test_expert_limbs();
+#ifndef STRATA_USE_HIP
     test_experts_mma();
     test_q8_verify_tile();
+#else
+    std::puts("CUDA-only MMA and flash tests excluded on gfx1100");
+#endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

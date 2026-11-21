@@ -96,6 +96,14 @@ inline hipError_t cudaHostAlloc(T** p, size_t bytes, unsigned int flags) {
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostUnregister hipHostUnregister
 #define cudaLaunchHostFunc hipLaunchHostFunc
+#define cudaCpuDeviceId hipCpuDeviceId
+#define cudaMallocManaged hipMallocManaged
+#define cudaMemAdvise hipMemAdvise
+#define cudaMemAdviseSetAccessedBy hipMemAdviseSetAccessedBy
+#define cudaMemAdviseSetPreferredLocation hipMemAdviseSetPreferredLocation
+#define cudaMemPrefetchAsync hipMemPrefetchAsync
+#define cudaStreamCaptureModeGlobal hipStreamCaptureModeGlobal
+#define cudaDevAttrConcurrentManagedAccess hipDeviceAttributeConcurrentManagedAccess
 #define cudaMalloc hipMalloc
 #define cudaMallocHost(...) (::strata::hip_compat::malloc_host(__VA_ARGS__))
 #define cudaMemGetInfo hipMemGetInfo
