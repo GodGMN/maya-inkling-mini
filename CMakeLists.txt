@@ -879,7 +879,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
   # maya-ik2: Inkling 2 (thinkingmachines/Inkling-2-Small, docs/INKLING2.md) from unsloth's GGUFs in place.  CUDA on
   # Linux only (its host tables are mmap'd and pinned in place), Ampere on (mma.sync m16n8k16, cp.async); Hopper's
-  # prefill attention takes wgmma, so a 90 in the list builds 90a.
+  # prefill attention takes wgmma, so a 90 in the list builds 90a. HIP gfx1100 uses scalar decode and hipBLAS prefill.
   # Its kernels - the ops the other engines do not have - and their test against a double reference (no model).
   set(_ik2_archs "")
   set(_ik2_filter OFF)
@@ -919,6 +919,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(maya-ik2 PRIVATE ik2_kernels ${_strata_gpu_blas_target} Threads::Threads)
     set(_ik2_targets ik2_kernels maya-ik2)
     if(STRATA_BUILD_TESTS)
+      add_executable(ik2_host_ref_test tests/ik2_host_ref_test.cpp src/ik2/ik2_cpu.cpp)
+      target_link_libraries(ik2_host_ref_test PRIVATE ik2_kernels Threads::Threads)
       add_executable(ik2_kernels_test tests/ik2_kernels_test.cu)
       target_link_libraries(ik2_kernels_test PRIVATE ik2_kernels)
       add_test(NAME ik2_kernels_test COMMAND ik2_kernels_test)

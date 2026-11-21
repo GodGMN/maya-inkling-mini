@@ -58,7 +58,7 @@ static inline int munmap(void*, size_t) { return 0; }
 #include <unistd.h>
 #endif
 
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+#if !defined(STRATA_USE_HIP) && defined(CUDART_VERSION) && CUDART_VERSION >= 13000
 static inline cudaError_t cudaMemPrefetchAsync_compat(const void* devPtr, size_t count, int dstDevice, cudaStream_t stream = 0) {
     cudaMemLocation loc{};
     if (dstDevice < 0) {
