@@ -373,10 +373,13 @@ def main():
     ap.add_argument("gguf")
     ap.add_argument("--tokens", default="1,2,3")
     ap.add_argument("--dump-dir", default="")
+    ap.add_argument("--logprobs-out", type=pathlib.Path, help="save only the final log-probabilities as .npy")
     a = ap.parse_args()
     dump = {} if a.dump_dir else None
     r = Ref(a.gguf, dump)
     lp = r.forward([int(t) for t in a.tokens.split(",")])
+    if a.logprobs_out:
+        np.save(a.logprobs_out, lp.detach().cpu().numpy())
     print("top-1:", lp.argmax(-1).tolist())
     if dump is not None:
         out = pathlib.Path(a.dump_dir)

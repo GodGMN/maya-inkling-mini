@@ -57,3 +57,28 @@ Inside the build container, run `build-ik2/ik2_host_ref_test < /work/ik2-host-re
 `python3 -m unittest tools.test_hip_compat` passed the repository's CUDA name mapping checks. The CUDA 13 managed-memory shims are excluded from HIP. Both builds completed with the build container limited to four CPUs and 6 GiB of RAM with swap disabled. At completion, `df -h /work` reported 21G available on the root filesystem.
 
 After GPU release, run `ctest --test-dir build-ik2 -R '^ik2_kernels_test$' --output-on-failure` with the GPU available. The suite contains scalar expert, routing, FP8 and FP16 attention checks against numerical references. Full-model validation also requires an approved storage location for the unsloth GGUF. Compare logits on identical forced tokens, generated text, and graph-on/off output before timing prefill and decode at different prompt depths.
+
+### Forced decode comparison
+
+Use identical prompt and forced token IDs in each run. The CLI writes its first raw logit row **after consuming the first forced token**. For `--gen N` it writes N−1 rows and omits the prompt prediction. The comparator checks the expected byte counts and reports top-1 agreement, mean/median/max KL, and the input position with the largest KL. It reads one vocabulary row at a time.
+
+Example for the GPU validation session, with `MODEL` pointing to the approved Mini GGUF, in a scratch directory. The token IDs below exercise the alignment only. For quality measurements use tokenized real text and the same cache format, prompt, and forced file in both runs.
+
+```sh
+printf '%s\n' '101,102,103' > force.csv
+for graph in 0 1; do
+  IK2_KV=fp8 IK2_GRAPH="$graph" IK2_FORCE=force.csv IK2_LOGITS_OUT="graph-$graph.f32" \
+    /work/build-ik2/maya-ik2 --model "$MODEL" --tokens 1,2 --gen 4 --ctx 256
+done
+python3 /work/src/tools/ik2_compare_decode.py graph-1.f32 --baseline graph-0.f32 \
+  --prompt-length 2 --gen 4 --vocab 200058
+```
+
+For comparison against the independent model reference, run the reference on a CPU machine with sufficient RAM for the GGUF forward pass. Pass the prompt followed by the first N−1 forced tokens. The example compares the same three decode rows as above. `--logprobs-out` saves the final array without retaining intermediate layer dumps.
+
+```sh
+python3 ref/inkling2.py "$MODEL" --tokens 1,2,101,102,103 --logprobs-out ref.npy
+python3 tools/ik2_compare_decode.py graph-1.f32 --ref ref.npy --prompt-length 2 --gen 4 --vocab 200058
+```
+
+Run throughput measurements separately with logit export disabled, since exporting the full vocabulary adds a device-to-host copy per step.
