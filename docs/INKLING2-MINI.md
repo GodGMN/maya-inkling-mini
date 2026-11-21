@@ -2,6 +2,8 @@
 
 `maya-ik2` runs [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) with every weight in the VRAM of one 24 GB card. This page is how to build and run it, what speed to expect, and how it works. The engine's design notes, with the model's exact arithmetic, are in [INKLING2.md](INKLING2.md) (section 8 is Mini).
 
+For the experimental RX 7900 XTX build, see the [gfx1100 port notes](HIP-PORT.md).
+
 ## Quick start
 
 You need Linux, an RTX 3090 or another 24 GB `sm_86` card, CUDA 12.8 with `nvcc` on the `PATH`, CMake 3.21 or newer, Ninja, and Python 3.10 or newer. The model takes 17.6 GB on disk and 23.6 GiB of VRAM at the full context.
