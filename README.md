@@ -1,10 +1,20 @@
-<h1 align="center">Inkling 2 Mini on ONE RTX 3090: 128 tok/s, up to 210 with the drafter</h1>
+# Inkling 2 Mini on AMD Radeon RX 7900 XTX
+
+This fork ports `maya-ik2` to AMD HIP. The `hip-port` branch builds for `gfx1100` with ROCm 7.2.1. A CPU test verified NVFP4 weight decoding and compared a synthetic expert's output with the Python reference. Full-model correctness, context capacity, and throughput on the RX 7900 XTX still need GPU validation.
+
+```sh
+git clone --branch hip-port https://github.com/GodGMN/maya-inkling-mini.git
+```
+
+See the [HIP build instructions and validation commands](docs/HIP-PORT.md).
+
+## Upstream CUDA results on RTX 3090
 
 <p align="center"><b>Thinking Machines' 26B looped MoE, all of it in 24 GB of VRAM. 128 tok/s plain decode, 150 to 210 tok/s on code and edits with the official DSpark drafter, 2,700 tok/s prefill, up to 344K context, images and tools. llama.cpp gets 57 tok/s on the same card.</b></p>
 
 <p align="center">
 <a href="docs/INKLING2-MINI.md"><b>Read the guide</b></a> ·
-<a href="#quick-start"><b>Quick start</b></a> ·
+<a href="#cuda-quick-start"><b>CUDA quick start</b></a> ·
 <a href="https://huggingface.co/unsloth/Inkling-2-Mini-GGUF"><b>Weights on Hugging Face</b></a>
 </p>
 
@@ -18,7 +28,7 @@
 
 One RTX 3090 at a 300 W limit, Unsloth `UD-Q4_K_XL`, FP8 KV cache, a cold prompt every time. Prefill runs at 2,742 tok/s on 4K tokens, 2,361 on 64K and 2,079 on 128K. Every launch and log is in the [guide](docs/INKLING2-MINI.md#numbers).
 
-## What you get
+## CUDA engine features
 
 * **`maya-ik2`**, an engine for [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini): the 24 layers, the loop (layers 6 to 17 run 3 times, 48 layer visits per token), the relative bias, the short convs and the attention residuals.
 * **The model stays in VRAM.** All 3,072 experts (14.7 GiB), the dense weights and an FP8 KV cache fit in 24 GB: 344,064 tokens without the drafter, 262,144 with it. Nothing is read from RAM or disk while it answers.
@@ -26,7 +36,7 @@ One RTX 3090 at a 300 W limit, Unsloth `UD-Q4_K_XL`, FP8 KV cache, a cold prompt
 * **The original weights.** The experts of layers 0 to 19 are Thinking Machines' own NVFP4 bits, the way Unsloth's GGUF carries them. A 3090 has no FP4 hardware, so the engine decodes the 4-bit codes in registers and feeds the tensor cores.
 * **Images, tools, reasoning control, streaming** through OpenAI and Anthropic compatible APIs on `/v1`.
 
-## Quick start
+## CUDA quick start
 
 Linux, an RTX 3090 (or another 24 GB `sm_86` card), CUDA 12.8, Python 3.10 or newer.
 
@@ -55,7 +65,7 @@ python serve/server.py --engine maya --config docs/inkling2-mini/ik2-mini.json -
 
 Then talk to `http://127.0.0.1:18000/v1` with any OpenAI client, model `inkling-2-mini`. There are 4 configs in [`docs/inkling2-mini/`](docs/inkling2-mini/): the default (the drafter, 262K context, image encoder on the CPU), the longest context (344K, no drafter), text only, and the image encoder on the GPU.
 
-## Why it's faster than llama.cpp
+## Why the CUDA engine is faster than llama.cpp
 
 llama.cpp runs about 7,350 kernel launches per token for this model. A token here is 757 launches replayed as one CUDA graph, and the GPU never waits for the host between the embedding and the logits.
 
