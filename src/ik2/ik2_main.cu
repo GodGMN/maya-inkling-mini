@@ -4127,6 +4127,7 @@ int main(int argc, char** argv) {
                              "IK2_Q8_TILE", "IK2_BLOCK", "IK2_WGMMA"}) {
         if (getenv(flag) && std::atoi(getenv(flag))) die(std::string(flag) + " requires CUDA tensor cores");
     }
+    if (serve && !draft_path.empty()) die("--serve with --draft requires CUDA block verification");
     if (n_gpu != 1) die("HIP supports one gfx1100 device");
     g_flash = false;
     std::fprintf(stderr, "ik2 HIP gfx1100: scalar experts and decode attention, hipBLAS prefill\n");

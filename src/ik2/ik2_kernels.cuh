@@ -5,7 +5,7 @@
 // experts' GEMMs of the prompt path take FP16 rows (an NVFP4 weight is exact in FP16).  docs/INKLING2.md has the model.
 //
 // Layouts: rows of tokens; a token's heads back to back ([T][H][D]); the K / V caches by position, [ctx][Hkv][D] F32.
-// CUDA only for now (no HIP mapping yet).
+// CUDA sm_80+ and the scalar HIP port for gfx1100 (docs/HIP-PORT.md).
 #pragma once
 
 #include <cstddef>

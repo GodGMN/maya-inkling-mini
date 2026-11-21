@@ -2678,7 +2678,11 @@ int main() {
     CU(cudaGetDeviceCount(&dev_count));
     cudaDeviceProp p{};
     CU(cudaGetDeviceProperties(&p, 0));
+#ifdef STRATA_USE_HIP
+    std::printf("ik2_kernels_test on %s (%s)\n", p.name, p.gcnArchName);
+#else
     std::printf("ik2_kernels_test on %s (sm_%d%d)\n", p.name, p.major, p.minor);
+#endif
     test_rms();
     test_l2clip();
     test_conv();
