@@ -325,3 +325,12 @@ oracle-env/bin/python src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/token
 oracle-env/bin/python src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
     --depths 32768,131072,392960 --score retrieval.log
 ```
+
+With the pinned-input fix, Maya again returned the exact midpoint phrase on the two shorter prompts. The same process reserved 393,216 positions and kept all experts on the GPU. Each retrieval started with an empty prefix. A second request extended the prompt by one token and generated 129 tokens with stopping disabled. Its decode time covers the last 128 tokens.
+
+| Input tokens | Expected phrase and actual final answer | Uncached prefill | Tokens before stop | Fixed-length decode |
+| ---: | --- | ---: | ---: | ---: |
+| 32,768 | falcon saffron cobalt meadow | 14.056 s | 119 | 87.13 tok/s |
+| 131,072 | falcon meadow lantern glacier | 78.134 s | 80 | 59.76 tok/s |
+
+These are single runs with token-major E4M3. The longer prompt fully recovered its 131,072-token prefix for the fixed-length request. To reproduce, add `--decode-steps 128` to both Python commands above and use `--depths 32768,131072`. Set `IK2_EXPERT_TILE_LDS=1` and `IK2_SHARED_COMBINE=1` with the cooperative prefill environment.
