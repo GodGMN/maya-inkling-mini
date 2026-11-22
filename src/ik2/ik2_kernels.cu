@@ -2199,12 +2199,19 @@ __device__ __forceinline__ float iq3xxs_sub_dot(const uint8_t* b, int ib32, cons
 // IQ4_NL values of the 4 low (hi = false) or high nibbles of the bytes of w, as 4 int8 in a u32
 __device__ __forceinline__ uint32_t iq4nl_lut4(uint32_t w, bool hi) {
     const uint32_t t = (hi ? (w >> 4) : w) & 0x0F0F0F0Fu;
+#if defined(__HIP_DEVICE_COMPILE__)
+    const uint32_t p = t & 0x07070707u;
+    const uint32_t lo = __builtin_amdgcn_perm(0xF6EADDCFu, 0xBFAD9881u, p);
+    const uint32_t hi4 = __builtin_amdgcn_perm(0x71594535u, 0x26190D01u, p);
+    return __builtin_amdgcn_perm(hi4, lo, ((t >> 1) & 0x04040404u) | 0x03020100u);
+#else
     const uint32_t x = t | (t >> 4);
     const uint32_t sel = (x & 0xFFu) | ((x >> 8) & 0xFF00u);
     const uint32_t T0 = 0xBFAD9881u, T1 = 0xF6EADDCFu, T2 = 0x26190D01u, T3 = 0x71594535u;
     const uint32_t lo = __byte_perm(T0, T1, sel & 0x7777u), hv = __byte_perm(T2, T3, sel & 0x7777u);
     const uint32_t m = ((t >> 3) & 0x01010101u) * 0xFFu;
     return (lo & ~m) | (hv & m);
+#endif
 }
 // block b (136 bytes, 4-aligned), sub-block ib
 __device__ __forceinline__ float iq4xs_sub_dot(const uint8_t* b, int ib, const float4 (&xv)[8]) {
@@ -2223,6 +2230,27 @@ __device__ __forceinline__ float iq4xs_sub_dot(const uint8_t* b, int ib, const f
 __device__ __forceinline__ void load_xv8(const float* x, float4 (&xv)[8]) {
 #pragma unroll
     for (int k = 0; k < 8; ++k) xv[k] = *(const float4*) (x + 4 * k);
+}
+
+// Four lanes decode an IQ4_NL block. A lane reads four packed bytes and the two corresponding float4s.
+template <bool Pair>
+__device__ __forceinline__ void iq4nl_rows(const uint8_t* row0, const uint8_t* row1, const float* xs, int K,
+                                          float& acc0, float& acc1) {
+    const int lane = threadIdx.x & 31;
+    const int word = lane & 3;
+    for (int block = lane >> 2; block < K / 32; block += 8) {
+        const float* x = xs + block * 36 + 4 * word;
+        const float4 lo = *(const float4*) x, hi = *(const float4*) (x + 16);
+        const size_t off = (size_t) block * 18;
+#pragma unroll
+        for (int r = 0; r < (Pair ? 2 : 1); ++r) {
+            const uint8_t* b = (r ? row1 : row0) + off;
+            uint32_t packed;
+            memcpy(&packed, b + 2 + 4 * word, sizeof(packed));
+            const float dot = dot_u32_f4(iq4nl_lut4(packed, false), lo) + dot_u32_f4(iq4nl_lut4(packed, true), hi);
+            (r ? acc1 : acc0) += h2f(*(const uint16_t*) b) * dot;
+        }
+    }
 }
 
 // a warp's dot of one row of K values (blocks of `type` from w) with xs (shared, padded: xp), every lane gets it
@@ -2337,6 +2365,9 @@ __device__ float row_dot(int type, const uint8_t* w, const float* xs, int K) {
             }
             acc += a;
         }
+    } else if (type == kIQ4_NL) {
+        float unused = 0.0f;
+        iq4nl_rows<false>(w, nullptr, xs, K, acc, unused);
     } else if (type == kIQ3_XXS || type == kIQ4_XS) {
         const bool iq3 = type == kIQ3_XXS;
         for (int sb = lane; sb < K / 32; sb += 32) {
@@ -2510,6 +2541,8 @@ __device__ void row_dot_2(int type, const uint8_t* wg, const uint8_t* wu, const 
                 }
             }
         }
+    } else if (type == kIQ4_NL) {
+        iq4nl_rows<true>(wg, wu, xs, K, ag, au);
     } else if (type == kIQ3_XXS || type == kIQ4_XS) {
         const bool iq3 = type == kIQ3_XXS;
         const size_t bb = iq3 ? 98 : 136;

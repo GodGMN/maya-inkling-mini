@@ -1,6 +1,6 @@
 # Inkling 2 Mini on AMD Radeon RX 7900 XTX
 
-This fork ports `maya-ik2` to AMD HIP. The `hip-port` branch builds for `gfx1100` with ROCm 7.2.1. A CPU test verified NVFP4 weight decoding and compared a synthetic expert's output with the Python reference. Full-model correctness, context capacity, and throughput on the RX 7900 XTX still need GPU validation.
+This fork runs `maya-ik2` on the RX 7900 XTX with ROCm 7.2.1. It reads the ggml-org IQ4_NL weights directly. The GPU kernel suite passes on gfx1100. On a 30-position forced-decode check, the vectorized HIP engine with FP8 KV matched the float64 reference’s top choice at all 30 positions (mean KL 0.00183).
 
 ```sh
 git clone --branch hip-port https://github.com/GodGMN/maya-inkling-mini.git
