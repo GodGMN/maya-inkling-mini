@@ -5535,6 +5535,7 @@ int main(int argc, char** argv) {
             }
             std::vector<int> stops;
             if (serve_maya) {
+                stops = eos_ids;
                 in >> max_new;
                 std::string w;
                 while (in >> w) {
@@ -5551,8 +5552,8 @@ int main(int argc, char** argv) {
                     else if (k == "top_p") top_p = std::atof(v.c_str());
                     else if (k == "top_k") top_k = std::atoi(v.c_str());
                     else if (k == "seed") seed = std::atoll(v.c_str());
+                    else if (k == "stop_token") stops.push_back(std::atoi(v.c_str()));
                 }
-                stops = eos_ids;
             } else {
                 in >> max_new >> temp >> top_p >> seed >> stops_s >> ids_s;
                 stops = parse_ints(stops_s);

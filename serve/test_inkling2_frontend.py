@@ -212,6 +212,12 @@ class Serving(unittest.TestCase):
         for text, num in zip(said, ("0", "0.2", "0.99")):
             self.assertIn(EFFORT + num + END, text)
 
+    def test_direct_answer_ends_at_its_first_segment(self):
+        svc, eng, tok = service("H609" + END + MODEL + THINK + "Consider again." + END + MODEL + TEXT + "H609" + END)
+        got = answer(svc, {"messages": ASK, "reasoning_effort": "none"})
+        self.assertEqual((got["content"], got["reasoning"], got["done"]["finish"]), ("H609", "", "stop"))
+        self.assertIn(f" stop_token={tok.special_tokens[END]}", server.StrataEngine.sampling_keys(eng.sampling[0]))
+
     def test_tool_call(self):
         svc, _, _ = service(MODEL + THINK + "Look it up." + END + call("get_weather", {"city": "Paris", "days": 2}))
         got = answer(svc, {"messages": ASK, "tools": TOOLS})

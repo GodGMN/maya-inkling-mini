@@ -2,6 +2,12 @@
 
 On Prometheus’s RX 7900 XTX, the Radeon server runs the installed ggml-org IQ4_NL model with all routed experts in VRAM. [Current measurements](#full-model-measurements-at-393216-reserved-tokens) · [Packaged server](#run-the-packaged-image-on-prometheus) · [Long-context retrieval](#exact-phrase-retrieval-at-long-context)
 
+## Growing conversations
+
+The full-context image reserves 393,216 positions with a 1,024-token prefill chunk. The web client now sends Inkling's earlier reasoning back. API clients should retain the complete assistant message, including reasoning and tool calls, and preserve tool IDs when sending results. Changing the system prompt, tools, their order, or the reasoning level can change tokens near the beginning of the rendered history. A rewritten history starts a new prefix.
+
+The first long chat found a direct-answer bug at 70,024 tokens. The engine reused all 70,003 available tokens, then generated the correct seal, switched to thinking and repeated the seal. The direct-answer path now ends generation at the first text segment's closing token. Reasoning and tool conversations still run to the end of their whole turn.
+
 ## Multi-turn tool calls on Prometheus
 
 Run `python3 tests/ik2_tool_conversations.py http://127.0.0.1:PORT` against each listening server. The packaged gfx1100 Maya image (`gfx1100-08aad41`) and the incumbent llama.cpp image (`server-rocm-inkling-1427-r2`, port 8085) each passed all four conversations. On both the OpenAI and Anthropic APIs, in streaming and non-streaming mode, the first assistant turn called the same tool twice with distinct IDs and desk arguments. The client returned results in reverse order. Every final answer associated Larch with VX-731 and Birch with PK-284. The llama.cpp answers sometimes added a heading. Raw responses are in `maya-tools.jsonl` and `llama-tools.jsonl` in the Prometheus build directory.
@@ -192,32 +198,15 @@ curl -NsS http://127.0.0.1:18085/v1/chat/completions -H 'Content-Type: applicati
 
 ## Run the packaged image on Prometheus
 
-The local image `hyperion/maya-ik2:gfx1100-08aad41` contains the selected executable, its Python server, the Radeon preset and the tokenizer exported from the installed IQ4_NL checkpoint. It reads the weights from a read-only mount. The preset reserves 32,768 positions. When the card is available exclusively for Maya, run the following on Prometheus.
+The local image contains the HIP engine, Python server, Radeon preset and tokenizer. It reads the IQ4_NL weights from a read-only mount. Run this on Prometheus when the card is available exclusively for Maya.
 
 ```sh
 MODEL="$HOME/ai/models/inkling-2-mini/Inkling-2-Mini-IQ4_NL.gguf"
 docker run --rm --name maya-ik2-api --memory 9g --memory-swap 9g --device /dev/kfd --device /dev/dri \
     -p 127.0.0.1:18085:8080 \
     --mount "type=bind,src=$MODEL,dst=/opt/maya/models/Inkling-2-Mini-IQ4_NL.gguf,readonly" \
-    hyperion/maya-ik2:gfx1100-08aad41
+    hyperion/maya-ik2:gfx1100-b747ddf
 ```
-
-For the 393,216-position benchmark configuration, create a copy of the preset on the host. From `~/ai/build/maya-ik2-hip`, run the following command. For the mixed-precision profile, also set `cfg["env"]["IK2_KV"] = "fp8-global"` before writing the file.
-
-```sh
-python3 - <<'PYCFG'
-import json
-from pathlib import Path
-
-cfg = json.loads(Path("src/docs/inkling2-mini/ik2-mini-gfx1100.json").read_text())
-args = cfg["args"]
-args[args.index("--max-context") + 1] = "393216"
-args[args.index("--chunk") + 1] = "1024"
-Path("ik2-393216.json").write_text(json.dumps(cfg, indent=2) + "\n")
-PYCFG
-```
-
-Add `--mount "type=bind,src=$PWD/ik2-393216.json,dst=/opt/maya/ik2-mini-gfx1100.json,readonly"` before the image name in the Docker command above.
 
 To rebuild the image from the build directory, run `sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer hyperion/maya-ik2:local`. The script stages the executable and tokenizer, uses Buildx resource limits of four CPUs and 6 GiB, and loads the resulting image into the local Docker daemon. Prometheus used Buildx v0.36.1. The packaged chat template, parser and server passed all 18 Inkling frontend tests. Run `docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 --entrypoint python3 hyperion/maya-ik2:gfx1100-08aad41 -m unittest serve.test_inkling2_frontend`.
 
@@ -644,7 +633,7 @@ The Radeon kernel splits the keys according to the number of query workgroups. E
 | 8,192 | 3,660 | 3,674 | 104.58 | 102.48 |
 | 32,768 | 3,159 | 3,233 | 91.76 | 93.77 |
 
-The 32K server preset uses token-major KV. The page layout takes the same bytes per token. For the two- and eight-wave boundary cases, the device tests checked results against the CPU attention reference.
+The Radeon server preset uses token-major KV. The page layout takes the same bytes per token. For the two- and eight-wave boundary cases, the device tests checked results against the CPU attention reference.
 
 ```sh
 # Use the cooperative prefill environment above.

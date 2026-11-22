@@ -1394,6 +1394,8 @@ class StrataEngine:
         bias = sampling.get("logit_bias")      # {id: bias}, checked by the handler (logit_bias_of)
         bias_key = (" logit_bias=" + ",".join(f"{int(i)}:{float(b):g}" for i, b in sorted(bias.items()))
                     if isinstance(bias, dict) and bias else "")
+        if isinstance(sampling.get("_inkling_end"), int):
+            tune_keys += f' stop_token={sampling["_inkling_end"]}'
         penalty_keys = StrataEngine.penalty_keys(sampling)
         if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
@@ -4546,6 +4548,12 @@ class Service:
         pending, tries, sent_call = [], {}, False
         seg = {"prompt": ids, "ids": [], "next": None}   # this engine call's prompt and tokens; the next one's
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
+        direct_end = None
+        if getattr(self.template, "inkling", False) and prefill == "<|message_model|><|content_text|>" and not tools:
+            end = self.tok.encode("<|end_message|>", parse_special=True)
+            if len(end) == 1:
+                direct_end = end[0]
+                sampling = {**(sampling or {}), "_inkling_end": direct_end}
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         reasoning_tokens = 0
@@ -4760,6 +4768,9 @@ class Service:
                         if my_first is None:
                             my_first = time.time()
                         raw_ids.append(t)
+                        if t == direct_end:
+                            finish = "stop"
+                            break
                         end_think = bool(in_think and t == self.think_end_id)
                         if end_think:
                             in_think = False
