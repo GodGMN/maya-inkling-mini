@@ -2659,35 +2659,38 @@ __device__ __forceinline__ float nv_limb_dot(const uint8_t* row, int sub, const 
     }
     return float(128 * hi + lo) * x.scale * ue4m3(b[sub % 4]);
 }
-__device__ __forceinline__ float q8_limb_dot(const uint8_t* row, int sub, const NvInput& x) {
-    const uint8_t* block = row + (sub / 2) * 34;
-    const uint16_t* q = (const uint16_t*)(block + 2 + (sub % 2) * 16);
+template <int Type>
+__device__ __forceinline__ float linear_limb_dot(const uint8_t* row, int sub, const NvInput& x) {
+    constexpr int bytes = Type == kIQ4_NL ? 18 : 34;
+    const uint8_t* block = row + (sub / 2) * bytes;
+    const uint16_t* q = (const uint16_t*)(block + 2 + (Type == kIQ4_NL ? 0 : (sub % 2) * 16));
     int hi = 0, lo = 0;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        const int four = (uint32_t)q[2 * j] | ((uint32_t)q[2 * j + 1] << 16);
+        uint32_t four = (uint32_t)q[2 * j] | ((uint32_t)q[2 * j + 1] << 16);
+        if constexpr (Type == kIQ4_NL) four = iq4nl_lut4(four, sub & 1);
         hi = __dp4a(four, x.high[j], hi);
         lo = __dp4a(four, x.low[j], lo);
     }
     return float(128 * hi + lo) * x.scale * h2f(*(const uint16_t*)block);
 }
 
-template <bool Gate, bool Q8>
+template <bool Gate, int Type>
 __global__ void nv_limb_mv(const uint8_t* const* blobs, const NvInput* packed, size_t offset, int C, int F,
                            const float* sg, const float* su, float gcap, float ucap, uint16_t* hidden, float* y) {
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, slot = blockIdx.y;
     const int K = Gate ? C : F, N = Gate ? F : C;
     const int r = (blockIdx.x * (blockDim.x / 32) + warp) * (Gate ? 1 : 2);
     if (r >= N) return;
-    const int stride = Q8 ? K / 32 * 34 : K / 64 * 36;
+    const int stride = Type == kQ8_0 ? K / 32 * 34 : Type == kIQ4_NL ? K / 32 * 18 : K / 64 * 36;
     const uint8_t* row = blobs[slot] + (Gate ? 0 : offset) + (size_t)r * stride;
     const uint8_t* second = row + (Gate ? offset : stride);
     const NvInput* xp = packed + (Gate ? 0 : slot * K / 16);
     float a = 0, b = 0;
     for (int s = lane; s < K / 16; s += 32) {
         const NvInput z = xp[s];
-        a += Q8 ? q8_limb_dot(row, s, z) : nv_limb_dot(row, s, z);
-        b += Q8 ? q8_limb_dot(second, s, z) : nv_limb_dot(second, s, z);
+        a += Type == kNVFP4 ? nv_limb_dot(row, s, z) : linear_limb_dot<Type>(row, s, z);
+        b += Type == kNVFP4 ? nv_limb_dot(second, s, z) : linear_limb_dot<Type>(second, s, z);
     }
     a = wsum(a);
     b = wsum(b);
@@ -3648,7 +3651,8 @@ __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, 
     pp[2 + tid] = o;
 }
 
-__global__ void attn_combine_kernel(const float* sink, const float* part, int H, int P, float v_inv_scale, float* out) {
+__global__ void attn_combine_kernel(const float* sink, const float* part, int H, int P, float v_inv_scale, float* out,
+                                     const float* gate = nullptr, uint16_t* out16 = nullptr, int o_ld = 0) {
     const int h = blockIdx.x, qi = blockIdx.y, tid = threadIdx.x;
     const float* pp = part + ((size_t) qi * H + h) * P * 130;
     const float sk = sink[(size_t) qi * H + h];
@@ -3662,7 +3666,11 @@ __global__ void attn_combine_kernel(const float* sink, const float* part, int H,
         den += pp[(size_t) p * 130 + 1] * f;
         o += pp[(size_t) p * 130 + 2 + tid] * f;
     }
-    out[((size_t) qi * H + h) * 128 + tid] = (o / den) * v_inv_scale;
+    const size_t index = (size_t)qi * (o_ld ? o_ld : H * 128) + h * 128 + tid;
+    float value = (o / den) * v_inv_scale;
+    if (gate) value *= 1.0f / (1.0f + expf(-gate[index]));
+    out[index] = value;
+    if (out16) out16[index] = f2h(value);
 }
 
 template <int WARPS, int ROWS>
@@ -5287,6 +5295,26 @@ void attn_probs_bias_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk
                                                                                    qk_scale, bias, extent, window, sink);
     check("attn_probs_bias_f16");
 }
+#ifdef STRATA_USE_HIP
+#include "ik2_attention_rdna3.cuh"
+template <class KV>
+void rdna3_flash(const uint16_t* q, int q_ld, const KV* kc, const KV* vc, int ring, int H, int Hkv, int D,
+                 int T, int pos, float scale, float inv, const float* bias, int extent, int window, const float* sink,
+                 float* out, int o_ld, float* scratch, size_t scratch_floats, int splits, cudaStream_t stream) {
+    if (T <= 0) return;
+    const size_t per_split = (size_t)T * H * 130;
+    if (D != 128 || Hkv <= 0 || H % Hkv != 0 || scratch_floats < per_split) {
+        std::fprintf(stderr, "rdna3 flash attention: incompatible shapes or workspace\n");
+        std::abort();
+    }
+    splits = std::max(1, std::min<int>(splits, scratch_floats / per_split));
+    rdna3_attn_part<true><<<dim3(H, splits, (T + 15) / 16), 32, 0, stream>>>(
+        q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias);
+    check("rdna3 prefill attention");
+    attn_combine_kernel<<<dim3(H, T), 128, 0, stream>>>(sink, scratch, H, splits, inv, out, nullptr, nullptr, o_ld);
+    check("rdna3 prefill attention combine");
+}
+#endif
 #ifndef STRATA_USE_HIP
 // the Hopper kernel (wgmma) on a 9.x GPU of a build with sm_90a; IK2_WGMMA=0: the mma.sync one everywhere
 bool fa_wgmma() {
@@ -5323,7 +5351,8 @@ void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uin
                     const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats, int n_split,
                     cudaStream_t s) {
 #ifdef STRATA_USE_HIP
-    unavailable_mma(__func__);
+    rdna3_flash(q16, q_ld, kc, vc, kv_cap, H, KV, D, Tq, qpos0, qk_scale, 1.0f, bias, extent, window,
+                sink, out, o_ld, scratch, scratch_floats, n_split, s);
 #else
     if (Tq <= 0) return;
     if (D != kFaD) {
@@ -5350,7 +5379,8 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
                     int window, const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats,
                     int n_split, cudaStream_t s) {
 #ifdef STRATA_USE_HIP
-    unavailable_mma(__func__);
+    rdna3_flash(q16, q_ld, kc, vc, kv_cap, H, KV, D, Tq, qpos0, qk_scale, v_inv_scale, bias, extent, window,
+                sink, out, o_ld, scratch, scratch_floats, n_split, s);
 #else
     if (Tq <= 0) return;
     if (D != kFaD) {
@@ -5370,7 +5400,8 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
 }
 int attn_flash_splits(int Tq, int H, int nk, int n_sm) {
 #ifdef STRATA_USE_HIP
-    unavailable_mma(__func__);
+    const int waves = (Tq + 15) / 16 * H;
+    return std::max(1, std::min({16, (nk + 255) / 256, (n_sm * 8 + waves - 1) / waves}));
 #else
     const int blocks = (Tq + 16 * kFaNW - 1) / (16 * kFaNW) * H;
     const int want = (6 * n_sm + blocks - 1) / blocks;   // (about three waves of two blocks an SM)
@@ -5686,23 +5717,30 @@ void launch_experts_down(const uint8_t* const* blob, int S, int ty_down, size_t 
 
 void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C, int F, int S, const float* x,
                     uint16_t* h, float* y, const float* sg, const float* su, float gcap, float ucap, void* scratch,
-                    cudaStream_t stream, bool q8, bool packed) {
+                    cudaStream_t stream, int type, bool packed) {
+    const bool ordered = type != kNVFP4;
     auto* p = (NvInput*)scratch;
     if (gate) {
-        if (!packed) nv_input<true><<<(C / 16 + 31) / 32, 32, 0, stream>>>(x, nullptr, C, p, q8);
-        if (q8)
-            nv_limb_mv<true, true>
+        if (!packed) nv_input<true><<<(C / 16 + 31) / 32, 32, 0, stream>>>(x, nullptr, C, p, ordered);
+        if (type == kQ8_0)
+            nv_limb_mv<true, kQ8_0>
+                <<<dim3((F + 3) / 4, S), 128, 0, stream>>>(blob, p, offset, C, F, sg, su, gcap, ucap, h, nullptr);
+        else if (type == kIQ4_NL)
+            nv_limb_mv<true, kIQ4_NL>
                 <<<dim3((F + 3) / 4, S), 128, 0, stream>>>(blob, p, offset, C, F, sg, su, gcap, ucap, h, nullptr);
         else
-            nv_limb_mv<true, false>
+            nv_limb_mv<true, kNVFP4>
                 <<<dim3((F + 3) / 4, S), 128, 0, stream>>>(blob, p, offset, C, F, sg, su, gcap, ucap, h, nullptr);
     } else {
-        nv_input<false><<<dim3((F / 16 + 31) / 32, S), 32, 0, stream>>>(nullptr, h, F, p, q8);
-        if (q8)
-            nv_limb_mv<false, true>
+        nv_input<false><<<dim3((F / 16 + 31) / 32, S), 32, 0, stream>>>(nullptr, h, F, p, ordered);
+        if (type == kQ8_0)
+            nv_limb_mv<false, kQ8_0>
+                <<<dim3((C + 7) / 8, S), 128, 0, stream>>>(blob, p, offset, C, F, nullptr, nullptr, 0, 0, nullptr, y);
+        else if (type == kIQ4_NL)
+            nv_limb_mv<false, kIQ4_NL>
                 <<<dim3((C + 7) / 8, S), 128, 0, stream>>>(blob, p, offset, C, F, nullptr, nullptr, 0, 0, nullptr, y);
         else
-            nv_limb_mv<false, false>
+            nv_limb_mv<false, kNVFP4>
                 <<<dim3((C + 7) / 8, S), 128, 0, stream>>>(blob, p, offset, C, F, nullptr, nullptr, 0, 0, nullptr, y);
     }
     check("nv_expert_limb");
@@ -6106,9 +6144,10 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
     check("attn_decode_fp8_at (combine)");
 }
 
+
 int attn_decode_mma_blocks(int Hkv) {
 #ifdef STRATA_USE_HIP
-    return 1;
+    return std::max(1, 256 / std::max(Hkv, 1));
 #else
     int dev = 0, n_sm = 0, occ16 = 0, occ8 = 0;
     cudaGetDevice(&dev);
@@ -6121,7 +6160,7 @@ int attn_decode_mma_blocks(int Hkv) {
 }
 size_t attn_decode_mma_scratch(int H, int n_split) {
 #ifdef STRATA_USE_HIP
-    return 0;
+    return (size_t)H * n_split * 130;
 #else
     return (size_t) n_split * kWaNW * H * (kFaD + 2);
 #endif
@@ -6132,7 +6171,15 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
                           const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
                           const float* gate, uint16_t* out16, cudaStream_t s) {
 #ifdef STRATA_USE_HIP
-    unavailable_mma(__func__);
+    if (Hkv <= 0 || H % Hkv || H / Hkv > 16 || n_split < 1) {
+        std::fprintf(stderr, "rdna3 attention: unsupported head geometry or split count\n");
+        std::abort();
+    }
+    rdna3_attn_part<false><<<dim3(Hkv, n_split), 32, 0, s>>>(q16, r, kc, vc, kv_cap, H, Hkv, pos, qpos,
+                                                      qk_scale, proj, d_rel, extent, window, scratch, 1, H * 128, nullptr);
+    check("rdna3_attn_part");
+    attn_combine_kernel<<<H, 128, 0, s>>>(sink, scratch, H, n_split, v_inv, out, gate, out16);
+    check("rdna3 attention combine");
 #else
     if (H % Hkv || H / Hkv > 8 || n_split < 1 || (kv_cap > 0 && kv_cap < 16)) {
         std::fprintf(stderr, "ik2::k::attn_decode_mma: %d heads on %d, %d splits, a cache of %d\n", H, Hkv, n_split,

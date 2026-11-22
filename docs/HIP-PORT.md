@@ -109,3 +109,26 @@ oracle-env/bin/python src/tools/ik2_compare_decode.py paris-0.f32 --ref paris-re
 With the environment above and graph replay enabled, `build-ik2/maya-ik2 --model /weight.gguf --ctx 1024 --chunk 128 --tokens 371,151451,149879,151194,149884 --gen 65` measured 32.65 tok/s for 64 scalar decode steps. The prompt predicted the first generated token. On the same prompt, `IK2_GRAPH=0 rocprofv3 --kernel-trace --stats -f csv -d /work/profile-scalar -- /work/scalar-baseline --model /weight.gguf --ctx 1024 --chunk 128 --tokens 371,151451,149879,151194,149884 --gen 33` attributed 43.83% of the traced kernel time to single-token gate/up and 21.88% to down projections.
 
 The vectorized IQ4_NL path reads four packed bytes per lane and uses gfx1100 byte-permute instructions to decode eight weights. Input activations and dot accumulators remain FP32. The GPU kernel suite passed. For a text check, tokenize “Water freezes at” and the continuation “ zero degrees Celsius and boils at one hundred degrees Celsius at sea level. At higher altitudes the boiling point falls because atmospheric pressure is lower.” with `tools/strata_tokenizer.py`. On this GGUF they yield 4 prompt and 30 continuation tokens. Force the continuation with `--gen 31`, export logits and run the oracle on all 34 tokens. `oracle-env/bin/python src/tools/ik2_compare_decode.py v1-water.f32 --ref water-ref.npy --prompt-length 4 --gen 31 --vocab 200058` measured 30/30 top-1, mean KL 0.0018280142 and max KL 0.0081613966.
+
+### RDNA3 expert and attention kernels
+
+`IK2_EXPERT_LIMB=60` uses signed integer dot products for IQ4_NL and Q8_0 experts during decode. Each group of sixteen activations shares a scale and uses two signed bytes per value. `IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1` groups routed tokens for native 16×16×16 FP16 matrix instructions with FP32 accumulation. `IK2_ATTN_MMA=1` enables WMMA decode attention on every visit, and `2` selects full-attention visits only. `IK2_FLASH=1` enables WMMA prefill attention. Both attention kernels accept FP16 and software-decoded E4M3 KV, including ring buffers, relative bias and the sink. The CUDA block verifier and drafter server path still require NVIDIA kernels.
+
+These are plain greedy rates, using three uncached requests per depth in one resident process. The server predicts the first output token during prefill. Each decode timing covers the following 128 tokens. For this measurement, attention used the HIP scalar decode and hipBLAS prefill paths. The reported 64 tok/s for the existing llama.cpp service came from a separate run.
+
+| Prompt tokens | Decode tok/s, three runs | Uncached prefill tok/s, three runs |
+| ---: | --- | --- |
+| 32 | 95.10, 95.10, 96.24 | 12.90, 48.71, 49.00 |
+| 512 | 91.69, 91.69, 91.56 | 890.43, 888.89, 890.43 |
+| 2,048 | 87.55, 87.55, 87.55 | 818.87, 825.14, 819.86 |
+
+Run inside the ROCm container, with the installed IQ4_NL GGUF mounted at `/weight.gguf`. The benchmark alternates the first prompt token, checks the server's cached-token count, and requests greedy decoding without a stop token. The water continuation described above supplies these input IDs.
+
+```sh
+cd /work
+echo '151712,156358,179692,149880,167442,82,149922,150011,156258,156358,179692,149922,151333,150628,13,150847,151197,178091,82,149876,167442,279,150279,159383,150301,186867,152023,149884,151214,13' > water.force
+IK2_HOST=mmap IK2_KV=fp8 IK2_GATE_BF16=1 IK2_GATE_TILE=64 IK2_Q8_UNROLL=1 \
+IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1 IK2_EXPERT_LIMB=60 IK2_ATTN_MMA=0 IK2_FLASH=0 \
+python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    --tokens water.force --depths 32,512,2048 --gen 129 --repeats 3 --chunk 128
+```

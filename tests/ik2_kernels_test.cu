@@ -1502,16 +1502,24 @@ void test_attn_flash() {
         {70, 2000, 256, 256, 400, 2, "attn_flash ring 400, window 256"},
         {9, 40, 1 << 30, 64, 0, 7, "attn_flash 9 queries, empty splits"},
     };
-    for (const Case& c : cases) {
+    for (bool fp8 : {false, true}) for (const Case& c : cases) {
         const int n_pos = c.qpos0 + c.Tq;   // positions written so far
         const int rows = c.kv_cap > 0 ? c.kv_cap : n_pos;
-        auto kf = fvec((size_t) n_pos * KV * D), vf = fvec((size_t) n_pos * KV * D);
+        std::vector<uint8_t> k8((size_t) rows * KV * D), v8(k8.size());
         std::vector<uint16_t> kc((size_t) rows * KV * D, 0x7e00), vc((size_t) rows * KV * D, 0x7e00);   // (NaN: unused)
         for (int pos = 0; pos < n_pos; ++pos) {
             const int pr = c.kv_cap > 0 ? pos % c.kv_cap : pos;
             for (int x = 0; x < KV * D; ++x) {
-                kc[(size_t) pr * KV * D + x] = f2h_host(kf[(size_t) pos * KV * D + x]);
-                vc[(size_t) pr * KV * D + x] = f2h_host(vf[(size_t) pos * KV * D + x]);
+                const size_t idx = (size_t) pr * KV * D + x;
+                if (fp8) {
+                    k8[idx] = (rng() & 0x80u) | (rng() % 0x60u);
+                    v8[idx] = (rng() & 0x80u) | (rng() % 0x60u);
+                    kc[idx] = f2h_host(e4m3fn_to_f32_host(k8[idx]));
+                    vc[idx] = f2h_host(e4m3fn_to_f32_host(v8[idx]));
+                } else {
+                    kc[idx] = f2h_host(frand(1.0f));
+                    vc[idx] = f2h_host(frand(1.0f));
+                }
             }
         }
         const int q_ld = H * D + 64;
@@ -1519,14 +1527,26 @@ void test_attn_flash() {
         std::vector<uint16_t> q16(qf.size());
         for (size_t i = 0; i < qf.size(); ++i) q16[i] = f2h_host(qf[i]);
         auto bias = fvec((size_t) c.Tq * H * c.extent, 2.0f), sink = fvec((size_t) c.Tq * H, 3.0f);
-        const float scale = 1.0f / std::sqrt((float) D);
+        const float scale = (fp8 ? 1.0f / 16.0f : 1.0f) / std::sqrt((float) D);
+        const float v_scale = fp8 ? 1.0f / 32.0f : 1.0f;
         const int o_ld = H * D + 32;
-        uint16_t *dq = dev(q16), *dk = dev(kc), *dv = dev(vc);
+        uint16_t* dq = dev(q16);
         float *db = dev(bias), *ds = dev(sink), *dout = dev_n<float>((size_t) c.Tq * o_ld);
         const size_t scr = (size_t) 8 * c.Tq * H * (D + 2);
         float* dscr = dev_n<float>(scr);
-        k::attn_flash_f16(dq, q_ld, dk, dv, c.kv_cap, H, KV, D, c.Tq, c.qpos0, scale, db, c.extent, c.window, ds, dout,
-                          o_ld, dscr, scr, c.n_split, 0);
+        if (fp8) {
+            uint8_t *dk = dev(k8), *dv = dev(v8);
+            k::attn_flash_fp8(dq, q_ld, dk, dv, c.kv_cap, H, KV, D, c.Tq, c.qpos0, scale, v_scale, db,
+                              c.extent, c.window, ds, dout, o_ld, dscr, scr, c.n_split, 0);
+            CU(cudaDeviceSynchronize());
+            cudaFree(dk), cudaFree(dv);
+        } else {
+            uint16_t *dk = dev(kc), *dv = dev(vc);
+            k::attn_flash_f16(dq, q_ld, dk, dv, c.kv_cap, H, KV, D, c.Tq, c.qpos0, scale, db, c.extent, c.window,
+                              ds, dout, o_ld, dscr, scr, c.n_split, 0);
+            CU(cudaDeviceSynchronize());
+            cudaFree(dk), cudaFree(dv);
+        }
         const auto out = host(dout, (size_t) c.Tq * o_ld);
         std::vector<float> got;
         std::vector<double> want;
@@ -1552,13 +1572,15 @@ void test_attn_flash() {
                     double o = 0;
                     for (int kp = lo; kp <= qp; ++kp)
                         o += std::exp(l[kp - lo] - m) / sum * h2f_host(vc[((size_t) (c.kv_cap > 0 ? kp % c.kv_cap : kp) * KV + g) * D + d]);
-                    want.push_back(o);
+                    want.push_back(o * v_scale);
                     got.push_back(out[(size_t) i * o_ld + h * D + d]);
                 }
             }
         }
-        expect(c.name, got, want, 1e-2, 2e-3);
-        for (uint16_t* p : {dq, dk, dv}) cudaFree(p);
+        char name[96];
+        std::snprintf(name, sizeof name, "%s %s", c.name, fp8 ? "fp8" : "f16");
+        expect(name, got, want, 1e-2, 2e-3);
+        cudaFree(dq);
         for (float* p : {db, ds, dout, dscr}) cudaFree(p);
     }
 }
@@ -2524,17 +2546,58 @@ void test_round6() {
 
 }  // namespace
 
+#ifdef STRATA_USE_HIP
+// Three nonempty experts separated by an empty one, including a partial token tile and a partial output workgroup.
+void test_rdna3_expert_gemm() {
+    constexpr int E = 4, N = 48, K = 96, T = 39;
+    const std::vector<int> starts{0, 1, 1, 22, T};
+    int* ds = dev(starts);
+    std::vector<uint16_t> x(T * K);
+    for (auto& v : x) v = f2h_host(frand(0.75f));
+    auto* dx = dev(x);
+    auto* dy = dev_n<float>(T * N);
+    for (int type : {k::kIQ4_NL, k::kQ8_0}) {
+        auto raw = rand_blocks(type, (size_t)E * 2 * N * K);
+        auto* weights = dev(raw);
+        const size_t matrix_bytes = raw.size() / (2 * E);
+        std::vector<const uint8_t*> blob(E);
+        for (int e = 0; e < E; ++e) blob[e] = weights + 2 * e * matrix_bytes;
+        auto** db = dev(blob);
+        for (int matrix = 0; matrix < 2; ++matrix) {
+            const size_t offset = matrix * matrix_bytes;
+            k::rdna3_expert_gemm(type, db, offset, E, ds, 21, dx, K, N, dy, 0);
+            std::vector<double> expected(T * N);
+            std::vector<float> w(N * K);
+            for (int e = 0; e < E; ++e) {
+                k::decode_host(type, raw.data() + 2 * e * matrix_bytes + offset, N * K, w.data());
+                for (int t = starts[e]; t < starts[e + 1]; ++t)
+                    for (int n = 0; n < N; ++n)
+                        for (int i = 0; i < K; ++i)
+                            expected[t * N + n] += (double)h2f_host(x[t * K + i]) * h2f_host(f2h_host(w[n * K + i]));
+            }
+            expect(type == k::kIQ4_NL ? "RDNA3 WMMA IQ4_NL expert GEMM" : "RDNA3 WMMA Q8_0 expert GEMM",
+                   host(dy, T * N), expected, 1e-4, 1e-3);
+        }
+        cudaFree(db);
+        cudaFree(weights);
+    }
+    cudaFree(dy);
+    cudaFree(dx);
+    cudaFree(ds);
+}
+#endif
+
 // One decode token has one input shared by its selected experts. Include zero
 // groups and signed activations whose low limb changes the dot product.
 void test_expert_limbs() {
     constexpr int C = 256, F = 128, S = 3;
-    for (bool q8 : {false, true}) {
-        const int ty = q8 ? k::kQ8_0 : k::kNVFP4;
+    for (int ty : {k::kNVFP4, k::kQ8_0, k::kIQ4_NL}) {
+        const bool q8 = ty == k::kQ8_0;
         const int block = k::block_values(ty), bytes = k::block_bytes(ty);
         const size_t matrix_bytes = (size_t)C * F / block * bytes;
         auto pool = rand_blocks(ty, (size_t)S * 3 * C * F);
         for (size_t off = 0; off < pool.size(); off += bytes) {
-            if (q8) {
+            if (ty != k::kNVFP4) {
                 const uint16_t scale = f2h_host(1.0f / 256);
                 std::memcpy(pool.data() + off, &scale, sizeof(scale));
             } else {
@@ -2558,7 +2621,7 @@ void test_expert_limbs() {
         k::experts_gate_up_swiglu(blobs, tokens, S, ty, ty, matrix_bytes, input, C, F, nullptr, nullptr, 20, 20, ref,
                                   0);
         k::expert_limb_mv(true, blobs, matrix_bytes, C, F, S, input, got, output, nullptr, nullptr, 20, 20, scratch, 0,
-                          q8);
+                          ty);
         const auto h_ref = host(ref, S * F), h_got = host(got, S * F);
         std::vector<double> expected(h_ref.size());
         std::vector<float> actual(h_ref.size());
@@ -2566,12 +2629,12 @@ void test_expert_limbs() {
             expected[i] = h2f_host(h_ref[i]);
             actual[i] = h2f_host(h_got[i]);
         }
-        expect(q8 ? "Q8 limb SwiGLU" : "NVFP4 limb SwiGLU", actual, expected, 2e-3, 5e-3);
+        expect(ty == k::kIQ4_NL ? "IQ4_NL limb SwiGLU" : q8 ? "Q8 limb SwiGLU" : "NVFP4 limb SwiGLU", actual, expected, 2e-3, 5e-3);
         k::experts_down(blobs, S, ty, 2 * matrix_bytes, ref, C, F, output, 0);
         const auto reference_down = host(output, S * C);
         k::expert_limb_mv(false, blobs, 2 * matrix_bytes, C, F, S, input, ref, output, nullptr, nullptr, 20, 20,
-                          scratch, 0, q8);
-        expect(q8 ? "Q8 limb down" : "NVFP4 limb down", host(output, S * C),
+                          scratch, 0, ty);
+        expect(ty == k::kIQ4_NL ? "IQ4_NL limb down" : q8 ? "Q8 limb down" : "NVFP4 limb down", host(output, S * C),
                std::vector<double>(reference_down.begin(), reference_down.end()), 1e-3, 1e-2);
         // Resident short-prefill callers have an FP16 mirror of each normalized input.
         // Give the reference the very same rounded activations and test indirect output rows.
@@ -2604,7 +2667,7 @@ void test_expert_limbs() {
             actual[j] = h2f_host(gh[j]);
             expected[j] = h2f_host(rh[j]);
         }
-        expect(q8 ? "Q8 grouped FP16 input" : "NVFP4 grouped FP16 input", actual, expected, 2e-3, 5e-3);
+        expect(ty == k::kIQ4_NL ? "IQ4_NL grouped FP16 input" : q8 ? "Q8 grouped FP16 input" : "NVFP4 grouped FP16 input", actual, expected, 2e-3, 5e-3);
         cudaFree(x16);
         cudaFree(x32);
         cudaFree(counts);
@@ -2710,6 +2773,9 @@ int main() {
     test_decode();
     test_iq_ref();
     test_experts_mv();
+#ifdef STRATA_USE_HIP
+    test_rdna3_expert_gemm();
+#endif
     test_attn_decode();
     test_mv_blocks();
     test_experts_grouped();
@@ -2719,10 +2785,8 @@ int main() {
     test_round2_fused();
     test_fp8_kv();
     test_round6();
-#ifndef STRATA_USE_HIP
-    test_attn_flash();   // (last: its random data leaves the others' as they were)
+    test_attn_flash();
     test_attn_decode_mma();
-#endif
     test_cand_topk();
     test_token_path();
     test_expert_limbs();
@@ -2730,7 +2794,7 @@ int main() {
     test_experts_mma();
     test_q8_verify_tile();
 #else
-    std::puts("CUDA-only MMA and flash tests excluded on gfx1100");
+    std::puts("CUDA-only NVFP4 MMA and verify tile tests excluded on gfx1100");
 #endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;

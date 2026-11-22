@@ -1916,14 +1916,30 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             uint16_t* sorted_input = (uint16_t*)X.lg;
             float* sorted_out = (float*)(sorted_input + (size_t)S * std::max(C, F));
             gather_f16_16_kernel<<<S, 256, 0, g_s>>>(xin, X.gidx, S, C, sorted_input);
-            for (int e : X.hit_exps) {
-                const size_t offset = W.start[e];
-                gate_up_product(e, sorted_input + offset * C, X.gu32 + offset * 2 * F);
-            }
-            k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
-            for (int e : X.hit_exps) {
-                const size_t offset = W.start[e];
-                down_product(e, sorted_input + offset * F, sorted_out + offset * C);
+#ifdef STRATA_USE_HIP
+            static const bool wmma = getenv("IK2_PREFILL_WMMA") && atoi(getenv("IK2_PREFILL_WMMA"));
+            if (wmma && Ly.ty[0] == Ly.ty[1] && Ly.ty[0] == Ly.ty[2] &&
+                (Ly.ty[0] == k::kIQ4_NL || Ly.ty[0] == k::kQ8_0) && c.E + 1 <= 2 * S &&
+                C % 32 == 0 && F % 32 == 0) {
+                const int max_rows = *std::max_element(W.cnt.begin(), W.cnt.begin() + c.E);
+                // The routing results have already been consumed on the host. Reuse their device storage for offsets.
+                CU(cudaMemcpyAsync(X.route_d, W.start.data(), (c.E + 1) * sizeof(int), cudaMemcpyHostToDevice, g_s));
+                k::rdna3_expert_gemm(Ly.ty[0], Ly.tab_blob, 0, c.E, X.route_d, max_rows, sorted_input, C, 2 * F, X.gu32, g_s);
+                k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
+                k::rdna3_expert_gemm(Ly.ty[2], Ly.tab_blob, Ly.eb[0] + Ly.eb[1], c.E, X.route_d, max_rows,
+                                     sorted_input, F, C, sorted_out, g_s);
+            } else
+#endif
+            {
+                for (int e : X.hit_exps) {
+                    const size_t offset = W.start[e];
+                    gate_up_product(e, sorted_input + offset * C, X.gu32 + offset * 2 * F);
+                }
+                k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
+                for (int e : X.hit_exps) {
+                    const size_t offset = W.start[e];
+                    down_product(e, sorted_input + offset * F, sorted_out + offset * C);
+                }
             }
             combine_prefill_groups<<<T, 256, 0, g_s>>>(sorted_out, X.inv, X.wtr, C, c.K, X.tmp);
             X.pf_layers[l % Work::kPfRing] = -1;
@@ -2427,16 +2443,17 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + c.K);
         static const int limb = getenv("IK2_EXPERT_LIMB") ? atoi(getenv("IK2_EXPERT_LIMB")) : 0;
+        const bool iq4_gate = Ly.ty[0] == k::kIQ4_NL && Ly.ty[1] == k::kIQ4_NL;
         const bool q8_gate = Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0;
         const bool fast_gate =
-            C % 64 == 0 && (((limb & 1) && Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4) || ((limb & 4) && q8_gate));
+            C % 64 == 0 && (((limb & 1) && Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4) || ((limb & 4) && q8_gate) || ((limb & 16) && iq4_gate));
         const bool fast_down =
-            c.F % 64 == 0 && (((limb & 2) && Ly.ty[2] == k::kNVFP4) || ((limb & 8) && Ly.ty[2] == k::kQ8_0));
+            c.F % 64 == 0 && (((limb & 2) && Ly.ty[2] == k::kNVFP4) || ((limb & 8) && Ly.ty[2] == k::kQ8_0) || ((limb & 32) && Ly.ty[2] == k::kIQ4_NL));
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
         const bool exp_tc = exp_mma && !fast_gate && !fast_down && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
-                       fast_gate ? W.gu32 : nullptr, q8_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr);
+                       fast_gate ? W.gu32 : nullptr, q8_gate || iq4_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr);
 
 #ifdef IK2_HOST_AVX2
         if ((tier_active || host_plan.forced) && !host_plan.active.empty() && host_plan.active[l]) {
@@ -2466,13 +2483,13 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             } else {
             if (fast_gate)
                 k::expert_limb_mv(true, W.blob, Ly.eb[0], C, c.F, c.K, W.xq, W.h16, W.y32, W.sg, W.su, c.gate_cap,
-                                  c.up_cap, W.gu32, g_s, q8_gate, true);
+                                  c.up_cap, W.gu32, g_s, Ly.ty[0], true);
             else
                 k::experts_gate_up_swiglu(W.blob, W.tok, c.K, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
                                           c.gate_cap, c.up_cap, W.h16, g_s);
             if (fast_down && C % 2 == 0)
                 k::expert_limb_mv(false, W.blob, Ly.eb[0] + Ly.eb[1], C, c.F, c.K, W.xq, W.h16, W.y32, W.sg, W.su,
-                                  c.gate_cap, c.up_cap, W.gu32, g_s, Ly.ty[2] == k::kQ8_0, false);
+                                  c.gate_cap, c.up_cap, W.gu32, g_s, Ly.ty[2], false);
             else
                 k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
             }
@@ -4123,14 +4140,14 @@ int main(int argc, char** argv) {
     }
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
 #ifdef STRATA_USE_HIP
-    for (const char* flag : {"IK2_FLASH", "IK2_ATTN_MMA", "IK2_EXPERT_MMA", "IK2_GROUP_MMA",
+    for (const char* flag : {"IK2_EXPERT_MMA", "IK2_GROUP_MMA",
                              "IK2_Q8_TILE", "IK2_BLOCK", "IK2_WGMMA"}) {
         if (getenv(flag) && std::atoi(getenv(flag))) die(std::string(flag) + " requires CUDA tensor cores");
     }
     if (serve && !draft_path.empty()) die("--serve with --draft requires CUDA block verification");
     if (n_gpu != 1) die("HIP supports one gfx1100 device");
-    g_flash = false;
-    std::fprintf(stderr, "ik2 HIP gfx1100: scalar experts and decode attention, hipBLAS prefill\n");
+    g_flash = getenv("IK2_FLASH") && std::atoi(getenv("IK2_FLASH"));
+    std::fprintf(stderr, "ik2 HIP gfx1100: %s prefill attention\n", g_flash ? "RDNA3 WMMA" : "hipBLAS");
 #else
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
 #endif
@@ -4323,7 +4340,9 @@ int main(int argc, char** argv) {
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
 #ifdef STRATA_USE_HIP
     g_block = false;
-    g_attn_mma = 0;
+    g_attn_mma = getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 0;
+    if (g_attn_mma < 0 || g_attn_mma > 2) die("IK2_ATTN_MMA expects 0, 1 or 2");
+    g_mma_split = k::attn_decode_mma_blocks(c.KV);
 #else
     g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
@@ -5087,7 +5106,7 @@ int main(int argc, char** argv) {
             EC.misses = m0, EC.bytes_up = b0;
             g_fast = true;
             std::printf("resident: every expert in VRAM (%d copied in %.1f s); tokens take the resident path%s\n", n,
-                        now() - tw, g_graph ? ", a CUDA graph each" : "");
+                        now() - tw, g_graph ? ", one graph replay per decode step" : "");
         } else {
             std::printf("resident path off: %s\n", all ? "a dense matrix is not kept as blocks" : "the cache does not hold every expert");
         }

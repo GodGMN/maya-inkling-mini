@@ -170,12 +170,12 @@ void loop_gate_blend(const float* x, const float* m, const float* f, const float
 
 // ---- the token path: the experts straight from their blocks, the attention of one query
 
-/// Two signed INT8 limbs approximate each activation for DP4A with the serialized NVFP4 or Q8 weights.
+/// Two signed INT8 limbs approximate each activation for DP4A with the serialized NVFP4, Q8_0 or IQ4_NL weights.
 /// Scratch uses nine float-sized words per 16 inputs, one row for gate/up or S rows for down.
 /// A fused router can provide the gate input already packed.
 void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C, int F, int S, const float* x,
                     uint16_t* h, float* y, const float* sg, const float* su, float gcap, float ucap, void* scratch,
-                    cudaStream_t stream, bool q8 = false, bool packed = false);
+                    cudaStream_t stream, int type, bool packed = false);
 
 /// The routed experts of a few tokens as matrix-vector products over the blocks as the GGUF holds them (NVFP4, Q8_0,
 /// Q5_K, Q6_K), one launch a phase.  Slot s (S of them): its expert's blob at blob[s] (gate | up | down: eb0, eb1 bytes
@@ -405,6 +405,12 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
 
 /// ggml type ids of the blocks these decode.
 constexpr int kQ8_0 = 8, kQ5_K = 13, kQ6_K = 14, kIQ3_XXS = 18, kIQ4_NL = 20, kIQ4_XS = 23, kNVFP4 = 40;
+#ifdef STRATA_USE_HIP
+/// Sorted half inputs [starts[count], K] and resident GGUF matrices [N, K] to float outputs [starts[count], N].
+/// starts gives each expert's half-open input range. K must be a multiple of 32 and N a multiple of 16.
+void rdna3_expert_gemm(int type, const uint8_t* const* experts, size_t offset, int count, const int* starts,
+                       int max_rows, const uint16_t* input, int K, int N, float* output, cudaStream_t stream);
+#endif
 /// values a block / bytes a block (0: not one of the above).
 int block_values(int type);
 size_t block_bytes(int type);
