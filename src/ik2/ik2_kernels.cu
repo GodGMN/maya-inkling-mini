@@ -6031,16 +6031,15 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
                      window, scratch, out, s);
 }
 
+#ifndef STRATA_USE_HIP
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
              cudaStream_t s) {
-#ifdef STRATA_USE_HIP
-    unavailable_mma(__func__);
-#else
+
     q8_mma_tile<4><<<dim3((N + 15) / 16, (T + 7) / 8), 128, 0, s>>>(q, d, N, K, x, T, y, ldy);
     check("q8_mma_tile");
-#endif
 }
 
+#endif
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
                  const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1) {
     if (N <= 0) return;

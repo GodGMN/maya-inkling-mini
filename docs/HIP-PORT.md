@@ -1,6 +1,6 @@
 # Inkling 2 Mini on gfx1100
 
-Phase 1 targets the RX 7900 XTX on Prometheus. The HIP executable uses the resident expert path, scalar NVFP4 and Q8_0 expert products, scalar decode attention, and hipBLAS for prompt GEMMs. Use the text-only configuration as the starting point for validation, with a short context first. The CUDA configuration's maximum context and speed have not been measured on AMD.
+The port runs on Prometheus's RX 7900 XTX. Build instructions and the original scalar port are below. The [RDNA3 results](#rdna3-expert-and-attention-kernels) give the measured configuration and uncached benchmark command.
 
 ## Build on Prometheus without a GPU
 
@@ -29,7 +29,7 @@ cmake --build build-ik2 -j4 --target maya-ik2 ik2_kernels_test ik2_host_ref_test
 
 The base library uses the same source and target architecture. For the separate base build directory on Prometheus, the build command is `cmake --build build -j4 --target strata_engine`. The engine links its own kernels and hipBLAS directly.
 
-## CUDA and HIP differences
+## CUDA and HIP differences in the initial scalar port
 
 | Area | Phase 1 implementation |
 | --- | --- |
@@ -56,7 +56,7 @@ Inside the build container, run `build-ik2/ik2_host_ref_test < /work/ik2-host-re
 
 `python3 -m unittest tools.test_hip_compat` passed the repository's CUDA name mapping checks. The CUDA 13 managed-memory shims are excluded from HIP. Both builds completed with the build container limited to four CPUs and 6 GiB of RAM with swap disabled. At completion, `df -h /work` reported 21G available on the root filesystem.
 
-After GPU release, run `ctest --test-dir build-ik2 -R '^ik2_kernels_test$' --output-on-failure` with the GPU available. The suite contains scalar expert, routing, FP8 and FP16 attention checks against numerical references. Full-model validation also requires an approved storage location for the unsloth GGUF. Compare logits on identical forced tokens, generated text, and graph-on/off output before timing prefill and decode at different prompt depths.
+To rerun the device suite, use `ctest --test-dir build-ik2 -R '^ik2_kernels_test$' --output-on-failure` with the GPU available. The suite contains scalar expert, routing, FP8 and FP16 attention checks against numerical references. The GPU validation below uses the installed ggml-org weights. Compare logits on identical forced tokens, generated text, and graph-on/off output before timing prefill and decode at different prompt depths.
 
 ### Forced decode comparison
 
@@ -132,3 +132,16 @@ IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1 IK2_EXPERT_LIMB=60 IK2_ATTN_MMA=0 IK2_FLA
 python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
     --tokens water.force --depths 32,512,2048 --gen 129 --repeats 3 --chunk 128
 ```
+
+The four full-vocabulary checks below used the same WMMA attention and integer-dot decode configuration. Each row compares every forced step with the independent float64 forward, including the prediction after the final forced token. The three chat checks used terminal token `<|content_model_end_sampling|>` and the normal chat template at effort `none`. They returned Paris, `12 - 3 - 4 = 5 apples`, and an explanation of ice's lower density and open hydrogen-bonded lattice.
+
+| Passage | Prompt | Forced positions | Top-1 matches | Mean KL | Max KL |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Water | 4 | 30 | 30 | 0.00147747 | 0.00451225 |
+| Fibonacci | 8 | 33 | 33 | 0.00048531 | 0.00675873 |
+| Apples | 7 | 33 | 33 | 0.00152825 | 0.00606835 |
+| Library | 114 | 13 | 11 | 0.01083507 | 0.05335118 |
+
+For the library check, repeat “The town library keeps its reading room open on Saturdays. Visitors can borrow a book for three weeks and renew it online. ” four times and append “A visitor borrows a book on Saturday.” Force the continuation “ When is the book due? It is due three weeks later.” Starting from the benchmark environment above, enable `IK2_FLASH=1 IK2_ATTN_MMA=1`. Run the CLI with `--tokens @long.prompt --gen 14 --ctx 1024 --chunk 128`, `IK2_FORCE=long.force`, and `IK2_LOGITS_OUT=all-flash-long.f32`. Compare using `python3 tools/ik2_compare_decode.py all-flash-long.f32 --ref long-ref.npy --prompt-length 114 --gen 14 --vocab 200058`. The two top-1 changes were at positions 114 and 119. These are distribution checks on four passages.
+
+The Loom bundle uses the original Unsloth quant and an external drafter on Strix Halo. Its report identifies speculative acceptance separately for each context. Here the weights are ggml-org IQ4_NL and the decoder predicts one token per step. The Loom code identifies two relevant operations for the port, grouping routed experts for WMMA and accumulating relative-position attention with an explicit sink. [Loom measurement report](https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom/blob/a78779814f545e254cffa9b346e85f236d54ea7c/REPORT.md)

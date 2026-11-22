@@ -7,6 +7,7 @@
 // Layouts: rows of tokens; a token's heads back to back ([T][H][D]); the K / V caches by position, [ctx][Hkv][D] F32.
 // CUDA sm_80+ and the scalar HIP port for gfx1100 (docs/HIP-PORT.md).
 #pragma once
+#include <algorithm>
 
 #include <cstddef>
 #include <cstdint>
@@ -406,10 +407,20 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
 /// ggml type ids of the blocks these decode.
 constexpr int kQ8_0 = 8, kQ5_K = 13, kQ6_K = 14, kIQ3_XXS = 18, kIQ4_NL = 20, kIQ4_XS = 23, kNVFP4 = 40;
 #ifdef STRATA_USE_HIP
-/// Sorted half inputs [starts[count], K] and resident GGUF matrices [N, K] to float outputs [starts[count], N].
-/// starts gives each expert's half-open input range. K must be a multiple of 32 and N a multiple of 16.
-void rdna3_expert_gemm(int type, const uint8_t* const* experts, size_t offset, int count, const int* starts,
-                       int max_rows, const uint16_t* input, int K, int N, float* output, cudaStream_t stream);
+struct ExpertTile {
+    int expert, first, end;
+};
+inline int expert_tile_capacity(int slots, int experts) {
+    // At most one partial 16-row tile per nonempty expert.
+    return std::min(slots, experts + (slots - 1) / 16);
+}
+/// Group [T, K] picks by expert, schedule their 16-row tiles, and preserve expert order in each token's sum.
+void rdna3_expert_groups(const int* top, const float* weights, int slots, int K, int experts, const float* gs,
+                         const float* us, const float* ds, ExpertTile* tiles, int* tokens, int* inv, float* gate,
+                         float* up, float* weight, cudaStream_t stream);
+/// Sorted half inputs and resident GGUF matrices [N, K] to float outputs. K % 32 == N % 16 == 0.
+void rdna3_expert_gemm(int type, const uint8_t* const* experts, size_t offset, const ExpertTile* tiles, int capacity,
+                       const uint16_t* input, int K, int N, float* output, cudaStream_t stream);
 #endif
 /// values a block / bytes a block (0: not one of the above).
 int block_values(int type);

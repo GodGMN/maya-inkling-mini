@@ -2547,11 +2547,65 @@ void test_round6() {
 }  // namespace
 
 #ifdef STRATA_USE_HIP
+void test_rdna3_expert_groups() {
+    constexpr int E = 64, K = 4;
+    const auto gs = fvec(E), us = fvec(E), ds = fvec(E);
+    auto *dg = dev(gs), *du = dev(us), *dd = dev(ds);
+    for (int T : {2, 17, 129}) {
+        const int slots = T * K, capacity = k::expert_tile_capacity(slots, E);
+        std::vector<int> top(slots);
+        for (int t = 0; t < T; ++t) {
+            // Expert zero spans many tiles. Most other experts see a mix of one or two rows.
+            for (int j = 0; j < K; ++j)
+                top[t * K + j] = j == 2 ? 0 : 1 + (t + 7 * j) % (E - 1);
+        }
+        const auto weights = fvec(slots);
+        auto *dt = dev(top), *tokens = dev_n<int>(slots), *inv = dev_n<int>(slots);
+        auto *dw = dev(weights), *gate = dev_n<float>(slots), *up = dev_n<float>(slots), *weight = dev_n<float>(slots);
+        auto* tiles = dev_n<k::ExpertTile>(capacity);
+        for (bool scales : {false, true}) {
+            k::rdna3_expert_groups(dt, dw, slots, K, E, scales ? dg : nullptr, scales ? du : nullptr,
+                                   scales ? dd : nullptr, tiles, tokens, inv, gate, up, weight, 0);
+            std::vector<int> experts(slots, -1);
+            bool correct = true;
+            for (const auto tile : host(tiles, capacity)) {
+                correct &= tile.expert >= 0 && tile.expert < E && tile.first >= 0 && tile.first <= tile.end &&
+                           tile.end <= slots && tile.end - tile.first <= 16;
+                if (!correct) break;
+                for (int r = tile.first; r < tile.end; ++r) {
+                    correct &= experts[r] == -1;
+                    experts[r] = tile.expert;
+                }
+            }
+            const auto in = host(tokens, slots), out = host(inv, slots);
+            const auto g = host(gate, slots), u = host(up, slots), w = host(weight, slots);
+            std::vector<int> uses(slots);
+            for (int t = 0; t < T && correct; ++t) {
+                std::vector<int> picks(top.begin() + t * K, top.begin() + (t + 1) * K);
+                std::sort(picks.begin(), picks.end());
+                for (int j = 0; j < K; ++j) {
+                    const int row = out[t * K + j], e = picks[j];
+                    if (row < 0 || row >= slots) { correct = false; break; }
+                    const auto it = std::find(top.begin() + t * K, top.begin() + (t + 1) * K, e);
+                    correct &= ++uses[row] == 1 && in[row] == t && experts[row] == e &&
+                               g[row] == (scales ? gs[e] : 1.f) && u[row] == (scales ? us[e] : 1.f) &&
+                               w[row] == weights[it - top.begin()] * (scales ? ds[e] : 1.f);
+                }
+            }
+            expect_true("RDNA3 expert tiles, row permutations, route scales and ordered reduction", correct);
+        }
+        cudaFree(dt); cudaFree(tokens); cudaFree(inv); cudaFree(dw); cudaFree(gate);
+        cudaFree(up); cudaFree(weight); cudaFree(tiles);
+    }
+    cudaFree(dg); cudaFree(du); cudaFree(dd);
+}
+
 // Three nonempty experts separated by an empty one, including a partial token tile and a partial output workgroup.
 void test_rdna3_expert_gemm() {
     constexpr int E = 4, N = 48, K = 96, T = 39;
     const std::vector<int> starts{0, 1, 1, 22, T};
-    int* ds = dev(starts);
+    const std::vector<k::ExpertTile> tiles{{0,0,1}, {2,1,17}, {2,17,22}, {3,22,38}, {3,38,39}, {0,0,0}};
+    auto* ds = dev(tiles);
     std::vector<uint16_t> x(T * K);
     for (auto& v : x) v = f2h_host(frand(0.75f));
     auto* dx = dev(x);
@@ -2565,7 +2619,7 @@ void test_rdna3_expert_gemm() {
         auto** db = dev(blob);
         for (int matrix = 0; matrix < 2; ++matrix) {
             const size_t offset = matrix * matrix_bytes;
-            k::rdna3_expert_gemm(type, db, offset, E, ds, 21, dx, K, N, dy, 0);
+            k::rdna3_expert_gemm(type, db, offset, ds, (int)tiles.size(), dx, K, N, dy, 0);
             std::vector<double> expected(T * N);
             std::vector<float> w(N * K);
             for (int e = 0; e < E; ++e) {
@@ -2736,7 +2790,7 @@ void test_q8_verify_tile() {
         for (auto& v : x)
             v = f2h_host(frand());
         auto* dx = dev(x);
-        auto* dy = dev_n<float>(T * ld);
+        auto* dy = dev(std::vector<float>(T * ld));
         k::q8_tile(dw, ds, N, K, dx, T, dy, ld, 0);
         std::vector<double> wanted(T * ld);
         for (int t = 0; t < T; ++t)
@@ -2774,6 +2828,7 @@ int main() {
     test_iq_ref();
     test_experts_mv();
 #ifdef STRATA_USE_HIP
+    test_rdna3_expert_groups();
     test_rdna3_expert_gemm();
 #endif
     test_attn_decode();
@@ -2792,10 +2847,10 @@ int main() {
     test_expert_limbs();
 #ifndef STRATA_USE_HIP
     test_experts_mma();
-    test_q8_verify_tile();
 #else
-    std::puts("CUDA-only NVFP4 MMA and verify tile tests excluded on gfx1100");
+    std::puts("CUDA-only NVFP4 MMA tests excluded on gfx1100");
 #endif
+    test_q8_verify_tile();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -1916,30 +1916,14 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             uint16_t* sorted_input = (uint16_t*)X.lg;
             float* sorted_out = (float*)(sorted_input + (size_t)S * std::max(C, F));
             gather_f16_16_kernel<<<S, 256, 0, g_s>>>(xin, X.gidx, S, C, sorted_input);
-#ifdef STRATA_USE_HIP
-            static const bool wmma = getenv("IK2_PREFILL_WMMA") && atoi(getenv("IK2_PREFILL_WMMA"));
-            if (wmma && Ly.ty[0] == Ly.ty[1] && Ly.ty[0] == Ly.ty[2] &&
-                (Ly.ty[0] == k::kIQ4_NL || Ly.ty[0] == k::kQ8_0) && c.E + 1 <= 2 * S &&
-                C % 32 == 0 && F % 32 == 0) {
-                const int max_rows = *std::max_element(W.cnt.begin(), W.cnt.begin() + c.E);
-                // The routing results have already been consumed on the host. Reuse their device storage for offsets.
-                CU(cudaMemcpyAsync(X.route_d, W.start.data(), (c.E + 1) * sizeof(int), cudaMemcpyHostToDevice, g_s));
-                k::rdna3_expert_gemm(Ly.ty[0], Ly.tab_blob, 0, c.E, X.route_d, max_rows, sorted_input, C, 2 * F, X.gu32, g_s);
-                k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
-                k::rdna3_expert_gemm(Ly.ty[2], Ly.tab_blob, Ly.eb[0] + Ly.eb[1], c.E, X.route_d, max_rows,
-                                     sorted_input, F, C, sorted_out, g_s);
-            } else
-#endif
-            {
-                for (int e : X.hit_exps) {
-                    const size_t offset = W.start[e];
-                    gate_up_product(e, sorted_input + offset * C, X.gu32 + offset * 2 * F);
-                }
-                k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
-                for (int e : X.hit_exps) {
-                    const size_t offset = W.start[e];
-                    down_product(e, sorted_input + offset * F, sorted_out + offset * C);
-                }
+            for (int e : X.hit_exps) {
+                const size_t offset = W.start[e];
+                gate_up_product(e, sorted_input + offset * C, X.gu32 + offset * 2 * F);
+            }
+            k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
+            for (int e : X.hit_exps) {
+                const size_t offset = W.start[e];
+                down_product(e, sorted_input + offset * F, sorted_out + offset * C);
             }
             combine_prefill_groups<<<T, 256, 0, g_s>>>(sorted_out, X.inv, X.wtr, C, c.K, X.tmp);
             X.pf_layers[l % Work::kPfRing] = -1;
@@ -3027,6 +3011,30 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
 }
 
+#ifdef STRATA_USE_HIP
+bool resident_wmma_prefill(const Config& c, const Layer& ly, int T, Work& w) {
+    static const bool enabled = getenv("IK2_PREFILL_WMMA") && atoi(getenv("IK2_PREFILL_WMMA"));
+    const int S = T * c.K, C = c.C, F = c.F;
+    const int capacity = k::expert_tile_capacity(S, c.E);
+    if (!enabled || !g_fast || T < 2 || !ly.tab_blob || c.E > 1024 ||
+        ly.ty[0] != ly.ty[1] || ly.ty[0] != ly.ty[2] || (ly.ty[0] != k::kIQ4_NL && ly.ty[0] != k::kQ8_0) ||
+        C % 32 || F % 32 || (size_t)capacity * sizeof(k::ExpertTile) > (size_t)T * F * sizeof(uint16_t) ||
+        (size_t)S * (2 * std::max(C, F) + 4 * C) > w.lg_cap * sizeof(float) ||
+        (size_t)S * 2 * F * sizeof(float) > w.gu32_bytes) return false;
+    auto* tiles = reinterpret_cast<k::ExpertTile*>(w.h16);
+    auto* input = reinterpret_cast<uint16_t*>(w.lg);
+    auto* output = reinterpret_cast<float*>(input + (size_t)S * std::max(C, F));
+    k::rdna3_expert_groups(w.route_d, (const float*)(w.route_d + S), S, c.K, c.E, ly.tab_sc[0], ly.tab_sc[1],
+                           ly.tab_sc[2], tiles, w.gidx, w.inv, w.sg, w.su, w.wtr, g_s);
+    gather_f16_16_kernel<<<S, 256, 0, g_s>>>(w.x16, w.gidx, S, C, input);
+    k::rdna3_expert_gemm(ly.ty[0], ly.tab_blob, 0, tiles, capacity, input, C, 2 * F, w.gu32, g_s);
+    k::swiglu_cap_f32(w.gu32, S, F, w.sg, w.su, c.gate_cap, c.up_cap, input, g_s);
+    k::rdna3_expert_gemm(ly.ty[2], ly.tab_blob, ly.eb[0] + ly.eb[1], tiles, capacity, input, F, C, output, g_s);
+    combine_prefill_groups<<<T, 256, 0, g_s>>>(output, w.inv, w.wtr, C, c.K, w.tmp);
+    return true;
+}
+#endif
+
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     k::enable_grouped_tensor_products(allow_short_batch_products());
@@ -3145,6 +3153,13 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+#ifdef STRATA_USE_HIP
+        if (dump.empty() && !g_prof && !g_trace && g_pop.empty() && resident_wmma_prefill(c, Ly, T, W)) {
+            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
+            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            continue;
+        }
+#endif
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
         const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && Ly.ty[0] == k::kNVFP4 &&
                               Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
@@ -4141,7 +4156,7 @@ int main(int argc, char** argv) {
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
 #ifdef STRATA_USE_HIP
     for (const char* flag : {"IK2_EXPERT_MMA", "IK2_GROUP_MMA",
-                             "IK2_Q8_TILE", "IK2_BLOCK", "IK2_WGMMA"}) {
+                             "IK2_BLOCK", "IK2_WGMMA"}) {
         if (getenv(flag) && std::atoi(getenv(flag))) die(std::string(flag) + " requires CUDA tensor cores");
     }
     if (serve && !draft_path.empty()) die("--serve with --draft requires CUDA block verification");
@@ -4420,7 +4435,7 @@ int main(int argc, char** argv) {
             for (auto& x : w) x *= 1.0f / std::sqrt(9.0f);
         return w;
     };
-    std::printf("layout: %s\n", rw ? "unsloth's GGUF_shard_rewrite (llama.cpp master)" : "llama.cpp PR #32187");
+    std::printf("layout: %s\n", rw ? "GGUF_shard_rewrite tensor layout" : "llama.cpp PR #32187");
     struct ExpJob {
         int l;
         std::string name;   // a tensor read whole into pinned memory

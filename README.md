@@ -1,6 +1,8 @@
 # Inkling 2 Mini on AMD Radeon RX 7900 XTX
 
-This fork runs `maya-ik2` on the RX 7900 XTX with ROCm 7.2.1. It reads the ggml-org IQ4_NL weights directly. The GPU kernel suite passes on gfx1100. On a 30-position forced-decode check, the vectorized HIP engine with FP8 KV matched the float64 reference’s top choice at all 30 positions (mean KL 0.00183).
+On an RX 7900 XTX, `maya-ik2` with the ggml-org IQ4_NL weights and FP8 KV measured **91.6–91.7 tok/s greedy decode after a 512-token prompt** and **87.55 tok/s after 2,048 tokens**. Each rate covers 128 decode steps, with all experts in VRAM. Uncached prefill measured 889–890 and 819–825 tok/s at those depths. The port uses ROCm 7.2.1 and native RDNA3 WMMA for grouped expert prefill.
+
+The gfx1100 kernel suite passes. With WMMA attention enabled, forced decode matched the float64 reference's top token on all 96 positions across three short passages. After a 114-token prompt it matched on 11 of 13 positions. The build guide includes the switches, input IDs and timing command.
 
 ```sh
 git clone --branch hip-port https://github.com/GodGMN/maya-inkling-mini.git
