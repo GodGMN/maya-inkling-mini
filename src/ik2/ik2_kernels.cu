@@ -2594,6 +2594,15 @@ __device__ void row_dot_2(int type, const uint8_t* wg, const uint8_t* wu, const 
 }
 __device__ __forceinline__ void row_dot_pair(int type, const uint8_t* wg, const uint8_t* wu, const float* xs, int K,
                                              float& og, float& ou) {
+#ifdef STRATA_USE_HIP
+    if (type == kIQ4_NL) {
+        float ag = 0.f, au = 0.f;
+        iq4nl_rows<true>(wg, wu, xs, K, ag, au);
+        og = rdna3_iq4nl_gate_sum<true>(ag, wg, xs, K);
+        ou = rdna3_iq4nl_gate_sum<true>(au, wu, xs, K);
+        return;
+    }
+#endif
     row_dot_2(type, wg, wu, xs, K, og, ou);
 }
 

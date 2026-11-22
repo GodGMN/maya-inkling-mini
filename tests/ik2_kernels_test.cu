@@ -795,6 +795,37 @@ void test_experts_mv() {
     }
 }
 
+#ifdef STRATA_USE_HIP
+void test_iq4nl_gate_cancellation() {
+    constexpr int C = 512, F = 2;
+    constexpr size_t row_bytes = C / 32 * 18, gate_bytes = F * row_bytes;
+    std::vector<uint8_t> weights(2 * gate_bytes, 0x88); // Both nibbles decode to +1.
+    for (size_t b = 0; b < weights.size(); b += 18) {
+        weights[b] = 0;
+        weights[b + 1] = 0x3c; // Unit FP16 block scale.
+    }
+    for (int r = 0; r < F; ++r) weights[gate_bytes + r * row_bytes + 2] = 0x89;
+    std::vector<float> x(C);
+    x[0] = 4096.f;
+    x[4] = -4096.f;
+    x[64] = 1.f / 8192;
+    auto* pool = dev(weights);
+    auto* blobs = dev(std::vector<const uint8_t*>{pool});
+    auto* tokens = dev(std::vector<int>{0});
+    auto* input = dev(x);
+    auto* hidden = dev_n<uint16_t>(F);
+    k::experts_gate_up_swiglu(blobs, tokens, 1, k::kIQ4_NL, k::kIQ4_NL, gate_bytes, input, C, F,
+                              nullptr, nullptr, 12.f, 19.f, hidden, 0);
+    const double gate = x[64], up = 12. * x[0] + x[64];
+    const double expected = 12. * std::tanh(gate / 12.) / (1. + std::exp(-gate)) * 19. * std::tanh(up / 19.);
+    const auto result = host(hidden, F);
+    std::vector<float> activations;
+    for (uint16_t bits : result) activations.push_back(h2f_host(bits));
+    expect("IQ4_NL cancelling gate vs FP64", activations, std::vector<double>(F, expected), 5e-4, 1e-7);
+    cudaFree(hidden); cudaFree(input); cudaFree(tokens); cudaFree(blobs); cudaFree(pool);
+}
+#endif
+
 // the grouped kernels against the per-slot ones: 8 tokens, variable group sizes (1, 2, 3, 5, 8) over all quant types
 void test_experts_grouped() {
     const int C = 512, F = 256, E = 5, T = 8, K = 8, S = T * K;
@@ -3054,6 +3085,7 @@ int main() {
     test_iq_ref();
     test_experts_mv();
 #ifdef STRATA_USE_HIP
+    test_iq4nl_gate_cancellation();
     test_rdna3_small_dense();
     test_rdna3_dense_gemm();
     test_rdna3_expert_groups();

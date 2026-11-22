@@ -1,3 +1,25 @@
+// Recompute a projection when the wave sum loses twelve bits relative to a partial dot.
+template <bool Padded>
+__device__ __noinline__ float rdna3_iq4nl_precise_dot(const uint8_t* row, const float* x, int K) {
+    const int lane = threadIdx.x & 31;
+    double dot = 0;
+    for (int b = 0; b < K / 32; ++b) {
+        const uint8_t* block = row + b * 18;
+        const int nibble = (block[2 + (lane & 15)] >> (lane < 16 ? 0 : 4)) & 15;
+        const float w = h2f(*(const uint16_t*)block) * d_iq4nl[nibble];
+        dot += (double)w * x[b * (Padded ? 36 : 32) + lane];
+    }
+    for (int d = 16; d; d /= 2) dot += __shfl_xor(dot, d, 32);
+    return (float)dot;
+}
+
+template <bool Padded>
+__device__ __forceinline__ float rdna3_iq4nl_gate_sum(float local, const uint8_t* row, const float* x, int K) {
+    const float sum = wsum(local);
+    if (__any(fabsf(local) > 4096.f * fabsf(sum))) return rdna3_iq4nl_precise_dot<Padded>(row, x, K);
+    return sum;
+}
+
 // One wave reads eight 32-weight GGUF blocks per step and reuses its activation registers across output rows.
 template <bool Gate, int Type, int Rows, int Waves, int FixedK>
 __global__ void rdna3_expert_token(const uint8_t* const* blobs, size_t offset, const int* tokens,
@@ -46,16 +68,23 @@ __global__ void rdna3_expert_token(const uint8_t* const* blobs, size_t offset, c
     }
 #pragma unroll
     for (int r = 0; r < Rows; ++r) {
-        const float a = wsum(sums[r][0]);
         if constexpr (Gate) {
-            const float b = wsum(sums[r][1]);
+            float a, b;
+            if constexpr (Type == kIQ4_NL) {
+                a = rdna3_iq4nl_gate_sum<false>(sums[r][0], weights + r * stride, x + input, K);
+                b = rdna3_iq4nl_gate_sum<false>(sums[r][1], weights + r * stride + offset, x + input, K);
+            } else {
+                a = wsum(sums[r][0]);
+                b = wsum(sums[r][1]);
+            }
             if (lane == 0) {
                 const float g = a * (gates ? gates[slot] : 1.f), u = b * (ups ? ups[slot] : 1.f);
                 hidden[(size_t)slot * N + first + r] =
                     f2h(gate_cap * tanhf(g / gate_cap) * (1.f / (1.f + expf(-g))) * up_cap * tanhf(u / up_cap));
             }
-        } else if (lane == 0) {
-            output[(size_t)slot * N + first + r] = a;
+        } else {
+            const float a = wsum(sums[r][0]);
+            if (lane == 0) output[(size_t)slot * N + first + r] = a;
         }
     }
 }
