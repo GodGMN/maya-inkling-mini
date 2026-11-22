@@ -4,7 +4,7 @@ On Prometheus's RX 7900 XTX, `maya-ik2` decoded at **101.3 tok/s after a 512-tok
 
 Maya's uncached prefill at 8K measured 949 tok/s with 128-token chunks. Llama.cpp reached 1,488 tok/s with its production batch settings. The [hardware results and commands](docs/HIP-PORT.md#fp32-expert-decode-and-packed-e4m3-reads) cover both phases.
 
-The gfx1100 kernel suite passes. In a 96-question greedy GSM8K run, Maya returned 90 correct final answers with a 1,024-token output limit. The full-vocabulary checks include short passages and a 114-token prompt. [Quality checks](docs/HIP-PORT.md#rdna3-expert-and-attention-kernels)
+The gfx1100 kernel suite passes. On the same 96 GSM8K questions with a 1,024-token output limit, Maya scored 90 and llama.cpp scored 93. Maya reached the limit on all three questions that account for the difference. The full-vocabulary checks include short passages and a 114-token prompt. [Quality checks](docs/HIP-PORT.md#rdna3-expert-and-attention-kernels)
 
 ```sh
 git clone --branch hip-port https://github.com/GodGMN/maya-inkling-mini.git

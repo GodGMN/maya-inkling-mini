@@ -174,7 +174,8 @@ python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.ggu
 The same `ik2_bench.py` replayed the same input IDs, request order and 129-token output length against the patched llama.cpp HTTP service. Both decoders ran alone on the 7900 XTX. The service retained its deployed 393,216-token context, Q4_0 K/V, batch 2,048 and microbatch 256. Maya reserved 8,321 positions for this run, used E4M3 K/V and a 128-token chunk. The benchmark rejects a cached prompt or incomplete output and divides the generation time by the 128 steps after prefill.
 
 ```sh
-python3 src/tools/ik2_bench.py --llama-url http://127.0.0.1:8085 --tokens water.force     --depths 32,512,2048,8192 --gen 129 --repeats 3
+python3 src/tools/ik2_bench.py --llama-url http://127.0.0.1:8085 --tokens water.force \
+    --depths 32,512,2048,8192 --gen 129 --repeats 3
 ```
 
 | Prompt | Maya decode | llama.cpp decode | Maya prefill | llama.cpp prefill |
@@ -188,7 +189,7 @@ Medians in tok/s. The wider comparison is one GPU, one stream and one installed 
 
 ### GSM8K
 
-The first 96 GSM8K test questions use the official Inkling chat template with reasoning effort `none`, greedy sampling, and up to 1,024 generated tokens. The scorer reads the final content channel and compares its last number to the labeled answer. Missing final answers count as incorrect. With the FP32 expert configuration above, Maya scored 90/96, including three requests that reached the output limit. This sample measures arithmetic and instruction following. [OpenAI GSM8K dataset](https://github.com/openai/grade-school-math/tree/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data)
+The first 96 GSM8K test questions use the official Inkling chat template with reasoning effort `none`, greedy sampling, and up to 1,024 generated tokens. The scorer reads the final content channel and compares its last number to the labeled answer. Missing final answers count as incorrect. With the FP32 expert configuration above, Maya scored **90/96** and the production llama.cpp service scored **93/96**. Both missed questions 12, 40 and 93 (zero-based). Maya reached the output limit before the final answer on questions 41, 86 and 87. The service reached the limit on 12 and 40. Both engines returned a final answer on the other 91 questions. This sample measures arithmetic and instruction following. [OpenAI GSM8K dataset](https://github.com/openai/grade-school-math/tree/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data)
 
 ```sh
 cd /work
@@ -197,4 +198,6 @@ oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /we
 # Use the environment from the FP32 expert benchmark.
 ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 2048 --chunk 128 <gsm96-requests.txt >gsm96.log
 oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf --count 96 --score gsm96.log
+oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf --count 96 \
+    --llama-url http://192.168.100.111:8085
 ```
