@@ -21,50 +21,82 @@ __device__ __forceinline__ AttnHalf16 cache_fragment(const KV* ptr) {
     return out;
 }
 
-template <bool Prefill, class KV>
+template <bool Prefill, bool Block = false, int Waves = 1, bool StageKV = (Waves > 1), class KV>
 __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc, const KV* vc, int ring,
                                int H, int Hkv, const int* pos, int qpos, float qscale, const float* proj,
-                               int dr, int extent, int window, float* scratch, int Tq, int q_ld, const float* bias) {
-    const int lane = threadIdx.x, l = lane & 15, hi = lane >> 4;
-    const int split = blockIdx.y, splits = gridDim.y, tile = blockIdx.z * 16;
+                               int dr, int extent, int window, float* scratch, int Tq, int q_ld, const float* bias, int r_ld = 0) {
+    static_assert(Waves == 1 || Prefill);
+    const int lane = threadIdx.x & 31, l = lane & 15, hi = lane >> 4;
+    const int wave = threadIdx.x >> 5;
+    const int split = blockIdx.y, splits = gridDim.y, tile = (blockIdx.z * Waves + wave) * 16;
     const int group = H / Hkv, kv_head = Prefill ? blockIdx.x / group : blockIdx.x;
-    const int queries = Prefill ? min(16, Tq - tile) : group;
-    const int head_l = Prefill ? blockIdx.x : kv_head * group + l;
-    const int query_l = Prefill ? tile + l : 0;
+    // In a verification block a column is a (token, head) pair sharing this KV head.
+    const int queries = Prefill ? max(0, min(16, Tq - tile)) : Block ? min(16, Tq * group - tile) : group;
+    const auto token = [&](int col) { return Prefill ? tile + col : Block ? (tile + col) / group : 0; };
+    const auto head = [&](int col) { return Prefill ? (int)blockIdx.x : kv_head * group + (Block ? (tile + col) % group : col); };
+    const int query_l = token(l), head_l = head(l);
     const int pos0 = pos ? *pos : qpos;
-    const int end = pos0 + (Prefill ? tile + queries : 1);
-    const int start = max(0, pos0 + (Prefill ? tile : 0) + 1 - window);
+    const int end = pos0 + (Waves > 1 ? min(Tq, (int)(blockIdx.z + 1) * Waves * 16) : token(queries - 1) + 1);
+    const int start = max(0, pos0 + (Waves > 1 ? (int)blockIdx.z * Waves * 16 : token(0)) + 1 - window);
     const size_t query_row = (size_t)query_l * H + head_l;
     const int kd = Hkv * 128;
-    __shared__ AttnHalf16 query[16][8];
-    __shared__ _Float16 values[16][136];
+    __shared__ AttnHalf16 query[Waves == 1 ? 16 : 1][8];
+    __shared__ _Float16 values[StageKV ? 1 : 16][136];
+    __shared__ AttnHalf16 keys[StageKV ? 16 : 1][8];
+    __shared__ AttnHalf16 columns[StageKV ? 128 : 1];
+    AttnHalf16 query_reg[Waves > 1 ? 8 : 1];
 #pragma unroll
-    for (int d = hi; d < 8; d += 2) {
+    for (int d = Waves == 1 ? hi : 0; d < 8; d += Waves == 1 ? 2 : 1) {
         AttnHalf16 fragment = {};
         if (l < queries)
             __builtin_memcpy(&fragment, q + (size_t)query_l * q_ld + head_l * 128 + d * 16, sizeof(fragment));
-        query[l][d] = fragment;
+        if constexpr (Waves == 1) query[l][d] = fragment;
+        else query_reg[d] = fragment;
     }
-    __syncthreads();
+    if constexpr (Waves == 1) __syncthreads();
     float m = -INFINITY, sum = 0;
     AttnFloat8 out[8] = {};
     for (int key = start + 16 * split; key < end; key += 16 * splits) {
         const int key_l = key + l;
         const size_t off = (size_t)(ring ? key_l % ring : key_l) * kd + kv_head * 128;
         AttnFloat8 dot = {};
+        if constexpr (StageKV) {
+            // Consecutive work-items load consecutive 16-feature fragments. All query waves share
+            // these keys and the transposed values, including the final partial tile.
+            for (int f = threadIdx.x; f < 128; f += Waves * 32) {
+                const int t = f >> 3, d = f & 7, kp = key + t;
+                const size_t src = (size_t)(ring ? kp % ring : kp) * kd + kv_head * 128 + d * 16;
+                AttnHalf16 k = {}, v = {};
+                if (kp < end) {
+                    k = cache_fragment(kc + src);
+                    v = cache_fragment(vc + src);
+                }
+                keys[t][d] = k;
+#pragma unroll
+                for (int i = 0; i < 16; ++i)
+                    reinterpret_cast<_Float16*>(columns)[(d * 16 + i) * 16 + t] = v[i];
+            }
+            __syncthreads();
+        }
 #pragma unroll
         for (int d = 0; d < 8; ++d) {
-            AttnHalf16 k = {};
-            if (key_l < end) k = cache_fragment(kc + off + d * 16);
-            dot = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(k, query[l][d], dot);
+            if constexpr (!StageKV) {
+                AttnHalf16 k = {};
+                if (key_l < end) k = cache_fragment(kc + off + d * 16);
+                dot = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(k, query[l][d], dot);
+            } else {
+                dot = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(keys[l][d], Waves > 1 ? query_reg[d] : query[l][d], dot);
+            }
         }
+        if constexpr (!StageKV) {
 #pragma unroll
-        for (int d = hi; d < 8; d += 2) {
-            AttnHalf16 v = {};
-            if (key_l < end) v = cache_fragment(vc + off + d * 16);
-            __builtin_memcpy(&values[l][d * 16], &v, sizeof(v));
+            for (int d = hi; d < 8; d += 2) {
+                AttnHalf16 v = {};
+                if (key_l < end) v = cache_fragment(vc + off + d * 16);
+                __builtin_memcpy(&values[l][d * 16], &v, sizeof(v));
+            }
+            __syncthreads();
         }
-        __syncthreads();
         float new_max = m;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
@@ -74,7 +106,7 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
                 v = dot[i] * qscale;
                 if (distance < extent) {
                     if constexpr (Prefill) v += bias[query_row * extent + distance];
-                    else for (int j = 0; j < dr; ++j) v += r[head_l * dr + j] * proj[distance * dr + j];
+                    else for (int j = 0; j < dr; ++j) v += r[(size_t)query_l * r_ld + head_l * dr + j] * proj[distance * dr + j];
                 }
             }
             dot[i] = v;
@@ -97,8 +129,10 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
 #pragma unroll
         for (int d = 0; d < 8; ++d) {
             AttnHalf16 value;
+            if constexpr (!StageKV) {
 #pragma unroll
-            for (int t = 0; t < 16; ++t) value[t] = values[t][16 * d + l];
+                for (int t = 0; t < 16; ++t) value[t] = values[t][16 * d + l];
+            } else value = columns[16 * d + l];
 #pragma unroll
             for (int i = 0; i < 8; ++i) out[d][i] *= row_scale[i];
             out[d] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(prob, value, out[d]);
@@ -115,10 +149,78 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
     for (int i = 0; i < 8; ++i) {
         const int dest = 2 * i + hi;
         if (dest < queries) {
-            const size_t row = Prefill ? (size_t)(tile + dest) * H + blockIdx.x : kv_head * group + dest;
+            const size_t row = (size_t)token(dest) * H + head(dest);
             float* part = scratch + (row * splits + split) * 130;
 #pragma unroll
             for (int d = 0; d < 8; ++d) part[2 + 16 * d + l] = out[d][i];
         }
     }
+}
+
+// Sixteen independent online softmax reductions per workgroup. Eight adjacent lanes cover a 128-wide
+// head for one key. Each lane reads 16 consecutive KV elements without rounding the FP32 query.
+template <class KV>
+__global__ void rdna3_decode_split(const float* q, const float* r, const KV* kc, const KV* vc, int ring,
+                                   int H, int Hkv, const int* position, float scale, const float* proj,
+                                   int dr, int extent, int window, float* scratch) {
+    constexpr int lanes = 8, streams = 128 / lanes;
+    const int h = blockIdx.x, split = blockIdx.y, splits = gridDim.y, tid = threadIdx.x;
+    const int stream = tid / lanes, channel = (tid % lanes) * 16;
+    const int pos = *position, first = max(0, pos + 1 - window);
+    const int span = (pos + 1 - first + splits - 1) / splits;
+    const int start = first + split * span, end = min(pos + 1, start + span);
+    const int kvh = h / (H / Hkv);
+    float query[16], output[16] = {};
+    __builtin_memcpy(query, q + h * 128 + channel, sizeof(query));
+    float maximum = -INFINITY, sum = 0;
+    for (int key = start + stream; key < end; key += streams) {
+        const int slot = ring ? key % ring : key;
+        const size_t off = ((size_t)slot * Hkv + kvh) * 128 + channel;
+        const AttnHalf16 keys = cache_fragment(kc + off);
+        float dot = 0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) dot += (float)keys[i] * query[i];
+#pragma unroll
+        for (int step = lanes / 2; step; step /= 2) dot += __shfl_xor(dot, step, lanes);
+        float score = dot * scale;
+        if (pos - key < extent) {
+            const float* bias = proj + (size_t)(pos - key) * dr;
+            float b = 0;
+            for (int j = tid % lanes; j < dr; j += lanes) b += r[h * dr + j] * bias[j];
+#pragma unroll
+            for (int step = lanes / 2; step; step /= 2) b += __shfl_xor(b, step, lanes);
+            score += b;
+        }
+        const float next = fmaxf(maximum, score);
+        const float beta = expf(score - next), alpha = expf(maximum - next);
+        sum = sum * alpha + beta;
+        maximum = next;
+        const AttnHalf16 values = cache_fragment(vc + off);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) output[i] = output[i] * alpha + (float)values[i] * beta;
+    }
+    __shared__ float maxes[streams], sums[streams], outputs[streams][128], factors[streams];
+    if (tid % lanes == 0) {
+        maxes[stream] = maximum;
+        sums[stream] = sum;
+    }
+    __builtin_memcpy(&outputs[stream][channel], output, sizeof(output));
+    __syncthreads();
+    float* part = scratch + ((size_t)h * splits + split) * 130;
+    if (tid < streams) {
+        float m = maxes[tid];
+#pragma unroll
+        for (int step = streams / 2; step; step /= 2) m = fmaxf(m, __shfl_xor(m, step, streams));
+        const float f = maxes[tid] == -INFINITY ? 0.f : expf(maxes[tid] - m);
+        factors[tid] = f;
+        float total = sums[tid] * f;
+#pragma unroll
+        for (int step = streams / 2; step; step /= 2) total += __shfl_xor(total, step, streams);
+        if (tid == 0) { part[0] = m; part[1] = total; }
+    }
+    __syncthreads();
+    float value = 0;
+#pragma unroll
+    for (int i = 0; i < streams; ++i) value += outputs[i][tid] * factors[i];
+    part[2 + tid] = value;
 }

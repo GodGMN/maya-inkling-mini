@@ -3668,7 +3668,7 @@ __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, 
 }
 
 __global__ void attn_combine_kernel(const float* sink, const float* part, int H, int P, float v_inv_scale, float* out,
-                                     const float* gate = nullptr, uint16_t* out16 = nullptr, int o_ld = 0) {
+                                     const float* gate = nullptr, uint16_t* out16 = nullptr, int o_ld = 0, int gate_ld = 0) {
     const int h = blockIdx.x, qi = blockIdx.y, tid = threadIdx.x;
     const float* pp = part + ((size_t) qi * H + h) * P * 130;
     const float sk = sink[(size_t) qi * H + h];
@@ -3684,7 +3684,7 @@ __global__ void attn_combine_kernel(const float* sink, const float* part, int H,
     }
     const size_t index = (size_t)qi * (o_ld ? o_ld : H * 128) + h * 128 + tid;
     float value = (o / den) * v_inv_scale;
-    if (gate) value *= 1.0f / (1.0f + expf(-gate[index]));
+    if (gate) value *= 1.0f / (1.0f + expf(-gate[gate_ld ? (size_t)qi * gate_ld + h * 128 + tid : index]));
     out[index] = value;
     if (out16) out16[index] = f2h(value);
 }
@@ -5366,8 +5366,17 @@ void rdna3_flash(const uint16_t* q, int q_ld, const KV* kc, const KV* vc, int ri
         std::abort();
     }
     splits = std::max(1, std::min<int>(splits, scratch_floats / per_split));
-    rdna3_attn_part<true><<<dim3(H, splits, (T + 15) / 16), 32, 0, stream>>>(
-        q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias);
+    static const int waves = getenv("IK2_FLASH_WAVES") ? atoi(getenv("IK2_FLASH_WAVES")) : 1;
+    if (waves == 4) {
+        rdna3_attn_part<true, false, 4><<<dim3(H, splits, (T + 63) / 64), 128, 0, stream>>>(
+            q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias);
+    } else if (waves == 1) {
+        rdna3_attn_part<true><<<dim3(H, splits, (T + 15) / 16), 32, 0, stream>>>(
+            q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias);
+    } else {
+        std::fprintf(stderr, "IK2_FLASH_WAVES expects 1 or 4\n");
+        std::abort();
+    }
     check("rdna3 prefill attention");
     attn_combine_kernel<<<dim3(H, T), 128, 0, stream>>>(sink, scratch, H, splits, inv, out, nullptr, nullptr, o_ld);
     check("rdna3 prefill attention combine");
@@ -6202,23 +6211,37 @@ void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t
     check("prep_qkv_r_fp8_at");
 }
 
+template <class KV>
+void split_token_attention(const float* q, const float* r, const KV* kc, const KV* vc, int ring,
+                           int H, int Hkv, const int* pos, int splits, float scale, const float* proj,
+                           int dr, int extent, int window, float* scratch, cudaStream_t stream) {
+#ifdef STRATA_USE_HIP
+    static const bool grouped = getenv("IK2_DECODE_SUBWAVE") && atoi(getenv("IK2_DECODE_SUBWAVE"));
+    if (grouped) {
+        rdna3_decode_split<<<dim3(H, splits), 128, 0, stream>>>(q, r, kc, vc, ring, H, Hkv, pos, scale,
+                                                              proj, dr, extent, window, scratch);
+        check("rdna3_decode_split");
+        return;
+    }
+#endif
+    attn_split_kernel<KV><<<dim3(H, splits), 128, 0, stream>>>(q, r, kc, vc, ring, H, Hkv, 0, 0, 0, scale,
+                                                             proj, dr, extent, window, scratch, pos);
+    check("attn_split_kernel");
+}
+
 void attn_decode_f16_at(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
-                        int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s) {
-    attn_split_kernel<uint16_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj,
-                                                            d_rel, extent, window, scratch, pos);
-    check("attn_decode_f16_at (split)");
-    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, out);
+                        int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s, const float* gate, uint16_t* out16) {
+    split_token_attention(q, r, kc, vc, kv_cap, H, Hkv, pos, P, qk_scale, proj, d_rel, extent, window, scratch, s);
+    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, out, gate, out16);
     check("attn_decode_f16_at (combine)");
 }
 void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, float v_inv_scale,
                         const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
-                        cudaStream_t s) {
-    attn_split_kernel<uint8_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel,
-                                                           extent, window, scratch, pos);
-    check("attn_decode_fp8_at (split)");
-    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, v_inv_scale, out);
+                        cudaStream_t s, const float* gate, uint16_t* out16) {
+    split_token_attention(q, r, kc, vc, kv_cap, H, Hkv, pos, P, qk_scale, proj, d_rel, extent, window, scratch, s);
+    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, v_inv_scale, out, gate, out16);
     check("attn_decode_fp8_at (combine)");
 }
 
@@ -6253,7 +6276,12 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
         std::fprintf(stderr, "rdna3 attention: unsupported head geometry or split count\n");
         std::abort();
     }
-    rdna3_attn_part<false><<<dim3(Hkv, n_split), 32, 0, s>>>(q16, r, kc, vc, kv_cap, H, Hkv, pos, qpos,
+    static const bool staged = getenv("IK2_ATTN_STAGED") && atoi(getenv("IK2_ATTN_STAGED"));
+    if (staged)
+        rdna3_attn_part<false, false, 1, true><<<dim3(Hkv, n_split), 32, 0, s>>>(q16, r, kc, vc, kv_cap, H, Hkv, pos, qpos,
+                                                      qk_scale, proj, d_rel, extent, window, scratch, 1, H * 128, nullptr);
+    else
+        rdna3_attn_part<false><<<dim3(Hkv, n_split), 32, 0, s>>>(q16, r, kc, vc, kv_cap, H, Hkv, pos, qpos,
                                                       qk_scale, proj, d_rel, extent, window, scratch, 1, H * 128, nullptr);
     check("rdna3_attn_part");
     attn_combine_kernel<<<H, 128, 0, s>>>(sink, scratch, H, n_split, v_inv, out, gate, out16);
@@ -6377,7 +6405,18 @@ static void attn_block_impl(const uint16_t* q16, const float* r, int r_ld, const
                             float* scratch, float* out, const float* gate, int gate_ld, uint16_t* out16,
                             cudaStream_t s) {
 #ifdef STRATA_USE_HIP
-    unavailable_mma(__func__);
+    if (Hkv <= 0 || H % Hkv || T < 1 || T > 8 || n_split < 1 || (kv_cap && kv_cap < T)) {
+        std::fprintf(stderr, "RDNA3 block attention: incompatible heads, window or splits\n");
+        std::abort();
+    }
+    const int columns = T * (H / Hkv);
+    rdna3_attn_part<false, true><<<dim3(Hkv, n_split, (columns + 15) / 16), 32, 0, s>>>(
+        q16, r, kc, vc, kv_cap, H, Hkv, pos, 0, qk_scale, proj, d_rel, extent, window,
+        scratch, T, H * 128, nullptr, r_ld);
+    check("rdna3 block attention");
+    attn_combine_kernel<<<dim3(H, T), 128, 0, s>>>(sink, scratch, H, n_split, v_inv, out, gate, out16,
+                                                   H * 128, gate_ld);
+    check("rdna3 block attention combine");
 #else
     const int R = H / Hkv, NC = T * R;
     if (H % Hkv || T < 1 || NC > 24 || n_split < 1 || (kv_cap > 0 && kv_cap < 16 + T)) {
@@ -6412,7 +6451,7 @@ void attn_block_fp8(const uint16_t* q16, const float* r, int r_ld, const float* 
 }
 size_t attn_block_scratch(int H, int T, int n_split) {
 #ifdef STRATA_USE_HIP
-    return 0;
+    return (size_t)T * H * n_split * 130;
 #else
     return (size_t) n_split * kWaNW * T * H * (kFaD + 2);
 #endif

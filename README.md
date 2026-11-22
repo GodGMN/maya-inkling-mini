@@ -1,8 +1,8 @@
 # Inkling 2 Mini on AMD Radeon RX 7900 XTX
 
-On Prometheus's RX 7900 XTX, `maya-ik2` decoded at **101.3 tok/s after a 512-token prompt** and **92.7 tok/s after 8,192 tokens**. The deployed llama.cpp service measured 64.0 and 62.0 tok/s on the same prompts and ggml-org IQ4_NL weights. Each median covers three greedy requests with 128 timed decode steps. Maya used FP32 expert inputs and FP8 KV. The service used its production Q4_0 KV configuration.
+On Prometheus's RX 7900 XTX, `maya-ik2` decoded at **109.1 tok/s after a 512-token prompt** and **100.3 tok/s after 8,192 tokens**. The deployed llama.cpp service measured 64.0 and 62.0 tok/s on the same token IDs and ggml-org IQ4_NL weights. Each median covers three greedy requests with 128 timed decode steps. Maya used FP32 expert inputs and FP8 KV. The service used its production Q4_0 KV configuration.
 
-At 8K, Maya's uncached prefill reached **1,663–1,666 tok/s** with 2,048-token chunks and cached dense projections. Llama.cpp reached 1,488 tok/s with its production settings. Maya decoded at 79 tok/s after 32,768 prompt tokens. [Hardware results and commands](docs/HIP-PORT.md#larger-prefill-chunks-and-exact-router-accumulation)
+At 8,192 tokens, Maya read the uncached prompt at **3,127 tok/s** with 2,048-token chunks. Llama.cpp reached 1,488 tok/s. Maya decoded at 87.1 tok/s after 32,768 prompt tokens. [Hardware results and commands](docs/HIP-PORT.md#cooperative-prefill-and-depth-dependent-decode-attention)
 
 The gfx1100 kernel suite passes. On the same 96 GSM8K questions with a 1,024-token output limit, Maya scored 90 and llama.cpp scored 93. Maya reached the limit on all three questions that account for the difference. The full-vocabulary checks include short passages and a 114-token prompt. [Quality checks](docs/HIP-PORT.md#rdna3-expert-and-attention-kernels)
 

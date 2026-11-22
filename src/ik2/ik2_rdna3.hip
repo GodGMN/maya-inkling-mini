@@ -16,6 +16,8 @@ void check_launch(const char* kernel) {
 
 using Half16 = _Float16 __attribute__((ext_vector_type(16)));
 using Float8 = float __attribute__((ext_vector_type(8)));
+constexpr int kDenseF16 = 1;
+constexpr int kPlanarQ8 = -1;
 
 __device__ uint32_t iq4_values(uint32_t codes) {
     const uint32_t p = codes & 0x07070707u;
@@ -34,6 +36,19 @@ __device__ __forceinline__ uint32_t scaled_byte_pair(uint32_t bytes, _Float16 sc
     const uint32_t biased = __builtin_amdgcn_perm(0x64646464u, bytes ^ 0x80808080u, Upper ? 0x04030402u : 0x04010400u);
     const Half2 values = __builtin_bit_cast(Half2, biased) - (_Float16)1152;
     return __builtin_bit_cast(uint32_t, values * scale);
+}
+
+__device__ __forceinline__ Half16 planar_fragment(const int8_t* weights, _Float16 scale) {
+    using Words = uint32_t __attribute__((ext_vector_type(4)));
+    Words words;
+    HalfWords halves;
+    __builtin_memcpy(&words, weights, sizeof(words));
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        halves[i * 2] = scaled_byte_pair<false>(words[i], scale);
+        halves[i * 2 + 1] = scaled_byte_pair<true>(words[i], scale);
+    }
+    return __builtin_bit_cast(Half16, halves);
 }
 
 // Each lane owns a consecutive group of sixteen weights in an output row.
@@ -136,6 +151,86 @@ __global__ void expert_wmma_gemm(const uint8_t* const* experts, size_t offset, c
     }
 }
 
+// A workgroup computes 64 tokens by 64 output channels. Each wave owns a 32x32 quadrant.
+// The extra eight halfs in each LDS row shift consecutive rows to different banks.
+template <int Type>
+__global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts, size_t offset, const ExpertTile* tiles,
+                           const uint16_t* input, int N, int K, int T, float* output, int ld,
+                           const int8_t* planar = nullptr, const uint16_t* scales = nullptr) {
+    constexpr int depth = 32, pitch = depth / 8 + 1;
+    __shared__ uint4 a[64][pitch], b[64][pitch];
+    const int tid = threadIdx.x, lane = tid & 31, l = lane & 15, wave = tid / 32;
+    int row0 = blockIdx.y * 64;
+    const uint8_t* quant = nullptr;
+    if constexpr (Type == kIQ4_NL || Type == kQ8_0) {
+        const auto tile = tiles[blockIdx.y];
+        if (tile.first >= tile.end) return;
+        row0 = tile.first;
+        T = tile.end;
+        quant = experts[tile.expert] + offset;
+    }
+    const int col0 = blockIdx.x * 64;
+    const int m0 = (wave / 2) * 32, n0 = (wave % 2) * 32;
+    Float8 accum[2][2] = {};
+    for (int k0 = 0; k0 < K; k0 += depth) {
+#pragma unroll
+        for (int load = 0; load < 2; ++load) {
+            const int f = tid + load * 128, row = f / 4, vec = f % 4;
+            const int k = k0 + vec * 8;
+            uint4 av = {};
+            if (row0 + row < T) __builtin_memcpy(&av, input + (size_t)(row0 + row) * K + k, sizeof(av));
+            a[row][vec] = av;
+            if constexpr (Type == kDenseF16) {
+                uint4 bv = {};
+                if (col0 + row < N) __builtin_memcpy(&bv, dense + (size_t)(col0 + row) * K + k, sizeof(bv));
+                b[row][vec] = bv;
+            }
+        }
+        if constexpr (Type != kDenseF16) {
+            constexpr int bytes = Type == kIQ4_NL ? 18 : 34;
+            const int row = tid / 2, half = tid % 2;
+            Half16 bv = {};
+            if (col0 + row < N) {
+                const size_t base = (size_t)(col0 + row) * K + k0;
+                if constexpr (Type == kPlanarQ8) {
+                    const _Float16 scale = __builtin_bit_cast(_Float16, scales[base / 32]);
+                    bv = planar_fragment(planar + base + half * 16, scale);
+                } else {
+                    bv = expert_fragment<Type>(quant + (base / 32) * bytes, half);
+                }
+            }
+            __builtin_memcpy(&b[row][2 * half], &bv, sizeof(bv));
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < depth / 8; kk += 2) {
+            Half16 ax[2], bx[2];
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                __builtin_memcpy(&ax[j], &a[m0 + j * 16 + l][kk], sizeof(Half16));
+                __builtin_memcpy(&bx[j], &b[n0 + j * 16 + l][kk], sizeof(Half16));
+            }
+#pragma unroll
+            for (int m = 0; m < 2; ++m)
+#pragma unroll
+                for (int n = 0; n < 2; ++n)
+                    accum[m][n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ax[m], bx[n], accum[m][n]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int m = 0; m < 2; ++m)
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            const int col = col0 + n0 + n * 16 + l;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int row = row0 + m0 + m * 16 + 2 * i + (lane >> 4);
+                if (row < T && col < N) output[(size_t)row * ld + col] = accum[m][n][i];
+            }
+        }
+}
+
 __global__ void dense_q8_wmma(const int8_t* weights, const uint16_t* scales, int N, int K,
                               const uint16_t* input, int T, float* output, int ld) {
     const int lane = threadIdx.x & 31, l = lane & 15;
@@ -149,16 +244,7 @@ __global__ void dense_q8_wmma(const int8_t* weights, const uint16_t* scales, int
             Half16 a = {}, b = {};
             if (token < T) __builtin_memcpy(&a, input + (size_t)token * K + k + half * 16, sizeof(a));
             if (col < N) {
-                using Words = uint32_t __attribute__((ext_vector_type(4)));
-                Words words;
-                HalfWords halves;
-                __builtin_memcpy(&words, weights + (size_t)col * K + k + half * 16, sizeof(words));
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    halves[i * 2] = scaled_byte_pair<false>(words[i], scale);
-                    halves[i * 2 + 1] = scaled_byte_pair<true>(words[i], scale);
-                }
-                b = __builtin_bit_cast(Half16, halves);
+                b = planar_fragment(weights + (size_t)col * K + k + half * 16, scale);
             }
             result = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, result);
         }
@@ -171,6 +257,20 @@ __global__ void dense_q8_wmma(const int8_t* weights, const uint16_t* scales, int
 }
 
 }  // namespace
+
+void rdna3_dense_gemm(const uint16_t* weights, int N, int K, const uint16_t* input, int T, float* output,
+                      int ld, cudaStream_t stream) {
+    tiled_gemm<kDenseF16><<<dim3((N + 63) / 64, (T + 63) / 64), 128, 0, stream>>>(
+        weights, nullptr, 0, nullptr, input, N, K, T, output, ld);
+    check_launch("dense_half_gemm");
+}
+
+void rdna3_planar_gemm(const int8_t* weights, const uint16_t* scales, int N, int K, const uint16_t* input, int T,
+                       float* output, int ld, cudaStream_t stream) {
+    tiled_gemm<kPlanarQ8><<<dim3((N + 63) / 64, (T + 63) / 64), 128, 0, stream>>>(
+        nullptr, nullptr, 0, nullptr, input, N, K, T, output, ld, weights, scales);
+    check_launch("dense_planar_gemm");
+}
 
 void q8_tile(const int8_t* q, const uint16_t* scales, int N, int K, const uint16_t* input, int T,
              float* output, int ld, cudaStream_t stream) {
@@ -190,7 +290,10 @@ template <int Type>
 void launch_expert_gemm(const uint8_t* const* experts, size_t offset, ExpertTiles tiles, const uint16_t* input,
                         int K, int N, float* output, cudaStream_t stream) {
     const dim3 grid((N + 63) / 64, tiles.capacity);
-    if (tiles.rows == 16) expert_wmma_gemm<Type, 16><<<grid, 128, 0, stream>>>(experts, offset, tiles.data, input, K, N, output);
+    static const bool use_lds = getenv("IK2_EXPERT_TILE_LDS") && atoi(getenv("IK2_EXPERT_TILE_LDS"));
+    if (tiles.rows == 64 && use_lds)
+        tiled_gemm<Type><<<grid, 128, 0, stream>>>(nullptr, experts, offset, tiles.data, input, N, K, 0, output, N);
+    else if (tiles.rows == 16) expert_wmma_gemm<Type, 16><<<grid, 128, 0, stream>>>(experts, offset, tiles.data, input, K, N, output);
     else if (tiles.rows == 32) expert_wmma_gemm<Type, 32><<<grid, 128, 0, stream>>>(experts, offset, tiles.data, input, K, N, output);
     else if (tiles.rows == 64) expert_wmma_gemm<Type, 64><<<grid, 128, 0, stream>>>(experts, offset, tiles.data, input, K, N, output);
     else {

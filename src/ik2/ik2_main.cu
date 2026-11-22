@@ -388,6 +388,13 @@ T* dalloc(size_t n) {
 
 // Y [T][N] (ldy) = X [T][K] FP16 . W [N][K]^T FP16, F32 sums
 void gemm16(const uint16_t* W, int N, int Kd, const uint16_t* X, int T, float* Y, int ldy, float beta = 0.0f) {
+#ifdef STRATA_USE_HIP
+    static const bool wmma = getenv("IK2_DENSE_WMMA") && atoi(getenv("IK2_DENSE_WMMA"));
+    if (wmma && beta == 0.f && T >= 32 && N >= 128 && Kd % 32 == 0) {
+        k::rdna3_dense_gemm(W, N, Kd, X, T, Y, ldy, g_s);
+        return;
+    }
+#endif
     const float one = 1.0f;
     CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, Kd, &one, W, CUDA_R_16F, Kd, X, CUDA_R_16F, Kd, &beta, Y,
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
@@ -400,7 +407,19 @@ bool g_dense_q8 = false;
 // The KV cache in FP16 (IK2_KV=fp8: E4M3, half the bytes).  Against ref/inkling2.py over 48 tokens FP16 kept every
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
-bool g_kv_fp8 = false;
+enum class KVPrecision { f16, fp8, fp8_global };
+KVPrecision g_kv_precision = KVPrecision::f16;
+bool fp8_kv(bool sliding) {
+    return g_kv_precision == KVPrecision::fp8 || (!sliding && g_kv_precision == KVPrecision::fp8_global);
+}
+const char* kv_format_name() {
+    switch (g_kv_precision) {
+        case KVPrecision::f16: return "f16";
+        case KVPrecision::fp8: return "fp8";
+        case KVPrecision::fp8_global: return "fp8-global";
+    }
+    std::abort();
+}
 bool g_kv_managed = false;
 bool g_managed_experts = false;
 size_t g_kv_room = 0;
@@ -657,6 +676,13 @@ void matmul(const Mat& m, const float* x32, const uint16_t* x16, int T, float* Y
         gemm16(m.f16, m.N, m.K, x16, T, Y, ldy);
         return;
     }
+#ifdef STRATA_USE_HIP
+    static const bool planar = getenv("IK2_DENSE_WMMA") && atoi(getenv("IK2_DENSE_WMMA"));
+    if (planar && m.q8 && T >= 32 && m.N >= 128 && m.K % 32 == 0) {
+        k::rdna3_planar_gemm(m.q8, m.q8d, m.N, m.K, x16, T, Y, ldy, g_s);
+        return;
+    }
+#endif
     static const bool use_q8_tile = getenv("IK2_Q8_TILE") && atoi(getenv("IK2_Q8_TILE"));
     if (use_q8_tile && allow_short_batch_products() && m.q8 && T >= 2 && T <= 16 && m.K % 32 == 0) {
         k::q8_tile(m.q8, m.q8d, m.N, m.K, x16, T, Y, ldy, g_s);
@@ -1582,11 +1608,11 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     // Long prefill revisits a whole global K/V span. Migrate it in bulk before
     // the flash kernel so warps never have to fault it in one page at a time.
     if (g_kv_managed && !Ly.sliding && T > 8 && pos0 + T > 196608) {
-        const size_t bytes = (size_t)(pos0 + T) * KD * (g_kv_fp8 ? 1 : 2);
-        CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)Ly.kc8 : (void*)Ly.kc, bytes, Ly.dev, g_s));
-        CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)Ly.vc8 : (void*)Ly.vc, bytes, Ly.dev, g_s));
+        const size_t bytes = (size_t)(pos0 + T) * KD * (Ly.kc8 ? 1 : 2);
+        CU(cudaMemPrefetchAsync(Ly.kc8 ? (void*)Ly.kc8 : (void*)Ly.kc, bytes, Ly.dev, g_s));
+        CU(cudaMemPrefetchAsync(Ly.kc8 ? (void*)Ly.vc8 : (void*)Ly.vc, bytes, Ly.dev, g_s));
     }
-    if (g_kv_fp8) {
+    if (Ly.kc8) {
         k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
                           Ly.kv_cap, k_scale, v_scale, g_s);
@@ -1604,7 +1630,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
     if (T == 1) {
-        if (g_kv_fp8) {
+        if (Ly.kc8) {
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
                                qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         } else {
@@ -1612,7 +1638,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         }
     } else if (T <= 8 && g_group && g_group_attn) {
-        if (g_kv_fp8) {
+        if (Ly.kc8) {
             k::attn_multi_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0,
                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         } else {
@@ -1647,7 +1673,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                 CUDA_R_32F, extent, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
                 const int k_lo = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1) : 0;
                 const int ns = k::attn_flash_splits(Tq, c.H, pos0 + ts + Tq - k_lo, g_n_sm);
-                if (g_kv_fp8)
+                if (Ly.kc8)
                     k::attn_flash_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale * k_inv, v_inv, W.relb, extent, window,
                                       sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
@@ -1664,7 +1690,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             if (W.relb) Tq = std::min(Tq, Work::kRelbRows);
             const int nk_s = pos0 + ts + Tq - k0_s;
             const long long qn = (long long) Tq * nk_s;
-            if (g_kv_fp8) {
+            if (Ly.kc8) {
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
                     k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv, W.kv_k16,
@@ -2148,6 +2174,7 @@ int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_block
 struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
+    int attention_bucket = 0;
 };
 bool tier_active = false;
 bool stage_cold = false;
@@ -2254,14 +2281,16 @@ __global__ void stage_selected_experts(const uint8_t* const* table, const uint8_
         selected[slot] = (const uint8_t*)dst;
 }
 
-void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
+void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_bucket) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     const size_t Cb = (size_t) C * 4;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
     // the attention's key splits: fixed, so that the launches are the same at every position
-    const int P_sl = std::min(128, std::max(1, (c.window + 63) / 64)), P_full = 128;
+    const int P_sl = std::min(128, std::max(1, (c.window + 63) / 64));
+    constexpr int full_splits[] = {128, 16, 32, 64, 128};
+    const int P_full = full_splits[attention_bucket];
     CU(cudaMemcpyAsync(W.tmp, W.emb_h, Cb, cudaMemcpyHostToDevice, g_s));
     k::rms(W.tmp, M.embd_norm, 1, C, c.eps, W.h, g_s);
     CU(cudaMemcpyAsync(W.pos, W.pos_h, 4, cudaMemcpyHostToDevice, g_s));
@@ -2367,11 +2396,18 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         const int P = Ly.sliding ? P_sl : P_full;
         // the attention on the tensor cores, from an FP16 copy of q (IK2_ATTN_MMA=0: the scalar kernels - a layer
         // without a window, its keys the whole context, is bound by their arithmetic)
-        const bool mma = g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding);
+#ifdef STRATA_USE_HIP
+        const float* split_gate = gate_p;
+        uint16_t* split_half = W.x16;
+#else
+        const float* split_gate = nullptr;
+        uint16_t* split_half = nullptr;
+#endif
+        const bool mma = g_attn_mma == 1 || ((g_attn_mma == 2 || attention_bucket >= 3) && !Ly.sliding);
         const int ring = Ly.sliding ? Ly.kv_cap : 0;
-        const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
+        const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : (attention_bucket ? P_full : g_mma_split);
         uint16_t* q16 = mma ? W.x16 : nullptr;
-        if (g_kv_fp8) {
+        if (Ly.kc8) {
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap,
                                  k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
@@ -2382,7 +2418,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             else
                 k::attn_decode_fp8_at(q_p, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
                                       qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
-                                      W.o, g_s);
+                                      W.o, g_s, split_gate, split_half);
         } else {
             k::prep_qkv_r_f16_at(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16,
@@ -2392,9 +2428,9 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                        Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s);
             else
                 k::attn_decode_f16_at(q_p, r_p, W.sink, Ly.kc, Ly.vc, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
-                                      qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                                      qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s, split_gate, split_half);
         }
-        if (!mma) k::gate_mul_f16(W.o, gate_p, (size_t) HD, W.x16, true, g_s);   // (the tensor cores' merge has it)
+        if (!mma && !split_gate) k::gate_mul_f16(W.o, gate_p, (size_t)HD, W.x16, true, g_s);
         // the output projection with its short conv (and the stream added, but where a block starts: there the
         // stream joins the blocks and starts again)
         const bool first = l % c.block == 0;
@@ -2513,14 +2549,25 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
+#ifdef STRATA_USE_HIP
+    const int attention_bucket = g_attn_mma != 3 ? 0 : pos < 1024 ? 1 : pos < 8192 ? 2 : pos < 131072 ? 3 : 4;
+#else
+    constexpr int attention_bucket = 0;
+#endif
     if (!g_graph) {
-        fast_token_launches(M, W, out_mode);
+        fast_token_launches(M, W, out_mode, attention_bucket);
     } else {
         FastGraph& G =
             g_fgraph[(tier_active && (stage_cold || !host_plan.active.empty())) || host_plan.forced][(int)out_mode];
+        if (G.exec && G.attention_bucket != attention_bucket) {
+            CU(cudaGraphExecDestroy(G.exec));
+            CU(cudaGraphDestroy(G.graph));
+            G = {};
+        }
         if (!G.exec) {   // the first token of this kind: its launches recorded
+            G.attention_bucket = attention_bucket;
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
-            fast_token_launches(M, W, out_mode);
+            fast_token_launches(M, W, out_mode, attention_bucket);
             CU(cudaStreamEndCapture(g_s, &G.graph));
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
         }
@@ -2708,7 +2755,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         const int ring = Ly.sliding ? Ly.kv_cap : 0;
         const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
         uint16_t* q16 = W.x16;
-        if (g_kv_fp8) {
+        if (Ly.kc8) {
             k::prep_qkv_r_fp8_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, r_ld, Ly.r_clip, T, c.H,
                                     c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha,
                                     c.n_floor, Ly.kv_cap, k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
@@ -2750,6 +2797,13 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+#ifdef STRATA_USE_HIP
+        k::route_gather(rtop, rw, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], S, c.K,
+                        g_blk.blob, g_blk.tok, g_blk.inv, g_blk.sg, g_blk.su, g_blk.wt, g_s);
+        k::experts_gate_up_swiglu(g_blk.blob, g_blk.tok, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
+                                  C, c.F, g_blk.sg, g_blk.su, c.gate_cap, c.up_cap, W.h16, g_s);
+        k::experts_down(g_blk.blob, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+#else
         k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], g_blk.blob, g_blk.n,
                        g_blk.tok, g_blk.row, g_blk.sg, g_blk.su, g_blk.wt, g_blk.inv, g_s);
         if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
@@ -2770,6 +2824,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
             k::experts_down_g(g_blk.blob, g_blk.n, g_blk.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                               g_s);
         }
+#endif
         k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
         k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
                       g_s);
@@ -3702,7 +3757,7 @@ int big_begin(const Model& M, Work& W, ExpertCache& EC, int n, int ctx_end, BigS
     const Config& c = M.c;
     // the attention's scratch for 256 queries against the whole context: few, large GEMMs (the default ~400 MB left
     // room for only ~20 queries a step at 100k tokens) - also lent for a short prompt at the end of a long context
-    const size_t lg_want = (g_flash && !g_kv_fp8 && c.D == 128) ? 0 : (size_t) c.H * 256 * (size_t) ctx_end;
+    const size_t lg_want = (g_flash && !fp8_kv(false) && c.D == 128) ? 0 : (size_t) c.H * 256 * (size_t) ctx_end;
     const bool long_ctx = lg_want > W.lg_cap;
     if (n <= W.T_sup && !long_ctx) return W.T_sup;
     int p = -1;
@@ -3911,13 +3966,13 @@ void replace_expert_pools(Model& M, bool managed) {
     CU(cudaStreamSynchronize(g_cs));
     if (!managed) {
         // Give back the global pages first so regular cudaMalloc has room.
-        const size_t row_bytes = (size_t)M.c.KV * M.c.D * (g_kv_fp8 ? 1 : 2);
+        const size_t row_bytes = (size_t)M.c.KV * M.c.D * (fp8_kv(false) ? 1 : 2);
         for (auto& v : M.V) {
             if (M.L[v.l].sliding) continue;
             const size_t bytes = (size_t)std::min(tier_depth, v.kv_cap) * row_bytes;
             if (!bytes) continue;
-            CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)v.kc8 : (void*)v.kc, bytes, cudaCpuDeviceId, g_s));
-            CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)v.vc8 : (void*)v.vc, bytes, cudaCpuDeviceId, g_s));
+            CU(cudaMemPrefetchAsync(v.kc8 ? (void*)v.kc8 : (void*)v.kc, bytes, cudaCpuDeviceId, g_s));
+            CU(cudaMemPrefetchAsync(v.vc8 ? (void*)v.vc8 : (void*)v.vc, bytes, cudaCpuDeviceId, g_s));
         }
         CU(cudaStreamSynchronize(g_s));
     }
@@ -3968,7 +4023,7 @@ void place_decode(Model& M, int depth) {
     Work& W = dev_work(0);
     ExpertCache& ec = dev_cache(0);
     const int elements = M.c.KV * M.c.D;
-    const int token_bytes = elements * (g_kv_fp8 ? 1 : 2);
+    const int token_bytes = elements * (fp8_kv(false) ? 1 : 2);
     size_t live = 0;
     for (const auto& v : M.V) {
         if (!M.L[v.l].sliding) live += (size_t)2 * std::min(v.kv_cap, depth + kPlacementInterval) * token_bytes;
@@ -4040,8 +4095,8 @@ void place_decode(Model& M, int depth) {
             if (M.L[v.l].sliding) continue;
             const size_t bytes = (size_t)std::min(depth, v.kv_cap) * token_bytes;
             if (!bytes) continue;
-            CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)v.kc8 : (void*)v.kc, bytes, 0, g_s));
-            CU(cudaMemPrefetchAsync(g_kv_fp8 ? (void*)v.vc8 : (void*)v.vc, bytes, 0, g_s));
+            CU(cudaMemPrefetchAsync(v.kc8 ? (void*)v.kc8 : (void*)v.kc, bytes, 0, g_s));
+            CU(cudaMemPrefetchAsync(v.vc8 ? (void*)v.vc8 : (void*)v.vc, bytes, 0, g_s));
         }
     }
     CU(cudaStreamSynchronize(g_s));
@@ -4076,15 +4131,19 @@ int verify_suffix(Model& M, const std::vector<int>& hist, int anchor, int remain
     while (matched < suffix_window && src >= matched && hist[src - matched] == hist[end - matched])
         ++matched;
     const int n = std::min({suffix_window, remaining, end - src, 2 * matched - 8});
-    if (n < match) return 0;
+    const bool use_block = g_block && n >= 2 && n <= kBlockMax && suffix_window <= kBlockMax;
+    if (!use_block && n < match) return 0;
     std::vector<float> logits;
     std::vector<int> predicted;
     ++stats.forwards;
     stats.offered += n - 1;
-    g_rec = true;
-    forward(M, hist.data() + src, n, end, true, sample ? OutMode::kLogits : OutMode::kArgmax, std::string(), logits,
-            &predicted, t_exp);
-    g_rec = false;
+    const auto mode = sample ? OutMode::kLogits : OutMode::kArgmax;
+    if (use_block) fast_block(M, hist.data() + src, n, end, mode, logits, &predicted);
+    else {
+        g_rec = true;
+        forward(M, hist.data() + src, n, end, true, mode, std::string(), logits, &predicted, t_exp);
+        g_rec = false;
+    }
     // Sample from the target once per committed next token. No random numbers
     // are consumed for positions beyond a rejected proposal.
     for (int i = 0; i < n; ++i) {
@@ -4096,7 +4155,10 @@ int verify_suffix(Model& M, const std::vector<int>& hist, int anchor, int remain
     }
     const int used = (int)next.size();
     stats.inputs += used;
-    if (used < n) rollback(M, used);
+    if (used < n) {
+        if (use_block) block_rollback(used);
+        else rollback(M, used);
+    }
     return used;
 }
 
@@ -4158,10 +4220,11 @@ int main(int argc, char** argv) {
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
 #ifdef STRATA_USE_HIP
     for (const char* flag : {"IK2_EXPERT_MMA", "IK2_GROUP_MMA",
-                             "IK2_BLOCK", "IK2_WGMMA"}) {
+                             "IK2_WGMMA"}) {
         if (getenv(flag) && std::atoi(getenv(flag))) die(std::string(flag) + " requires CUDA tensor cores");
     }
-    if (serve && !draft_path.empty()) die("--serve with --draft requires CUDA block verification");
+    if (serve && !draft_path.empty() && getenv("IK2_BLOCK") && !atoi(getenv("IK2_BLOCK")))
+        die("--serve with --draft requires block verification");
     if (n_gpu != 1) die("HIP supports one gfx1100 device");
     g_flash = getenv("IK2_FLASH") && std::atoi(getenv("IK2_FLASH"));
     std::fprintf(stderr, "ik2 HIP gfx1100: %s prefill attention\n", g_flash ? "RDNA3 WMMA" : "hipBLAS");
@@ -4177,9 +4240,10 @@ int main(int argc, char** argv) {
     g_dense_q8 = getenv("IK2_DENSE") && std::string(getenv("IK2_DENSE")) == "q8";
     if (getenv("IK2_KV")) {
         const std::string kv = getenv("IK2_KV");
-        if (kv == "f16" || kv == "fp16") g_kv_fp8 = false;
-        else if (kv == "fp8" || kv == "e4m3") g_kv_fp8 = true;
-        else die("unknown IK2_KV=" + kv + " (expected fp8 or f16)");
+        if (kv == "f16" || kv == "fp16") g_kv_precision = KVPrecision::f16;
+        else if (kv == "fp8" || kv == "e4m3") g_kv_precision = KVPrecision::fp8;
+        else if (kv == "fp8-global") g_kv_precision = KVPrecision::fp8_global;
+        else die("unknown IK2_KV=" + kv + " (expected f16, fp8 or fp8-global)");
     }
     if (getenv("IK2_TRACE") && *getenv("IK2_TRACE")) {
         g_trace = std::fopen(getenv("IK2_TRACE"), "wb");
@@ -4354,14 +4418,15 @@ int main(int argc, char** argv) {
     // card)?  Then they all stay there: the dense weights are kept as the GGUF's blocks unless IK2_DENSE says otherwise
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
+    const bool resident_only = getenv("IK2_RESIDENT_ONLY") && atoi(getenv("IK2_RESIDENT_ONLY"));
+    if (resident_only && n_gpu != 1) die("IK2_RESIDENT_ONLY requires one GPU");
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
+    g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
 #ifdef STRATA_USE_HIP
-    g_block = false;
     g_attn_mma = getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 0;
-    if (g_attn_mma < 0 || g_attn_mma > 2) die("IK2_ATTN_MMA expects 0, 1 or 2");
+    if (g_attn_mma < 0 || g_attn_mma > 3) die("IK2_ATTN_MMA expects 0, 1, 2 or 3");
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
 #else
-    g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
     g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
 #endif
@@ -4383,14 +4448,16 @@ int main(int argc, char** argv) {
         for (int l = 0; l < c.n_layer; ++l) {
             const size_t cap = c.sliding[l] ? (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : (size_t) ctx;
             if (!g_kv_managed || c.sliding[l])
-                kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+                kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (fp8_kv(c.sliding[l]) ? 1 : 2) * 2;
         }
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
-        const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
+        // With resident-only loading the actual post-workspace budget decides how many experts fit.
+        const size_t reserve = resident_only ? size_t{256} << 20 : size_t{3} << 29;
         const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
+        if (resident_only && !g_fast_want) die("resident-only loading: the model, KV cache and requested expert budget must fit on the GPU with planar dense weights");
         stage_cold = getenv("IK2_STAGE_COLD") && atoi(getenv("IK2_STAGE_COLD"));
         g_managed_experts = g_fast_want && g_kv_managed && getenv("IK2_TIER") && atoi(getenv("IK2_TIER"));
         std::printf("experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
@@ -4618,7 +4685,7 @@ int main(int argc, char** argv) {
         const Layer& Ly = M.L[Vi.l];
         use_dev(Ly.dev);
         Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
-        if (g_kv_fp8) {
+        if (fp8_kv(Ly.sliding)) {
             Vi.kc8 = kv_alloc<uint8_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
             Vi.vc8 = kv_alloc<uint8_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
         } else {
@@ -4644,8 +4711,8 @@ int main(int argc, char** argv) {
     if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;
     {
         size_t kv_bytes = 0;
-        for (const auto& Vi : M.V) kv_bytes += (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2) * 2;
-        std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", g_kv_fp8 ? "FP8 E4M3" : "FP16",
+        for (const auto& Vi : M.V) kv_bytes += (size_t) Vi.kv_cap * KD * (Vi.kc8 ? 1 : 2) * 2;
+        std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", kv_format_name(),
                     kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
         std::fflush(stdout);
     }
@@ -4922,6 +4989,14 @@ int main(int argc, char** argv) {
     W.lg_cap = std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, (size_t) 64 << 20);
     const bool flash_only = g_flash && c.D == 128 && (!getenv("IK2_RELB") || atoi(getenv("IK2_RELB")));
     if (flash_only && g_fast_want) W.lg_cap = std::max((size_t)64 << 20, (size_t)8 * c.H * 128 * 130);
+#ifdef STRATA_USE_HIP
+    if (flash_only && g_fast_want) {
+        const size_t flash = std::min<size_t>(Tm, Work::kRelbRows) * c.H * 130 * 16;
+        const size_t short_attention = size_t{8} * c.H * 130 * 128;
+        const size_t expert = (S8 * (2 * std::max<size_t>(C, c.F) + sizeof(float) * C) + 3) / 4;
+        W.lg_cap = std::max({flash, short_attention, expert});
+    }
+#endif
     W.lg = work_alloc<float>(W.lg_cap, 72ULL << 20);
     W.blocks = work_alloc<float>((size_t)(c.n_layer / c.block + 1) * T_buf * C);
     W.x16 = work_alloc<uint16_t>(Tm * std::max(C, HD)), W.xk16 = work_alloc<uint16_t>(Tm * C),
@@ -4929,9 +5004,10 @@ int main(int argc, char** argv) {
     if (W.T_sup > 0 || dual()) W.xq16_sup = work_alloc<uint16_t>(T_buf * C);
     if (!getenv("IK2_RELB") || std::atoi(getenv("IK2_RELB"))) {
         W.relb_ext = std::max(c.extent, c.extent_swa);
-        W.relb = work_alloc<float>((size_t)Work::kRelbRows * c.H * W.relb_ext);
+        const size_t rows = g_fast_want ? std::min<size_t>(Tm, Work::kRelbRows) : Work::kRelbRows;
+        W.relb = work_alloc<float>(rows * c.H * W.relb_ext);
     }
-    if (g_kv_fp8 && !(flash_only && g_fast_want)) {
+    if (fp8_kv(false) && !(flash_only && g_fast_want)) {
         W.kv_tmp_cap = std::min(ctx, 32768);
         W.kv_k16 = work_alloc<uint16_t>((size_t)W.kv_tmp_cap * KD);
         W.kv_v16 = work_alloc<uint16_t>((size_t)W.kv_tmp_cap * KD);
@@ -5034,6 +5110,8 @@ int main(int argc, char** argv) {
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
+    if (resident_only && EC.total_slots() != c.n_layer * c.E)
+        die("resident-only loading: insufficient VRAM after workspace allocation; reduce --ctx or --chunk");
     std::printf("expert cache, GPU %d: %d slots across %zu pools (%.1f GiB); load %.1f s in all\n", d, EC.total_slots(),
                 EC.pools.size(), EC.total_bytes() / 1073741824.0, now() - t_start);
     for (size_t p = 0; p < EC.pools.size(); ++p)
@@ -5125,6 +5203,7 @@ int main(int argc, char** argv) {
             std::printf("resident: every expert in VRAM (%d copied in %.1f s); tokens take the resident path%s\n", n,
                         now() - tw, g_graph ? ", one graph replay per decode step" : "");
         } else {
+            if (resident_only) die("resident-only loading: the dense matrix layout cannot use the resident decoder");
             std::printf("resident path off: %s\n", all ? "a dense matrix is not kept as blocks" : "the cache does not hold every expert");
         }
     }
@@ -5194,7 +5273,7 @@ int main(int argc, char** argv) {
             std::vector<float*> h;   // [layer * 4 + conv]
             std::vector<std::vector<uint8_t>> kv_k, kv_v;
         };
-        const size_t kv_elem_b = g_kv_fp8 ? 1 : 2;
+        const size_t kv_elem_b = fp8_kv(true) ? 1 : 2;
         std::vector<Snap> snaps(8);
         for (auto& sn : snaps) {
             sn.kv_k.resize(M.V.size());
@@ -5204,11 +5283,6 @@ int main(int argc, char** argv) {
                 use_dev(Ly.dev);
                 const size_t cc[4] = {KD, KD, C, C};
                 for (int i = 0; i < 4; ++i) sn.h.push_back(dalloc<float>(3 * cc[i]));
-                if (Ly.sliding && Ly.kv_cap < ctx) {
-                    const size_t bytes = (size_t) c.window * KD * kv_elem_b;
-                    sn.kv_k[l].resize(bytes);
-                    sn.kv_v[l].resize(bytes);
-                }
             }
         }
         int snap_next = 0;
@@ -5230,8 +5304,13 @@ int main(int argc, char** argv) {
                     const int s0 = k_start % Ly.kv_cap;
                     const int n1 = std::min(w, Ly.kv_cap - s0);
                     const int n2 = w - n1;
-                    uint8_t* dk = g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc;
-                    uint8_t* dv = g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc;
+                    uint8_t* dk = Ly.kc8 ? Ly.kc8 : (uint8_t*) Ly.kc;
+                    uint8_t* dv = Ly.vc8 ? Ly.vc8 : (uint8_t*) Ly.vc;
+                    const size_t bytes = (size_t)w * row_b;
+                    if (save && sn.kv_k[l].size() < bytes) {
+                        sn.kv_k[l].resize(bytes);
+                        sn.kv_v[l].resize(bytes);
+                    }
                     uint8_t* hk = sn.kv_k[l].data();
                     uint8_t* hv = sn.kv_v[l].data();
                     CU(cudaMemcpyAsync(save ? hk : dk + (size_t) s0 * row_b, save ? dk + (size_t) s0 * row_b : hk,
@@ -5272,6 +5351,11 @@ int main(int argc, char** argv) {
             }
             return v;
         };
+        if (resident_only) {
+            size_t free_bytes, total_bytes;
+            CU(cudaMemGetInfo(&free_bytes, &total_bytes));
+            std::printf("resident server: %.0f MiB of VRAM free before graph capture\n", free_bytes / 1048576.0);
+        }
         std::signal(SIGUSR1, on_usr1);
         // Maya's protocol (serve/server.py's StrataEngine): "GEN <max_new> [key=value ...] <ids>" in; "PP ..." per
         // prompt pass, "T <id>" per token and "DONE <generated> <prompt> <prompt_ms> <decode_ms> <stop|length|cancel>
@@ -5282,7 +5366,7 @@ int main(int argc, char** argv) {
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
         if (serve_maya) {
-            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d\n", g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu);
+            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d\n", kv_format_name(), ctx, n_gpu);
             std::printf("READY %d stop\n", ctx);
         } else {
             std::printf("@READY ctx %d\n", ctx);
@@ -5685,10 +5769,17 @@ int main(int argc, char** argv) {
     double t_exp = 0;
     const double tp = now();
     const bool all = !dump.empty();
+    const char* prompt_output = getenv("IK2_PREFILL_LOGITS_OUT");
+    std::ofstream prompt_logits;
+    if (prompt_output) {
+        prompt_logits.open(prompt_output, std::ios::binary);
+        if (!prompt_logits) die(std::string("cannot write prompt logits to ") + prompt_output);
+    }
+    const bool all_rows = all || prompt_output;
     int first_best = -1;
     const int T_sup = g_dev[0].W.T_sup;
     const int sub_chunk = std::min(g_dev[0].W.Tm, 512);
-    if (T_sup > 0 && (n_gpu == 1 || dual()) && !drafter && !all && (int) prompt.size() > 64) {
+    if (T_sup > 0 && (n_gpu == 1 || dual()) && !drafter && !all_rows && (int) prompt.size() > 64) {
         BigScratch bs;
         const int T_pass = big_begin(M, g_dev[0].W, dev_cache(0), (int) prompt.size(), (int) prompt.size(), bs);
         if (T_pass != T_sup) std::printf("prefill passes of %d tokens (scratch lent by the expert cache)\n", T_pass);
@@ -5706,10 +5797,16 @@ int main(int argc, char** argv) {
         for (int p0 = 0; p0 < (int) prompt.size(); p0 += chunk) {
             const int n = std::min(chunk, (int) prompt.size() - p0);
             const bool last = p0 + n == (int) prompt.size();
-            const OutMode om = all ? OutMode::kLogits : (!last ? OutMode::kNone : ((gen > 0 || drafter) ? OutMode::kArgmax : OutMode::kNone));
+            const OutMode om = all_rows ? OutMode::kLogits : (!last ? OutMode::kNone : ((gen > 0 || drafter) ? OutMode::kArgmax : OutMode::kNone));
             std::vector<float> lo;
             std::vector<int> ag;
-            forward(M, prompt.data() + p0, n, p0, all, om, all ? dump : std::string(), lo, &ag, t_exp);
+            forward(M, prompt.data() + p0, n, p0, all_rows, om, dump, lo, &ag, t_exp);
+            if (prompt_output) {
+                if (lo.size() != (size_t)n * c.n_vocab) die("unexpected number of prompt logits");
+                prompt_logits.write(reinterpret_cast<const char*>(lo.data()), lo.size() * sizeof(float));
+                if (!prompt_logits) die("writing prompt logits failed");
+                if (last) first_best = (int)(std::max_element(lo.end() - c.n_vocab, lo.end()) - (lo.end() - c.n_vocab));
+            }
             if (all) logits.insert(logits.end(), lo.begin(), lo.end());
             else if (last && !ag.empty()) first_best = ag[0];
             if (drafter) {
@@ -5717,6 +5814,10 @@ int main(int argc, char** argv) {
                 if (last) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
             }
         }
+    }
+    if (prompt_output) {
+        prompt_logits.close();
+        if (!prompt_logits) die("closing prompt logits failed");
     }
     const double prompt_s = now() - tp;
     std::printf("prompt: %zu tokens in %.2f s (%.1f tok/s); experts %.2f s of it, uploads %.2f s; cache %llu hits, "

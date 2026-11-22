@@ -688,18 +688,24 @@ void test_iq_ref() {
 }
 
 void test_experts_mv() {
-    const int C = 512, F = 256, S = 5;
+    const int S = 5;
     struct Case {
         int tg, tu, td;
         const char* name;
+        int C = 512, F = 256;
     };
     const Case cases[] = {{k::kNVFP4, k::kNVFP4, k::kNVFP4, "NVFP4"},
                           {k::kQ5_K, k::kQ5_K, k::kQ6_K, "Q5_K / Q6_K"},
                           {k::kQ8_0, k::kNVFP4, k::kQ6_K, "mixed"},
                           {k::kIQ3_XXS, k::kIQ3_XXS, k::kNVFP4, "IQ3_XXS / NVFP4"},
                           {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K, "IQ4_XS / Q6_K"},
-                          {k::kIQ4_NL, k::kIQ4_NL, k::kIQ4_NL, "IQ4_NL"}};
+                          {k::kIQ4_NL, k::kIQ4_NL, k::kIQ4_NL, "IQ4_NL"},
+                          {k::kIQ4_NL, k::kIQ4_NL, k::kIQ4_NL, "IQ4_NL gate K=2304", 2304, 32},
+                          {k::kIQ4_NL, k::kIQ4_NL, k::kIQ4_NL, "IQ4_NL down K=1152", 32, 1152},
+                          {k::kQ8_0, k::kQ8_0, k::kQ8_0, "Q8_0 gate K=2304", 2304, 32},
+                          {k::kQ8_0, k::kQ8_0, k::kQ8_0, "Q8_0 down K=1152", 32, 1152}};
     for (const Case& cs : cases) {
+        const int C = cs.C, F = cs.F;
         const int E = 3;
         auto g = rand_blocks(cs.tg, (size_t) E * F * C), u = rand_blocks(cs.tu, (size_t) E * F * C),
              d = rand_blocks(cs.td, (size_t) E * C * F);
@@ -1447,16 +1453,23 @@ void test_attn_decode_mma() {
             float* dscr = dev_n<float>(k::attn_decode_mma_scratch(H, c.n_split));
             std::vector<int> pos_h = {c.qpos};
             int* dpos = dev(pos_h);
+            for (size_t i = 0; i < qf.size(); ++i) qf[i] = h2f_host(q16[i]);
+            float *dq32 = dev(qf), *gated = dev_n<float>(qf.size());
+            float* split_part = dev_n<float>((size_t)H * c.n_split * 130);
             if (fp8) {
                 uint8_t *dk = dev(k8), *dv = dev(v8);
                 k::attn_decode_mma_fp8(dq, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, -1, c.n_split, scale * k_inv, v_inv, dp,
                                        d_rel, c.extent, c.window, dscr, dout, dg, dout16, 0);
+                k::attn_decode_fp8_at(dq32, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, c.n_split, scale * k_inv,
+                                      v_inv, dp, d_rel, c.extent, c.window, split_part, gated, 0, dg);
                 CU(cudaDeviceSynchronize());
                 cudaFree(dk), cudaFree(dv);
             } else {
                 uint16_t *dk = dev(k16), *dv = dev(v16);
                 k::attn_decode_mma_f16(dq, dr, ds, dk, dv, c.kv_cap, H, KV, nullptr, c.qpos, c.n_split, scale, dp, d_rel,
                                        c.extent, c.window, dscr, dout, nullptr, nullptr, 0);
+                k::attn_decode_f16_at(dq32, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, c.n_split, scale, dp,
+                                      d_rel, c.extent, c.window, split_part, gated, 0);
                 CU(cudaDeviceSynchronize());
                 cudaFree(dk), cudaFree(dv);
             }
@@ -1494,6 +1507,8 @@ void test_attn_decode_mma() {
             char label[96];
             std::snprintf(label, sizeof label, "mma %s %s", fp8 ? "fp8" : "f16", c.name);
             // (P is FP16 in the P V product: 2^-11 of a term)
+            expect("split attention and gate", host(gated, want.size()), want, 1e-3, 1e-5);
+            cudaFree(dq32), cudaFree(gated), cudaFree(split_part);
             const auto got = host(dout, want.size());
             expect(label, got, want, 1e-2, std::max(1e-6, 1e-3 * mag));
             if (fp8) {   // the FP16 copy: the output's rounding
@@ -1514,6 +1529,7 @@ void test_attn_flash() {
     struct Case {
         int Tq, qpos0, window, extent, kv_cap, n_split;
         const char* name;
+        bool block = false;
     };
     const Case cases[] = {
         {130, 0, 1 << 30, 64, 0, 1, "attn_flash from 0"},
@@ -1521,6 +1537,10 @@ void test_attn_flash() {
         {77, 1500, 1 << 30, 200, 0, 7, "attn_flash at 1500, 7 splits"},
         {70, 2000, 256, 256, 400, 2, "attn_flash ring 400, window 256"},
         {9, 40, 1 << 30, 64, 0, 7, "attn_flash 9 queries, empty splits"},
+#ifdef STRATA_USE_HIP
+        {3, 0, 1 << 30, 23, 0, 7, "verify attention from 0, empty splits", true},
+        {8, 127, 64, 35, 80, 3, "verify attention ring, three column tiles", true},
+#endif
     };
     for (bool fp8 : {false, true}) for (const Case& c : cases) {
         const int n_pos = c.qpos0 + c.Tq;   // positions written so far
@@ -1542,19 +1562,54 @@ void test_attn_flash() {
                 }
             }
         }
-        const int q_ld = H * D + 64;
+        const int q_ld = H * D + (c.block ? 0 : 64);
         auto qf = fvec((size_t) c.Tq * q_ld, 4.0f);
         std::vector<uint16_t> q16(qf.size());
         for (size_t i = 0; i < qf.size(); ++i) q16[i] = f2h_host(qf[i]);
         auto bias = fvec((size_t) c.Tq * H * c.extent, 2.0f), sink = fvec((size_t) c.Tq * H, 3.0f);
+        constexpr int dr = 5, r_ld = H * dr + 9, gate_ld = H * D + 13;
+        std::vector<float> r, proj, gate;
+        if (c.block) {
+            r = fvec(c.Tq * r_ld);
+            proj = fvec(c.extent * dr);
+            gate = fvec(c.Tq * gate_ld);
+            for (int t = 0; t < c.Tq; ++t) for (int h = 0; h < H; ++h) for (int d = 0; d < c.extent; ++d) {
+                double sum = 0;
+                for (int k = 0; k < dr; ++k) sum += (double)r[t * r_ld + h * dr + k] * proj[d * dr + k];
+                bias[(t * H + h) * c.extent + d] = (float)sum;
+            }
+        }
         const float scale = (fp8 ? 1.0f / 16.0f : 1.0f) / std::sqrt((float) D);
         const float v_scale = fp8 ? 1.0f / 32.0f : 1.0f;
-        const int o_ld = H * D + 32;
+        const int o_ld = H * D + (c.block ? 0 : 32);
         uint16_t* dq = dev(q16);
         float *db = dev(bias), *ds = dev(sink), *dout = dev_n<float>((size_t) c.Tq * o_ld);
         const size_t scr = (size_t) 8 * c.Tq * H * (D + 2);
         float* dscr = dev_n<float>(scr);
-        if (fp8) {
+        if (c.block) {
+            int* pos = dev(std::vector<int>{c.qpos0});
+            float *rel = dev(r), *pr = dev(proj), *g = dev(gate);
+            uint16_t* out16 = dev_n<uint16_t>((size_t)c.Tq * o_ld);
+            if (fp8) {
+                auto *dk = dev(k8), *dv = dev(v8);
+                k::attn_block_fp8(dq, rel, r_ld, ds, dk, dv, c.kv_cap, H, KV, pos, c.Tq, c.n_split,
+                                  scale, v_scale, pr, dr, c.extent, c.window, dscr, dout, g, gate_ld, out16, 0);
+                CU(cudaDeviceSynchronize());
+                cudaFree(dk), cudaFree(dv);
+            } else {
+                auto *dk = dev(kc), *dv = dev(vc);
+                k::attn_block_f16(dq, rel, r_ld, ds, dk, dv, c.kv_cap, H, KV, pos, c.Tq, c.n_split,
+                                  scale, pr, dr, c.extent, c.window, dscr, dout, g, gate_ld, out16, 0);
+                CU(cudaDeviceSynchronize());
+                cudaFree(dk), cudaFree(dv);
+            }
+            auto fp = host(dout, (size_t)c.Tq * o_ld);
+            auto half = host(out16, fp.size());
+            bool rounded = true;
+            for (size_t k = 0; k < fp.size(); ++k) rounded &= half[k] == f2h_host(fp[k]);
+            expect_true("verify attention returns rounded FP16 output", rounded);
+            cudaFree(pos), cudaFree(out16), cudaFree(rel), cudaFree(pr), cudaFree(g);
+        } else if (fp8) {
             uint8_t *dk = dev(k8), *dv = dev(v8);
             k::attn_flash_fp8(dq, q_ld, dk, dv, c.kv_cap, H, KV, D, c.Tq, c.qpos0, scale, v_scale, db,
                               c.extent, c.window, ds, dout, o_ld, dscr, scr, c.n_split, 0);
@@ -1592,6 +1647,7 @@ void test_attn_flash() {
                     double o = 0;
                     for (int kp = lo; kp <= qp; ++kp)
                         o += std::exp(l[kp - lo] - m) / sum * h2f_host(vc[((size_t) (c.kv_cap > 0 ? kp % c.kv_cap : kp) * KV + g) * D + d]);
+                    if (c.block) o /= 1.0 + std::exp(-(double)gate[(size_t)i * gate_ld + h * D + d]);
                     want.push_back(o * v_scale);
                     got.push_back(out[(size_t) i * o_ld + h * D + d]);
                 }
@@ -2599,6 +2655,38 @@ void test_rdna3_small_dense() {
     cudaFree(dy); cudaFree(dw); cudaFree(dx);
 }
 
+void test_rdna3_dense_gemm() {
+    constexpr int K = 96, N = 141, T = 79, ld = N + 9;
+    auto x = fvec(T * K), w = fvec(N * K);
+    std::vector<uint16_t> xh(x.size()), wh(w.size());
+    for (size_t i = 0; i < x.size(); ++i) xh[i] = f2h_host(x[i]);
+    for (size_t i = 0; i < w.size(); ++i) wh[i] = f2h_host(w[i]);
+    auto *dx = dev(xh), *dw = dev(wh);
+    auto* y = dev(std::vector<float>(T * ld, -77.f));
+    k::rdna3_dense_gemm(dw, N, K, dx, T, y, ld, 0);
+    std::vector<double> ref(T * ld, -77.);
+    for (int t = 0; t < T; ++t) for (int n = 0; n < N; ++n) {
+        double v = 0;
+        for (int k = 0; k < K; ++k) v += (double)h2f_host(wh[n * K + k]) * h2f_host(xh[t * K + k]);
+        ref[t * ld + n] = v;
+    }
+    expect("RDNA3 dense WMMA vs FP64, partial tiles and padded rows", host(y, T * ld), ref, 1e-4, 2e-5);
+    std::vector<int8_t> q(N * K);
+    std::vector<uint16_t> scales(N * K / 32);
+    for (auto& weight : q) weight = (int)(rng() % 256) - 128;
+    for (auto& d : scales) d = f2h_host(frand(0.02f));
+    for (size_t i = 0; i < wh.size(); ++i) wh[i] = f2h_host(q[i] * h2f_host(scales[i / 32]));
+    CU(cudaMemcpy(dw, wh.data(), wh.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    k::rdna3_dense_gemm(dw, N, K, dx, T, y, ld, 0);
+    const auto dequantized = host(y, T * ld);
+    auto *dq = dev(q);
+    auto *ds = dev(scales);
+    k::rdna3_planar_gemm(dq, ds, N, K, dx, T, y, ld, 0);
+    expect_true("planar Q8 WMMA equals CPU dequantization and dense WMMA", host(y, T * ld) == dequantized);
+    cudaFree(dq), cudaFree(ds);
+    cudaFree(dw), cudaFree(dx), cudaFree(y);
+}
+
 void test_rdna3_expert_groups() {
     constexpr int E = 64, K = 4;
     const auto gs = fvec(E), us = fvec(E), ds = fvec(E);
@@ -2887,6 +2975,7 @@ int main() {
     test_experts_mv();
 #ifdef STRATA_USE_HIP
     test_rdna3_small_dense();
+    test_rdna3_dense_gemm();
     test_rdna3_expert_groups();
     test_rdna3_expert_gemm();
 #endif

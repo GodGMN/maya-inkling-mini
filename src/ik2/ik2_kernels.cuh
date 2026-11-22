@@ -338,11 +338,11 @@ void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t
 /// a token to the next).  scratch: H x P x 130 floats.
 void attn_decode_f16_at(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
-                        int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+                        int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s, const float* gate = nullptr, uint16_t* out16 = nullptr);
 void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, float v_inv_scale,
                         const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
-                        cudaStream_t s);
+                        cudaStream_t s, const float* gate = nullptr, uint16_t* out16 = nullptr);
 
 /// One token's attention on the tensor cores - for long contexts, where the scalar attn_decode is bound by its
 /// arithmetic; this one reads at the memory's speed, an FP8 cache too.  q16 [H][128]: the clipped q in FP16;
@@ -418,6 +418,11 @@ inline int expert_tile_capacity(int slots, int experts, int rows) {
     // At most one partial tile per nonempty expert.
     return std::min(slots, experts + (slots - 1) / rows);
 }
+/// Row-major X[T,K] times W[N,K] transposed, in FP16 with FP32 sums. K is divisible by 32.
+void rdna3_dense_gemm(const uint16_t* weights, int N, int K, const uint16_t* input, int T, float* output,
+                      int ld, cudaStream_t stream);
+void rdna3_planar_gemm(const int8_t* weights, const uint16_t* scales, int N, int K, const uint16_t* input, int T,
+                       float* output, int ld, cudaStream_t stream);
 /// Group [T, K] picks by expert, schedule their tiles, and preserve expert order in each token's sum.
 void rdna3_expert_groups(const int* top, const float* weights, int slots, int K, int experts, const float* gs,
                          const float* us, const float* ds, ExpertTiles tiles, int* tokens, int* inv, float* gate,

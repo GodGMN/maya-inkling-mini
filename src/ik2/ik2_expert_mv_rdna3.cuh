@@ -1,10 +1,11 @@
 // One wave reads eight 32-weight GGUF blocks per step and reuses its activation registers across output rows.
-template <bool Gate, int Type, int Rows>
+template <bool Gate, int Type, int Rows, int Waves, int FixedK>
 __global__ void rdna3_expert_token(const uint8_t* const* blobs, size_t offset, const int* tokens,
-                                const float* x, const uint16_t* h, int K, int N, const float* gates,
+                                const float* x, const uint16_t* h, int runtime_k, int N, const float* gates,
                                 const float* ups, float gate_cap, float up_cap, uint16_t* hidden, float* output) {
+    const int K = FixedK ? FixedK : runtime_k;
     const int slot = blockIdx.y, lane = threadIdx.x & 31, word = lane & 3;
-    const int first = (blockIdx.x * 4 + threadIdx.x / 32) * Rows;
+    const int first = (blockIdx.x * Waves + threadIdx.x / 32) * Rows;
     if (first >= N) return;
     constexpr int bytes = Type == kIQ4_NL ? 18 : 34;
     const size_t stride = (size_t)(K / 32) * bytes;
@@ -59,13 +60,28 @@ __global__ void rdna3_expert_token(const uint8_t* const* blobs, size_t offset, c
     }
 }
 
-template <bool Gate, int Type, int Rows>
+template <bool Gate, int Type, int Rows, int Waves, int FixedK>
 void launch_rdna3_expert(const uint8_t* const* blobs, int slots, size_t offset, const int* tokens,
                          const float* x, const uint16_t* h, int K, int N, const float* gates, const float* ups,
                          float gate_cap, float up_cap, uint16_t* hidden, float* output, cudaStream_t stream) {
-    constexpr int rows_per_block = 4 * Rows;
-    rdna3_expert_token<Gate, Type, Rows><<<dim3((N + rows_per_block - 1) / rows_per_block, slots), 128, 0, stream>>>(
+    constexpr int rows_per_block = Waves * Rows;
+    rdna3_expert_token<Gate, Type, Rows, Waves, FixedK><<<dim3((N + rows_per_block - 1) / rows_per_block, slots), Waves * 32, 0, stream>>>(
         blobs, offset, tokens, x, h, K, N, gates, ups, gate_cap, up_cap, hidden, output);
+}
+
+template <bool Gate, int Type>
+void dispatch_rdna3_expert(const uint8_t* const* blobs, int slots, size_t offset, const int* tokens,
+                           const float* x, const uint16_t* h, int K, int N, const float* gates, const float* ups,
+                           float gate_cap, float up_cap, uint16_t* hidden, float* output, cudaStream_t stream) {
+    constexpr int width = Gate ? 2304 : 1152;
+    constexpr int rows = Type == kIQ4_NL ? (Gate ? 2 : 4) : (Gate ? 1 : 2);
+    constexpr int waves = Type == kIQ4_NL ? 2 : 4;
+    if (K == width && N % rows == 0)
+        launch_rdna3_expert<Gate, Type, rows, waves, width>(blobs, slots, offset, tokens, x, h, K, N, gates, ups,
+                                                           gate_cap, up_cap, hidden, output, stream);
+    else
+        launch_rdna3_expert<Gate, Type, 2, 4, 0>(blobs, slots, offset, tokens, x, h, K, N, gates, ups,
+                                                gate_cap, up_cap, hidden, output, stream);
 }
 
 template <bool Gate>
@@ -74,12 +90,12 @@ bool try_rdna3_expert(int type, const uint8_t* const* blobs, int slots, size_t o
                       float gate_cap, float up_cap, uint16_t* hidden, float* output, cudaStream_t stream) {
     static const bool iq4 = getenv("IK2_IQ4_MV") && atoi(getenv("IK2_IQ4_MV"));
     static const bool q8 = getenv("IK2_Q8_MV") && atoi(getenv("IK2_Q8_MV"));
-    if (N % 2 || (Gate ? ((uintptr_t)x & 15) : ((uintptr_t)h & 7))) return false;
+    if (K % 32 || N % 2 || (Gate ? ((uintptr_t)x & 15) : ((uintptr_t)h & 7))) return false;
     if (type == kIQ4_NL && iq4)
-        launch_rdna3_expert<Gate, kIQ4_NL, 2>(blobs, slots, offset, tokens, x, h, K, N, gates, ups,
+        dispatch_rdna3_expert<Gate, kIQ4_NL>(blobs, slots, offset, tokens, x, h, K, N, gates, ups,
                                              gate_cap, up_cap, hidden, output, stream);
     else if (type == kQ8_0 && q8)
-        launch_rdna3_expert<Gate, kQ8_0, 2>(blobs, slots, offset, tokens, x, h, K, N, gates, ups,
+        dispatch_rdna3_expert<Gate, kQ8_0>(blobs, slots, offset, tokens, x, h, K, N, gates, ups,
                                            gate_cap, up_cap, hidden, output, stream);
     else return false;
     check(Gate ? "rdna3_expert_gate_up" : "rdna3_expert_down");
