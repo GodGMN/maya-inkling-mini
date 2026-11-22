@@ -2,6 +2,31 @@
 
 On Prometheus’s RX 7900 XTX, the Radeon server runs the installed ggml-org IQ4_NL model with all routed experts in VRAM. [Current measurements](#full-model-measurements-at-393216-reserved-tokens) · [Packaged server](#run-the-packaged-image-on-prometheus) · [Long-context retrieval](#exact-phrase-retrieval-at-long-context)
 
+## Live service on Prometheus
+
+On 2026-11-22, `hyperion/maya-ik2:gfx1100-service-r1` replaced `hyperion/llama.cpp:server-rocm-inkling-1427-r2` on port 8085. The deployed image ID is `sha256:9f2df85e9fde0a5d4450c7f4cb87e4247bdb651d63ba5c4168d754dec9ed89d9`. Its native engine SHA-256 is `81cbe5f004ff5c0e64db8ead4fe13f1a7f410acbe26f5d01bdf6b33d9aa959b3`. Compose kept the controller's service name, port, device access, restart policy and 10 GiB memory and swap limits. The live health response reported one slot, 393,216 positions, images enabled and medium default reasoning effort.
+
+The deployed image passed all 19 Inkling frontend tests. On the live port all four tool conversations returned Larch's VX-731 and Birch's PK-284, and all four image answers matched the incumbent. The CPU-encoded screenshot request took 13.965 seconds. The incumbent had its own 8,192-token reasoning budget. Maya's Inkling backend accepts a reasoning effort and a total output limit. Its separate thinking-budget endpoint reports `supported: false`.
+
+```sh
+cd ~/ai/build/maya-ik2-hip
+docker inspect -f '{{.Config.Image}} {{.State.Health.Status}} {{.RestartCount}} {{.State.OOMKilled}}' inkling-2-mini
+curl -fsS http://127.0.0.1:8085/health
+curl -fsS http://127.0.0.1:8085/v1/models
+curl -fsS http://127.0.0.1:8085/api/thinking-budget
+python3 src/tests/ik2_tool_conversations.py http://127.0.0.1:8085
+python3 src/tests/ik2_image_answers.py http://127.0.0.1:8085
+```
+
+For rollback, the incumbent image remains on Prometheus. The following commands restore its Compose configuration and controller description.
+
+```sh
+cd ~/ai/services/inkling-2-mini
+cp docker-compose.yml.pre-maya-1429 docker-compose.yml
+cp service.json.pre-maya-1429 service.json
+docker compose up -d --no-deps --pull never llama
+```
+
 ## Growing conversations
 
 The full-context image reserves 393,216 positions with a 1,024-token prefill chunk. The web client now sends Inkling's earlier reasoning back. API clients should retain the complete assistant message, including reasoning and tool calls, and preserve tool IDs when sending results. Changing the system prompt, tools, their order, or the reasoning level can change tokens near the beginning of the rendered history. A rewritten history starts a new prefix.
