@@ -18,14 +18,20 @@ def png(left, right):
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(row * height)) + chunk(b"IEND", b"")
 
 
-def run(url, directory):
+def run(url, directory, screenshots=False):
     colors = {"red": (236, 24, 24), "blue": (16, 40, 236), "green": (16, 165, 46)}
     question = "What color is the left half of this image? Answer with just the color name."
     images = [(f"{left}-{right}", png(colors[left], colors[right]), question, left)
               for left, right in (("red", "blue"), ("blue", "red"), ("green", "blue"))]
-    screenshot = Path(__file__).resolve().parents[1] / "docs/media/setup-tui/03-compiling.png"
-    images.append(("setup-progress", screenshot.read_bytes(),
-                   "What percentage is printed beside the progress bar? Reply with the number and percent sign only.", "39%"))
+    media = Path(__file__).resolve().parents[1] / "docs/media/setup-tui"
+    question = "What percentage is printed beside the progress bar? Reply with the number and percent sign only."
+    setup = ("setup-progress", (media / "03-compiling.png").read_bytes(), question, "39%")
+    if screenshots:
+        images = [setup, ("downloading", (media / "04-downloading.png").read_bytes(), question, "43%"),
+                  ("loading", (media / "09-loading.png").read_bytes(),
+                   "What is the large percentage shown under Loading the model? Reply with the percentage only.", "55%")]
+    else:
+        images.append(setup)
     if url:
         with urlopen(url + "/v1/models", timeout=15) as response:
             model = json.load(response)["data"][0]["id"]
@@ -57,9 +63,10 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("url", nargs="?")
     p.add_argument("--write-images", type=Path)
+    p.add_argument("--screenshots", action="store_true", help="test three distinct 1480×900 screenshots, starting with compilation")
     args = p.parse_args()
     if not args.url and not args.write_images:
         p.error("provide a server URL or --write-images")
     if args.write_images:
         args.write_images.mkdir(parents=True, exist_ok=True)
-    run(args.url, args.write_images)
+    run(args.url, args.write_images, args.screenshots)

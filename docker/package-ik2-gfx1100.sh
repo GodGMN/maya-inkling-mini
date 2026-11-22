@@ -14,6 +14,7 @@ cp "$root/LICENSE" "$root/VERSION" "$context/"
 cp "$1" "$context/maya-ik2"
 cp -R "$2" "$context/tokenizer"
 cp "$root/docs/inkling2-mini/ik2-mini-gfx1100.json" "$root/docker/ik2-gfx1100.Dockerfile" "$context/"
+cp "$root/docker/start-ik2-gfx1100.sh" "$context/"
 mkdir "$context/vision"
 if [ "$#" -ge 4 ]; then
     test -x "$4"
