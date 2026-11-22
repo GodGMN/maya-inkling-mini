@@ -101,6 +101,27 @@ radeon env IK2_KV=f16 python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-i
     --model /weight.gguf --chunk 1024 --tokens water.force --depths 512,8192 --gen 129 --repeats 3
 ```
 
+### Retrieval at 392,960 input tokens
+
+The all-E4M3 preset returned the exact four-word phrase on all three direct-answer prompts. Each phrase had a different position in the archive, and every prefill started with zero cached tokens. A second request extended the same input by one token, reused all 392,960 previous tokens and timed 128 decode steps with stopping disabled.
+
+| Phrase position | Exact answer | Cold prefill, s | Decode, tok/s |
+| ---: | --- | ---: | ---: |
+| 5% | velvet falcon tundra juniper | 415.490 | 35.86 |
+| 50% | falcon juniper quartz ember | 415.744 | 35.81 |
+| 95% | ember meadow lantern harbor | 415.985 | 35.88 |
+
+```sh
+for position in 5 50 95; do
+    needle() {
+        python3 src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
+            --depths 392960 --percent "$position" --direct-answer --max-tokens 200 --decode-steps 128 "$@"
+    }
+    needle | radeon ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 >"needle-$position.log"
+    needle --score "needle-$position.log"
+done
+```
+
 ## Build on Prometheus without a GPU
 
 The source tree is under `~/ai/build/maya-ik2-hip/src`. The build container mounts its parent at `/work`. The following commands reproduce the environment from a synced source tree. The llama.cpp archive is the source revision pinned by Maya's top-level CMake file.
