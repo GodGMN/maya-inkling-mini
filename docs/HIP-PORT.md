@@ -682,3 +682,24 @@ for k in 32 64; do
 done
 IK2_EXPERT_MMA=1 IK2_WMMA_K=32 IK2_EXPERT_TILE_LDS=0 ./build-ik2/ik2_kernels_test
 ```
+
+### Resident prefill workspace and projection cache
+
+The grouped expert gate/up and down projections use one FP32 workspace in sequence. SwiGLU places its FP16 output in a separate buffer. With an 8,192-token chunk this saves 576 MiB of expert scratch, enough for the engine to keep all 56 dense attention projections in FP16 under the existing VRAM headroom setting. On 8,192 and 32,768 input tokens, median prefill fell from 2.175 and 9.756 seconds to 2.078 and 9.612 seconds respectively. At 512 tokens it went from 0.215 to 0.221 seconds. All 256 rows of held-out prefill logits matched the previous allocation byte for byte, both with a 64-token chunk and with a 256-token chunk.
+
+The Radeon preset uses `IK2_PREFILL_DENSE=2` to keep just the 24 fused QKV projections in FP16 (868 MiB). Q8 projections go directly through wave32 WMMA on batches of 32 through 511 tokens. At a chunk size of 2,048, the selective cache took 0.151, 2.214 and 10.333 seconds for 256, 8,192 and 32,768 input tokens. The 56-matrix cache took 0.160, 2.219 and 10.368 seconds. The uncached, selective and full caches produced identical full-vocabulary logits on the 256-token passage with chunk size 128. All times are medians of three requests.
+
+```sh
+# Use the preset environment and profile-pp-ids from the short-prompt test above.
+# Compare the workspace on commit 3b2e4ac and the compact build using the same 56-matrix cache.
+IK2_PREFILL_DENSE=1 python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    --tokens profile-pp-ids --depths 512,8192,32768 --chunk 8192 --gen 3 --repeats 3
+
+for cache in 1 0 2; do
+    IK2_PREFILL_DENSE=$cache python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+        --tokens profile-pp-ids --depths 64,256,512,2048,8192,32768 --chunk 2048 --gen 3 --repeats 3
+    IK2_PREFILL_DENSE=$cache IK2_PREFILL_LOGITS_OUT="cache-$cache.f32" ./build-ik2/maya-ik2 \
+        --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.all --gen 0
+done
+cmp cache-0.f32 cache-1.f32 && cmp cache-1.f32 cache-2.f32
+```

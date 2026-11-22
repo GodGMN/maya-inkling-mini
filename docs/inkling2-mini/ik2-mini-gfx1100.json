@@ -13,7 +13,7 @@
     "IK2_PREFILL_TILE": "auto",
     "IK2_PREFILL_SWIGLU": "1",
     "IK2_EXPERT_TILE_LDS": "1",
-    "IK2_PREFILL_DENSE": "1",
+    "IK2_PREFILL_DENSE": "2",
     "IK2_FLASH": "1",
     "IK2_FLASH_WAVES": "4",
     "IK2_DENSE_WMMA": "1",

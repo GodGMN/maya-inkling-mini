@@ -679,17 +679,18 @@ size_t g_w16_n = 0;          // values it holds
 // Y [T][N] = X [T][K] . W^T: one token straight over the blocks (x32), more through an FP16 decode and a GEMM (x16).
 // A matrix larger than the decode buffer (the head: its few rows of logits) goes a token at a time over its blocks.
 void matmul(const Mat& m, const float* x32, const uint16_t* x16, int T, float* Y, int ldy) {
-    if (m.f16 && (!m.q8 || T > 1)) {
-        gemm16(m.f16, m.N, m.K, x16, T, Y, ldy);
-        return;
-    }
 #ifdef STRATA_USE_HIP
     static const bool planar = getenv("IK2_DENSE_WMMA") && atoi(getenv("IK2_DENSE_WMMA"));
-    if (planar && m.q8 && T >= 32 && m.N >= 128 && m.K % 32 == 0) {
+    static const bool selective = getenv("IK2_PREFILL_DENSE") && atoi(getenv("IK2_PREFILL_DENSE")) == 2;
+    if (planar && m.q8 && T >= 32 && m.N >= 128 && m.K % 32 == 0 && (!m.f16 || (selective && T < 512))) {
         k::rdna3_planar_gemm(m.q8, m.q8d, m.N, m.K, x16, T, Y, ldy, g_s);
         return;
     }
 #endif
+    if (m.f16 && (!m.q8 || T > 1)) {
+        gemm16(m.f16, m.N, m.K, x16, T, Y, ldy);
+        return;
+    }
     static const bool use_q8_tile = getenv("IK2_Q8_TILE") && atoi(getenv("IK2_Q8_TILE"));
     if (use_q8_tile && allow_short_batch_products() && m.q8 && T >= 2 && T <= 16 && m.K % 32 == 0) {
         k::q8_tile(m.q8, m.q8d, m.N, m.K, x16, T, Y, ldy, g_s);
@@ -3121,25 +3122,25 @@ bool resident_wmma_prefill(const Config& c, const Layer& ly, int T, Work& w) {
     if (!enabled || !g_fast || T < 2 || !ly.tab_blob || c.E > 1024 ||
         ly.ty[0] != ly.ty[1] || ly.ty[0] != ly.ty[2] || (ly.ty[0] != k::kIQ4_NL && ly.ty[0] != k::kQ8_0 && ly.ty[0] != k::kNVFP4) ||
         C % block || F % block || (size_t)capacity * sizeof(k::ExpertTile) > (size_t)T * F * sizeof(uint16_t) ||
-        (size_t)S * (2 * std::max(C, F) + 4 * C) > w.lg_cap * sizeof(float) ||
-        (size_t)S * 2 * F * sizeof(float) > w.gu32_bytes) return false;
+        (size_t)S * std::max(C, F) * sizeof(uint16_t) > w.lg_cap * sizeof(float) ||
+        (size_t)S * std::max(2 * F, C) * sizeof(float) > w.gu32_bytes) return false;
     k::ExpertTiles tiles{reinterpret_cast<k::ExpertTile*>(w.h16), capacity, tile_rows};
-    auto* input = reinterpret_cast<uint16_t*>(w.lg);
-    auto* output = reinterpret_cast<float*>(input + (size_t)S * std::max(C, F));
+    static const bool fuse_swiglu = getenv("IK2_PREFILL_SWIGLU") && atoi(getenv("IK2_PREFILL_SWIGLU"));
+    const bool fused = fuse_swiglu && tiles.rows == 64;
+    // The down projection overwrites the gate/up workspace after SwiGLU has consumed it.
+    auto* hidden = reinterpret_cast<uint16_t*>(w.lg);
+    auto* input = fused ? reinterpret_cast<uint16_t*>(w.gu32) : hidden;
     k::rdna3_expert_groups(w.route_d, (const float*)(w.route_d + S), S, c.K, c.E, ly.tab_sc[0], ly.tab_sc[1],
                            ly.tab_sc[2], tiles, w.gidx, w.inv, w.sg, w.su, w.wtr, g_s);
     gather_f16_16_kernel<<<S, 256, 0, g_s>>>(w.x16, w.gidx, S, C, input);
-    static const bool fused = getenv("IK2_PREFILL_SWIGLU") && atoi(getenv("IK2_PREFILL_SWIGLU"));
-    uint16_t* hidden = input;
-    if (fused && tiles.rows == 64) {
-        hidden = reinterpret_cast<uint16_t*>(w.gu32);
+    if (fused) {
         k::rdna3_expert_swiglu(ly.ty[0], ly.tab_blob, tiles, input, C, F, w.sg, w.su, c.gate_cap, c.up_cap, hidden, g_s);
     } else {
         k::rdna3_expert_gemm(ly.ty[0], ly.tab_blob, 0, tiles, input, C, 2 * F, w.gu32, g_s);
-        k::swiglu_cap_f32(w.gu32, S, F, w.sg, w.su, c.gate_cap, c.up_cap, input, g_s);
+        k::swiglu_cap_f32(w.gu32, S, F, w.sg, w.su, c.gate_cap, c.up_cap, hidden, g_s);
     }
-    k::rdna3_expert_gemm(ly.ty[2], ly.tab_blob, ly.eb[0] + ly.eb[1], tiles, hidden, F, C, output, g_s);
-    combine_prefill_groups<<<T, 256, 0, g_s>>>(output, w.inv, w.wtr, C, c.K, w.tmp);
+    k::rdna3_expert_gemm(ly.ty[2], ly.tab_blob, ly.eb[0] + ly.eb[1], tiles, hidden, F, C, w.gu32, g_s);
+    combine_prefill_groups<<<T, 256, 0, g_s>>>(w.gu32, w.inv, w.wtr, C, c.K, w.tmp);
     return true;
 }
 #endif
@@ -5067,7 +5068,7 @@ int main(int argc, char** argv) {
     if (flash_only && g_fast_want) {
         const size_t flash = std::min<size_t>(Tm, Work::kRelbRows) * c.H * 130 * 16;
         const size_t short_attention = size_t{8} * c.H * 130 * 128;
-        const size_t expert = (S8 * (2 * std::max<size_t>(C, c.F) + sizeof(float) * C) + 3) / 4;
+        const size_t expert = (S8 * std::max<size_t>(C, c.F) * sizeof(uint16_t) + sizeof(float) - 1) / sizeof(float);
         W.lg_cap = std::max({flash, short_attention, expert});
     }
 #endif
@@ -5307,9 +5308,11 @@ int main(int argc, char** argv) {
     if (g_fast && getenv("IK2_PREFILL_DENSE") && atoi(getenv("IK2_PREFILL_DENSE"))) {
         std::vector<Mat*> projections;
         size_t elements = 0;
+        const bool selective = atoi(getenv("IK2_PREFILL_DENSE")) == 2;
         for (auto& layer : M.L) {
             for (Mat* m : {&layer.wqkvrg, &layer.wqrg, &layer.wk, &layer.wv, &layer.wo}) {
-                if (m->q8 && !m->f16) {
+                const bool fused = m == &layer.wqkvrg || m == &layer.wqrg;
+                if (m->q8 && !m->f16 && (!selective || fused)) {
                     projections.push_back(m);
                     elements += (size_t)m->N * m->K;
                 }

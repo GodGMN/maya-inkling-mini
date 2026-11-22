@@ -879,7 +879,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
   # maya-ik2: Inkling 2 (thinkingmachines/Inkling-2-Small, docs/INKLING2.md) from unsloth's GGUFs in place.  CUDA on
   # Linux only (its host tables are mmap'd and pinned in place), Ampere on (mma.sync m16n8k16, cp.async); Hopper's
-  # prefill attention takes wgmma, so a 90 in the list builds 90a. HIP gfx1100 uses scalar decode and hipBLAS prefill.
+  # prefill attention takes wgmma, so a 90 in the list builds 90a. HIP gfx1100 builds the wave32 and RDNA3 WMMA kernels.
   # Its kernels - the ops the other engines do not have - and their test against a double reference (no model).
   set(_ik2_archs "")
   set(_ik2_filter OFF)
