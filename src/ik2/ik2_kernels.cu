@@ -1662,6 +1662,89 @@ __global__ void gate_mul_impl_kernel(float* o, const float* g, size_t n, uint16_
     }
 }
 
+#ifdef STRATA_USE_HIP
+// The high word sorts by FP32 score, the low bits break ties in ascending expert order.
+__device__ __forceinline__ uint64_t route_key(float score, int expert) {
+    uint32_t bits = score == 0.f ? 0 : __float_as_uint(score);
+    bits ^= (0u - (bits >> 31)) | 0x80000000u;
+    return ((uint64_t)bits << 8) | (127 - expert);
+}
+
+__device__ __forceinline__ uint64_t route_sort_wave(uint64_t key, int lane) {
+#pragma unroll
+    for (int group = 2; group <= 32; group *= 2) {
+#pragma unroll
+        for (int stride = group / 2; stride; stride /= 2) {
+            const uint64_t peer = __shfl_xor(key, stride, 32);
+            const bool larger = ((lane & group) == 0) == ((lane & stride) == 0);
+            key = larger ? max(key, peer) : min(key, peer);
+        }
+    }
+    return key;
+}
+
+struct RouteGather {
+    const uint8_t* const* table;
+    const float *gate_scale, *up_scale, *down_scale;
+    const uint8_t** blob;
+    int *tok, *inv;
+    float *sg, *su, *wt;
+};
+
+// Four waves select their best eight experts. A final wave finds the eighth of those 32.
+template <bool Gather>
+__global__ void rdna3_route_eight(const float* logits, const float* bias, float scale, int* top, float* weights,
+                                 RouteGather tables) {
+    constexpr int E = 128, K = 8;
+    const int e = threadIdx.x, lane = e & 31, wave = e >> 5;
+    const int token = blockIdx.x;
+    const float sig = 1.f / (1.f + expf(-logits[(size_t)token * E + e]));
+    const uint64_t key = route_key(sig + bias[e], e);
+    const uint64_t local = route_sort_wave(key, lane);
+    __shared__ uint64_t finalists[32], cutoff;
+    __shared__ uint32_t masks[4];
+    __shared__ float chosen[K];
+    if (lane < K) finalists[wave * K + lane] = local;
+    __syncthreads();
+    if (!wave) {
+        const uint64_t ranked = route_sort_wave(finalists[lane], lane);
+        if (lane == K - 1) cutoff = ranked;
+    }
+    __syncthreads();
+    const bool pick = key >= cutoff;
+    const uint32_t mine = __ballot(pick);
+    if (!lane) masks[wave] = mine;
+    __syncthreads();
+    int pos = __popc(mine & ((1u << lane) - 1u));
+#pragma unroll
+    for (int w = 0; w < 3; ++w) if (w < wave) pos += __popc(masks[w]);
+    if (pick) chosen[pos] = sig;
+    __syncthreads();
+    if (!pick) return;
+    float sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < K; ++i) sum += chosen[i];
+    const float weight = sig / (sum + 1e-20f) * scale;
+    top[(size_t)token * K + pos] = e;
+    weights[(size_t)token * K + pos] = weight;
+    if constexpr (Gather) {
+        tables.blob[pos] = tables.table[e];
+        tables.tok[pos] = 0;
+        tables.inv[pos] = pos;
+        tables.sg[pos] = tables.gate_scale ? tables.gate_scale[e] : 1.f;
+        tables.su[pos] = tables.up_scale ? tables.up_scale[e] : 1.f;
+        tables.wt[pos] = weight * (tables.down_scale ? tables.down_scale[e] : 1.f);
+    }
+}
+bool rdna3_route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
+                      cudaStream_t stream) {
+    if (E != 128 || K != 8) return false;
+    rdna3_route_eight<false><<<T, 128, 0, stream>>>(logits, bias, scale, top, w, {});
+    check("rdna3_route_rows");
+    return true;
+}
+#endif
+
 constexpr int kRouteMax = 16;
 // Single-warp zero-barrier router for E <= 512: each lane holds <= 16 experts in registers.
 __global__ void route_warp_kernel(const float* logits, const float* bias, int T, int E, int K, float scale, int* top,
@@ -5616,6 +5699,9 @@ void gate_mul_f16(float* o, const float* g, size_t n, uint16_t* o16, bool write_
 void route(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
            cudaStream_t s) {
     if (T <= 0) return;
+#ifdef STRATA_USE_HIP
+    if (rdna3_route_rows(logits, bias, T, E, K, scale, top, w, s)) return;
+#endif
     if (K < 1 || K > kRouteMax) {
         std::fprintf(stderr, "ik2::k::route: K %d\n", K);
         std::abort();
@@ -6300,6 +6386,14 @@ void route_token(const float* logits, const float* bias, int E, int K, float sca
                  const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
                  int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s, const float* x, int width,
                  void* packed, bool q8, uint16_t* x_limbs) {
+#ifdef STRATA_USE_HIP
+    if (E == 128 && K == 8 && !packed && !x_limbs) {
+        const RouteGather gather{tab, sg_t, su_t, sd_t, blob, tok, inv, sg, su, wt};
+        rdna3_route_eight<true><<<1, 128, 0, s>>>(logits, bias, scale, top, w, gather);
+        check("rdna3_route_token");
+        return;
+    }
+#endif
     if (E > 1024 || K > E) {   // (more experts than a block's threads: the two kernels)
         if (packed) nv_input<true><<<(width / 16 + 31) / 32, 32, 0, s>>>(x, nullptr, width, (NvInput*)packed, q8);
         if (x_limbs) to_f16_limbs(x, (size_t) width, x_limbs, s);
@@ -6689,6 +6783,9 @@ void attn_res_jobs_block(const ResStates& states, int n, const float* q, int nq,
 void route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
                 cudaStream_t s) {
     if (T <= 0) return;
+#ifdef STRATA_USE_HIP
+    if (rdna3_route_rows(logits, bias, T, E, K, scale, top, w, s)) return;
+#endif
     if (E > 1024 || K > E || K > kRouteMax) {
         route(logits, bias, T, E, K, scale, top, w, s);
         return;

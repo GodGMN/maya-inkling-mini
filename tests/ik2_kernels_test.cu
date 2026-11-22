@@ -377,8 +377,8 @@ void test_attn_probs() {
     }
 }
 
-void test_route() {
-    const int T = 300, E = 384, K = 8;
+void test_route(int E) {
+    const int T = 300, K = 8;
     auto lg = fvec((size_t) T * E, 6.0f), bias = fvec(E, 0.2f);
     float *dl = dev(lg), *db = dev(bias), *dw = dev_n<float>((size_t) T * K);
     int* dt = dev_n<int>((size_t) T * K);
@@ -3079,7 +3079,10 @@ int main() {
     test_conv();
     test_attn_res();
     test_attn_probs();
-    test_route();
+    test_route(384);
+#ifdef STRATA_USE_HIP
+    test_route(128);
+#endif
     test_moe_pieces();
     test_decode();
     test_iq_ref();
