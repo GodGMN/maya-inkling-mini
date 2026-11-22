@@ -380,6 +380,11 @@ void test_attn_probs() {
 void test_route(int E) {
     const int T = 300, K = 8;
     auto lg = fvec((size_t) T * E, 6.0f), bias = fvec(E, 0.2f);
+    // Several waves share the cutoff score. The lower expert IDs must win the tie.
+    for (int e = 0; e < E; e += 4) {
+        lg[e] = 8.0f;
+        bias[e] = 0.4f;
+    }
     float *dl = dev(lg), *db = dev(bias), *dw = dev_n<float>((size_t) T * K);
     int* dt = dev_n<int>((size_t) T * K);
     k::route(dl, db, T, E, K, 8.0f, dt, dw, 0);

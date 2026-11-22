@@ -1,6 +1,6 @@
 # Inkling 2 Mini on gfx1100
 
-The port runs on Prometheus's RX 7900 XTX. Build instructions and the original scalar port are below. The [RDNA3 results](#rdna3-expert-and-attention-kernels) give the measured configuration and uncached benchmark command.
+On Prometheus’s RX 7900 XTX, the Radeon server preset runs the installed ggml-org IQ4_NL model with all routed experts in VRAM. See the [decode measurements](#fused-decode-projections), [uncached prefill measurements](#cooperative-prefill-and-depth-dependent-decode-attention) and [long-context retrieval results](#exact-phrase-retrieval-at-long-context).
 
 ## Build on Prometheus without a GPU
 
@@ -398,7 +398,7 @@ for flag in 0 1; do
     IK2_DECODE_PROJ=$flag python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
         --tokens water.force --gen 257 --depths 32,512,8192 --repeats 3 --chunk 2048
     IK2_DECODE_PROJ=$flag IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="projection-$flag.f32" ./build-ik2/maya-ik2 --model /weight.gguf \
-        --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 32
+        --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
 done
 cmp projection-0.f32 projection-1.f32
 ```
