@@ -653,7 +653,7 @@ size_t g_w16_n = 0;          // values it holds
 // Y [T][N] = X [T][K] . W^T: one token straight over the blocks (x32), more through an FP16 decode and a GEMM (x16).
 // A matrix larger than the decode buffer (the head: its few rows of logits) goes a token at a time over its blocks.
 void matmul(const Mat& m, const float* x32, const uint16_t* x16, int T, float* Y, int ldy) {
-    if (m.f16) {
+    if (m.f16 && (!m.q8 || T > 1)) {
         gemm16(m.f16, m.N, m.K, x16, T, Y, ldy);
         return;
     }
@@ -1384,8 +1384,8 @@ Mat mat_rows(const Mat& m, int r0, int n) {   // the rows [r0, r0 + n) of a matr
     Mat p = m;
     p.N = n;
     if (m.f16) p.f16 = m.f16 + (size_t) r0 * m.K;
-    else if (m.q8) p.q8 = m.q8 + (size_t) r0 * m.K, p.q8d = m.q8d + (size_t) r0 * (m.K >> 5);
-    else p.raw = m.raw + (size_t) r0 * (m.K / k::block_values(m.type)) * k::block_bytes(m.type);
+    if (m.q8) p.q8 = m.q8 + (size_t) r0 * m.K, p.q8d = m.q8d + (size_t) r0 * (m.K >> 5);
+    if (m.raw) p.raw = m.raw + (size_t) r0 * (m.K / k::block_values(m.type)) * k::block_bytes(m.type);
     return p;
 }
 void matmul_rows(const Mat& m, int r0, int n, const float* x32, const uint16_t* x16, int T, float* Y, int ldy) {
@@ -3015,21 +3015,23 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
 bool resident_wmma_prefill(const Config& c, const Layer& ly, int T, Work& w) {
     static const bool enabled = getenv("IK2_PREFILL_WMMA") && atoi(getenv("IK2_PREFILL_WMMA"));
     const int S = T * c.K, C = c.C, F = c.F;
-    const int capacity = k::expert_tile_capacity(S, c.E);
+    static const int tile_rows = getenv("IK2_PREFILL_TILE") ? atoi(getenv("IK2_PREFILL_TILE")) : 16;
+    if (tile_rows != 16 && tile_rows != 32 && tile_rows != 64) die("IK2_PREFILL_TILE expects 16, 32 or 64");
+    const int capacity = k::expert_tile_capacity(S, c.E, tile_rows);
     if (!enabled || !g_fast || T < 2 || !ly.tab_blob || c.E > 1024 ||
         ly.ty[0] != ly.ty[1] || ly.ty[0] != ly.ty[2] || (ly.ty[0] != k::kIQ4_NL && ly.ty[0] != k::kQ8_0) ||
         C % 32 || F % 32 || (size_t)capacity * sizeof(k::ExpertTile) > (size_t)T * F * sizeof(uint16_t) ||
         (size_t)S * (2 * std::max(C, F) + 4 * C) > w.lg_cap * sizeof(float) ||
         (size_t)S * 2 * F * sizeof(float) > w.gu32_bytes) return false;
-    auto* tiles = reinterpret_cast<k::ExpertTile*>(w.h16);
+    k::ExpertTiles tiles{reinterpret_cast<k::ExpertTile*>(w.h16), capacity, tile_rows};
     auto* input = reinterpret_cast<uint16_t*>(w.lg);
     auto* output = reinterpret_cast<float*>(input + (size_t)S * std::max(C, F));
     k::rdna3_expert_groups(w.route_d, (const float*)(w.route_d + S), S, c.K, c.E, ly.tab_sc[0], ly.tab_sc[1],
                            ly.tab_sc[2], tiles, w.gidx, w.inv, w.sg, w.su, w.wtr, g_s);
     gather_f16_16_kernel<<<S, 256, 0, g_s>>>(w.x16, w.gidx, S, C, input);
-    k::rdna3_expert_gemm(ly.ty[0], ly.tab_blob, 0, tiles, capacity, input, C, 2 * F, w.gu32, g_s);
+    k::rdna3_expert_gemm(ly.ty[0], ly.tab_blob, 0, tiles, input, C, 2 * F, w.gu32, g_s);
     k::swiglu_cap_f32(w.gu32, S, F, w.sg, w.su, c.gate_cap, c.up_cap, input, g_s);
-    k::rdna3_expert_gemm(ly.ty[2], ly.tab_blob, ly.eb[0] + ly.eb[1], tiles, capacity, input, F, C, output, g_s);
+    k::rdna3_expert_gemm(ly.ty[2], ly.tab_blob, ly.eb[0] + ly.eb[1], tiles, input, F, C, output, g_s);
     combine_prefill_groups<<<T, 256, 0, g_s>>>(output, w.inv, w.wtr, C, c.K, w.tmp);
     return true;
 }
@@ -5128,13 +5130,44 @@ int main(int argc, char** argv) {
     }
     std::fflush(stdout);
     }
+    // Keep space for allocations made on demand, including the image encoder.
+    const size_t reserve =
+        (size_t)(getenv("IK2_HEADROOM_MIB") ? std::max(0, atoi(getenv("IK2_HEADROOM_MIB"))) : 1536) << 20;
+#ifdef STRATA_USE_HIP
+    if (g_fast && getenv("IK2_PREFILL_DENSE") && atoi(getenv("IK2_PREFILL_DENSE"))) {
+        std::vector<Mat*> projections;
+        size_t elements = 0;
+        for (auto& layer : M.L) {
+            for (Mat* m : {&layer.wqkvrg, &layer.wqrg, &layer.wk, &layer.wv, &layer.wo}) {
+                if (m->q8 && !m->f16) {
+                    projections.push_back(m);
+                    elements += (size_t)m->N * m->K;
+                }
+            }
+        }
+        size_t free_bytes, total_bytes;
+        CU(cudaMemGetInfo(&free_bytes, &total_bytes));
+        if (elements && elements * sizeof(uint16_t) + reserve <= free_bytes) {
+            auto* dst = dalloc<uint16_t>(elements);
+            for (auto* m : projections) {
+                const size_t n = (size_t)m->N * m->K;
+                m->f16 = dst;
+                k::decode_q8p_f16(m->q8, m->q8d, n, dst, g_s);
+                dst += n;
+            }
+            CU(cudaStreamSynchronize(g_s));
+            std::fprintf(stderr, "prefill dense projections: %zu FP16 matrices, %.0f MiB\n",
+                         projections.size(), elements / 524288.0);
+        } else {
+            std::fprintf(stderr, "prefill dense projections: using per-call dequantization (%.0f MiB available after headroom)\n",
+                         free_bytes > reserve ? (free_bytes - reserve) / 1048576.0 : 0.0);
+        }
+    }
+#endif
     if (g_managed_experts) {
         CU(cudaStreamSynchronize(g_s));
         size_t remaining = 0, total = 0;
         CU(cudaMemGetInfo(&remaining, &total));
-        // An image encoder can start on demand after the engine comes up.
-        const size_t reserve =
-            (size_t)(getenv("IK2_HEADROOM_MIB") ? std::max(0, atoi(getenv("IK2_HEADROOM_MIB"))) : 1536) << 20;
         g_kv_room = remaining > reserve ? remaining - reserve : 0;
     }
     // the caches' counters, summed over the GPUs

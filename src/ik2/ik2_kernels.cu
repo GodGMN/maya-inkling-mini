@@ -2227,7 +2227,7 @@ __device__ __forceinline__ uint32_t iq4nl_lut4(uint32_t w, bool hi) {
 #endif
 }
 #ifdef STRATA_USE_HIP
-#include "ik2_iq4_rdna3.cuh"
+#include "ik2_expert_mv_rdna3.cuh"
 #endif
 // block b (136 bytes, 4-aligned), sub-block ib
 __device__ __forceinline__ float iq4xs_sub_dot(const uint8_t* b, int ib, const float4 (&xv)[8]) {
@@ -3806,6 +3806,26 @@ __global__ void mv_f16_kernel(const uint16_t* __restrict__ W, int N, int K, cons
 }
 
 #ifdef STRATA_USE_HIP
+// Keep the original 32-lane accumulation order while giving each row its own workgroup.
+__global__ void rdna3_mv_f16_exact(const uint16_t* weights, const float* x, float* y) {
+    constexpr int K = 2304, batch = 8;
+    const int lane = threadIdx.x;
+    const auto* w = weights + (size_t)blockIdx.x * K + lane;
+    float acc = 0;
+    for (int base = 0; base < K; base += 32 * batch) {
+        float a[batch], b[batch];
+#pragma unroll
+        for (int i = 0; i < batch; ++i) {
+            a[i] = h2f(w[base + 32 * i]);
+            b[i] = x[base + 32 * i + lane];
+        }
+#pragma unroll
+        for (int i = 0; i < batch; ++i) acc = fmaf(a[i], b[i], acc);
+    }
+    acc = wsum(acc);
+    if (!lane) y[blockIdx.x] = acc;
+}
+
 // A small routing or dynamic-convolution matrix has too few rows to fill the card with four rows per block.
 __global__ void rdna3_mv_f16_row(const uint16_t* weights, int K, const float* input, float* output) {
     constexpr int threads = 128;
@@ -5845,13 +5865,8 @@ void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_dow
 
     if (S <= 0) return;
 #ifdef STRATA_USE_HIP
-    static const bool direct = getenv("IK2_IQ4_MV") && atoi(getenv("IK2_IQ4_MV"));
-    if (direct && ty_down == kIQ4_NL && C % 2 == 0 && ((uintptr_t)h & 7) == 0) {
-        rdna3_iq4_token<false, 2><<<dim3((C + 7) / 8, S), 128, 0, s>>>(
-            blob, off_down, nullptr, nullptr, h, F, C, nullptr, nullptr, 0, 0, nullptr, y);
-        check("rdna3_iq4_down");
-        return;
-    }
+    if (try_rdna3_expert<false>(ty_down, blob, S, off_down, nullptr, nullptr, h, F, C, nullptr, nullptr,
+                                0, 0, nullptr, y, s)) return;
 #endif
     if (S <= 4) launch_experts_down<4, 2>(blob, S, ty_down, off_down, h, C, F, y, s);
     else launch_experts_down<4, 4>(blob, S, ty_down, off_down, h, C, F, y, s);
@@ -5919,13 +5934,8 @@ void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, i
 
     if (S <= 0) return;
 #ifdef STRATA_USE_HIP
-    static const bool direct = getenv("IK2_IQ4_MV") && atoi(getenv("IK2_IQ4_MV"));
-    if (direct && ty_gate == kIQ4_NL && ty_up == kIQ4_NL && F % 2 == 0 && ((uintptr_t)x & 15) == 0) {
-        rdna3_iq4_token<true, 2><<<dim3((F + 7) / 8, S), 128, 0, s>>>(
-            blob, eb0, tok, x, nullptr, C, F, sg, su, gcap, ucap, h, nullptr);
-        check("rdna3_iq4_gate_up");
-        return;
-    }
+    if (ty_gate == ty_up && try_rdna3_expert<true>(ty_gate, blob, S, eb0, tok, x, nullptr, C, F, sg, su,
+                                                  gcap, ucap, h, nullptr, s)) return;
 #endif
     if (S <= 8) launch_experts_gate_up_swiglu<4, 2>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
     else launch_experts_gate_up_swiglu<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
@@ -6124,8 +6134,13 @@ void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out,
 void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStream_t s) {
     if (N <= 0) return;
 #ifdef STRATA_USE_HIP
-    static const bool wide = getenv("IK2_F16_MV") && atoi(getenv("IK2_F16_MV"));
-    if (wide && (N == 32 || N == 128) && K % 4 == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)x & 15) == 0) {
+    static const int mode = getenv("IK2_F16_MV") ? atoi(getenv("IK2_F16_MV")) : 0;
+    if (mode == 2 && K == 2304 && (N == 32 || N == 128)) {
+        rdna3_mv_f16_exact<<<N, 32, 0, s>>>(W, x, y);
+        check("rdna3_mv_f16_exact");
+        return;
+    }
+    if (mode == 1 && (N == 32 || N == 128) && K % 4 == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)x & 15) == 0) {
         rdna3_mv_f16_row<<<N, 128, 0, s>>>(W, K, x, y);
         check("rdna3_mv_f16_row");
         return;

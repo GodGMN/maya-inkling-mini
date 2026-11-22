@@ -758,7 +758,7 @@ void test_experts_mv() {
         expect(name, host(dgu, want_gu.size()), want_gu, 2e-4, 2e-3);
         std::snprintf(name, sizeof name, "experts_down %s", cs.name);
         expect(name, host(dy, want_y.size()), want_y, 2e-4, 2e-3);
-        if (cs.tg == k::kIQ4_NL && cs.tu == k::kIQ4_NL) {
+        if (cs.tg == cs.tu && (cs.tg == k::kIQ4_NL || cs.tg == k::kQ8_0)) {
             auto sg = fvec(S), su = fvec(S);
             auto *dg = dev(sg), *du = dev(su);
             auto* hidden = dev_n<uint16_t>((size_t)S * F);
@@ -775,7 +775,7 @@ void test_experts_mv() {
                     got[(size_t)i * F + j] = h2f_host(halves[(size_t)i * F + j]);
                 }
             }
-            expect("IQ4_NL fused SwiGLU vs FP64", got, expected, 1e-3, 1e-4);
+            expect(cs.tg == k::kIQ4_NL ? "IQ4_NL fused SwiGLU vs FP64" : "Q8_0 fused SwiGLU vs FP64", got, expected, 1e-3, 1e-4);
             cudaFree(hidden); cudaFree(dg); cudaFree(du);
         }
         // S = 1 path (<4, 2> launch config)
@@ -2582,6 +2582,19 @@ void test_rdna3_small_dense() {
         k::mv_f16(dw, rows, K, dx, dy, 0);
         expect("RDNA3 small dense matvec", host(dy, rows), std::vector<double>(ref.begin(), ref.begin() + rows),
                2e-4, 1e-3);
+        if (std::getenv("IK2_F16_MV") && std::atoi(std::getenv("IK2_F16_MV")) == 2) {
+            const auto actual = host(dy, rows);
+            bool exact = true;
+            for (int r = 0; r < rows; ++r) {
+                float lanes[32] = {};
+                for (int i = 0; i < K; ++i)
+                    lanes[i % 32] = std::fma(h2f_host(weights[r * K + i]), x[i], lanes[i % 32]);
+                for (int distance = 16; distance; distance /= 2)
+                    for (int i = 0; i < distance; ++i) lanes[i] += lanes[i + distance];
+                exact &= actual[r] == lanes[0];
+            }
+            expect_true("RDNA3 small dense matvec preserves per-lane FP32 sums", exact);
+        }
     }
     cudaFree(dy); cudaFree(dw); cudaFree(dx);
 }
@@ -2590,8 +2603,8 @@ void test_rdna3_expert_groups() {
     constexpr int E = 64, K = 4;
     const auto gs = fvec(E), us = fvec(E), ds = fvec(E);
     auto *dg = dev(gs), *du = dev(us), *dd = dev(ds);
-    for (int T : {2, 17, 129}) {
-        const int slots = T * K, capacity = k::expert_tile_capacity(slots, E);
+    for (int tile_rows : {16, 32, 64}) for (int T : {2, 17, 129}) {
+        const int slots = T * K, capacity = k::expert_tile_capacity(slots, E, tile_rows);
         std::vector<int> top(slots);
         for (int t = 0; t < T; ++t) {
             // Expert zero spans many tiles. Most other experts see a mix of one or two rows.
@@ -2604,12 +2617,12 @@ void test_rdna3_expert_groups() {
         auto* tiles = dev_n<k::ExpertTile>(capacity);
         for (bool scales : {false, true}) {
             k::rdna3_expert_groups(dt, dw, slots, K, E, scales ? dg : nullptr, scales ? du : nullptr,
-                                   scales ? dd : nullptr, tiles, tokens, inv, gate, up, weight, 0);
+                                   scales ? dd : nullptr, {tiles, capacity, tile_rows}, tokens, inv, gate, up, weight, 0);
             std::vector<int> experts(slots, -1);
             bool correct = true;
             for (const auto tile : host(tiles, capacity)) {
                 correct &= tile.expert >= 0 && tile.expert < E && tile.first >= 0 && tile.first <= tile.end &&
-                           tile.end <= slots && tile.end - tile.first <= 16;
+                           tile.end <= slots && tile.end - tile.first <= tile_rows;
                 if (!correct) break;
                 for (int r = tile.first; r < tile.end; ++r) {
                     correct &= experts[r] == -1;
@@ -2641,10 +2654,8 @@ void test_rdna3_expert_groups() {
 
 // Three nonempty experts separated by an empty one, including a partial token tile and a partial output workgroup.
 void test_rdna3_expert_gemm() {
-    constexpr int E = 4, N = 48, K = 96, T = 39;
-    const std::vector<int> starts{0, 1, 1, 22, T};
-    const std::vector<k::ExpertTile> tiles{{0,0,1}, {2,1,17}, {2,17,22}, {3,22,38}, {3,38,39}, {0,0,0}};
-    auto* ds = dev(tiles);
+    constexpr int E = 4, N = 48, K = 96, T = 94;
+    const std::vector<int> starts{0, 1, 1, 74, T};
     std::vector<uint16_t> x(T * K);
     for (auto& v : x) v = f2h_host(frand(0.75f));
     auto* dx = dev(x);
@@ -2658,7 +2669,6 @@ void test_rdna3_expert_gemm() {
         auto** db = dev(blob);
         for (int matrix = 0; matrix < 2; ++matrix) {
             const size_t offset = matrix * matrix_bytes;
-            k::rdna3_expert_gemm(type, db, offset, ds, (int)tiles.size(), dx, K, N, dy, 0);
             std::vector<double> expected(T * N);
             std::vector<float> w(N * K);
             for (int e = 0; e < E; ++e) {
@@ -2668,15 +2678,24 @@ void test_rdna3_expert_gemm() {
                         for (int i = 0; i < K; ++i)
                             expected[t * N + n] += (double)h2f_host(x[t * K + i]) * h2f_host(f2h_host(w[n * K + i]));
             }
-            expect(type == k::kIQ4_NL ? "RDNA3 WMMA IQ4_NL expert GEMM" : "RDNA3 WMMA Q8_0 expert GEMM",
-                   host(dy, T * N), expected, 1e-4, 1e-3);
+            for (int tile_rows : {16, 32, 64}) {
+                std::vector<k::ExpertTile> tiles;
+                for (int e = 0; e < E; ++e)
+                    for (int row = starts[e]; row < starts[e+1]; row += tile_rows)
+                        tiles.push_back({e, row, std::min(row + tile_rows, starts[e+1])});
+                tiles.push_back({0, 0, 0});
+                auto* dt = dev(tiles);
+                k::rdna3_expert_gemm(type, db, offset, {dt, (int)tiles.size(), tile_rows}, dx, K, N, dy, 0);
+                expect(type == k::kIQ4_NL ? "RDNA3 WMMA IQ4_NL expert GEMM" : "RDNA3 WMMA Q8_0 expert GEMM",
+                       host(dy, T * N), expected, 1e-4, 1e-3);
+                cudaFree(dt);
+            }
         }
         cudaFree(db);
         cudaFree(weights);
     }
     cudaFree(dy);
     cudaFree(dx);
-    cudaFree(ds);
 }
 #endif
 

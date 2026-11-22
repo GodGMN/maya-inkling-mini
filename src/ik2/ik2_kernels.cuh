@@ -410,16 +410,20 @@ constexpr int kQ8_0 = 8, kQ5_K = 13, kQ6_K = 14, kIQ3_XXS = 18, kIQ4_NL = 20, kI
 struct ExpertTile {
     int expert, first, end;
 };
-inline int expert_tile_capacity(int slots, int experts) {
-    // At most one partial 16-row tile per nonempty expert.
-    return std::min(slots, experts + (slots - 1) / 16);
+struct ExpertTiles {
+    ExpertTile* data;
+    int capacity, rows;
+};
+inline int expert_tile_capacity(int slots, int experts, int rows) {
+    // At most one partial tile per nonempty expert.
+    return std::min(slots, experts + (slots - 1) / rows);
 }
-/// Group [T, K] picks by expert, schedule their 16-row tiles, and preserve expert order in each token's sum.
+/// Group [T, K] picks by expert, schedule their tiles, and preserve expert order in each token's sum.
 void rdna3_expert_groups(const int* top, const float* weights, int slots, int K, int experts, const float* gs,
-                         const float* us, const float* ds, ExpertTile* tiles, int* tokens, int* inv, float* gate,
+                         const float* us, const float* ds, ExpertTiles tiles, int* tokens, int* inv, float* gate,
                          float* up, float* weight, cudaStream_t stream);
 /// Sorted half inputs and resident GGUF matrices [N, K] to float outputs. K % 32 == N % 16 == 0.
-void rdna3_expert_gemm(int type, const uint8_t* const* experts, size_t offset, const ExpertTile* tiles, int capacity,
+void rdna3_expert_gemm(int type, const uint8_t* const* experts, size_t offset, ExpertTiles tiles,
                        const uint16_t* input, int K, int N, float* output, cudaStream_t stream);
 #endif
 /// values a block / bytes a block (0: not one of the above).

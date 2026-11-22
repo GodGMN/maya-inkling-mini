@@ -201,3 +201,30 @@ oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /we
 oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf --count 96 \
     --llama-url http://192.168.100.111:8085
 ```
+
+### Larger prefill chunks and exact router accumulation
+
+On the installed IQ4_NL model, the 56 attention projection matrices occupy 1,228 MiB when dequantized to FP16. `IK2_PREFILL_DENSE=1` retains those matrices when VRAM has room after the expert cache and headroom. Decode continues to read the original planar Q8. The grouped expert kernel expands signed byte pairs and applies the original FP16 block scale. It can reuse one loaded weight tile across 16, 32 or 64 routed tokens. The table uses the 16-token tile.
+
+| Prompt | Chunk | Uncached prefill, both runs (tok/s) | Decode, both runs (tok/s) |
+| ---: | ---: | ---: | ---: |
+| 512 | 512 | 1,625.40, 1,635.78 | 101.91, 101.99 |
+| 8,192 | 512 | 1,485.94, 1,485.94 | 93.36, 93.43 |
+| 8,192 | 1,024 | 1,589.14, 1,586.67 | 93.50, 93.50 |
+| 8,192 | 2,048 | 1,666.40, 1,663.35 | 93.64, 93.57 |
+| 32,768 | 2,048 | 1,339.38, 1,339.82 | 79.06, 79.11 |
+
+The production comparison above used identical tokens at 8,192 and reached 1,488.44 tok/s prefill and 61.97 tok/s decode. The 2,048-token chunk improves prefill, costs workspace and adds startup latency on the first matrix product.
+
+```sh
+# Start with the FP32 expert environment above.
+export IK2_PREFILL_DENSE=1 IK2_PREFILL_TILE=16 IK2_Q8_MV=1 IK2_F16_MV=2
+for chunk in 512 1024; do
+    python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+        --tokens water.force --depths 32,512,2048,8192,32768 --gen 129 --repeats 2 --chunk "$chunk"
+done
+python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    --tokens water.force --depths 2048,8192,32768 --gen 129 --repeats 2 --chunk 2048
+```
+
+`IK2_F16_MV=2` preserves the scalar router's FP32 FMA sequence within each lane and its wave reduction order. The gfx1100 device test compares its output bit for bit to this CPU computation. The library passage with E4M3 KV matched 12/13 CPU top-1 predictions (mean KL 0.02426905, maximum 0.22447712). With FP16 KV and uncompressed loop-gate weights it matched 9/13, with a lower mean KL of 0.00308744 and maximum 0.01372127. Both are full distributions over 200,058 tokens. Reproduce both with the library command above, `--chunk 128`, `IK2_ATTN_MMA=0 IK2_EXPERT_LIMB=0 IK2_IQ4_MV=1 IK2_Q8_MV=1 IK2_F16_MV=2 IK2_PREFILL_DENSE=1`. For the second run additionally set `IK2_KV=f16 IK2_GATE_BF16=0`.
