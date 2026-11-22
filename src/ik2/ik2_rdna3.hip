@@ -153,11 +153,11 @@ __global__ void expert_wmma_gemm(const uint8_t* const* experts, size_t offset, c
 
 // A workgroup computes 64 tokens by 64 output channels. Each wave owns a 32x32 quadrant.
 // The extra eight halfs in each LDS row shift consecutive rows to different banks.
-template <int Type>
+template <int Type, int Depth>
 __global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts, size_t offset, const ExpertTile* tiles,
                            const uint16_t* input, int N, int K, int T, float* output, int ld,
                            const int8_t* planar = nullptr, const uint16_t* scales = nullptr) {
-    constexpr int depth = 32, pitch = depth / 8 + 1;
+    constexpr int vectors = Depth / 8, pitch = vectors + 1;
     __shared__ uint4 a[64][pitch], b[64][pitch];
     const int tid = threadIdx.x, lane = tid & 31, l = lane & 15, wave = tid / 32;
     int row0 = blockIdx.y * 64;
@@ -172,10 +172,10 @@ __global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts,
     const int col0 = blockIdx.x * 64;
     const int m0 = (wave / 2) * 32, n0 = (wave % 2) * 32;
     Float8 accum[2][2] = {};
-    for (int k0 = 0; k0 < K; k0 += depth) {
+    for (int k0 = 0; k0 < K; k0 += Depth) {
 #pragma unroll
-        for (int load = 0; load < 2; ++load) {
-            const int f = tid + load * 128, row = f / 4, vec = f % 4;
+        for (int load = 0; load < 64 * vectors / 128; ++load) {
+            const int f = tid + load * 128, row = f / vectors, vec = f % vectors;
             const int k = k0 + vec * 8;
             uint4 av = {};
             if (row0 + row < T) __builtin_memcpy(&av, input + (size_t)(row0 + row) * K + k, sizeof(av));
@@ -188,22 +188,25 @@ __global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts,
         }
         if constexpr (Type != kDenseF16) {
             constexpr int bytes = Type == kIQ4_NL ? 18 : 34;
-            const int row = tid / 2, half = tid % 2;
-            Half16 bv = {};
-            if (col0 + row < N) {
-                const size_t base = (size_t)(col0 + row) * K + k0;
-                if constexpr (Type == kPlanarQ8) {
-                    const _Float16 scale = __builtin_bit_cast(_Float16, scales[base / 32]);
-                    bv = planar_fragment(planar + base + half * 16, scale);
-                } else {
-                    bv = expert_fragment<Type>(quant + (base / 32) * bytes, half);
+#pragma unroll
+            for (int f = tid; f < 64 * (Depth / 16); f += 128) {
+                const int row = f / (Depth / 16), frag = f % (Depth / 16);
+                Half16 bv = {};
+                if (col0 + row < N) {
+                    const size_t base = (size_t)(col0 + row) * K + k0 + frag * 16;
+                    if constexpr (Type == kPlanarQ8) {
+                        const _Float16 scale = __builtin_bit_cast(_Float16, scales[base / 32]);
+                        bv = planar_fragment(planar + base, scale);
+                    } else {
+                        bv = expert_fragment<Type>(quant + (base / 32) * bytes, frag % 2);
+                    }
                 }
+                __builtin_memcpy(&b[row][2 * frag], &bv, sizeof(bv));
             }
-            __builtin_memcpy(&b[row][2 * half], &bv, sizeof(bv));
         }
         __syncthreads();
 #pragma unroll
-        for (int kk = 0; kk < depth / 8; kk += 2) {
+        for (int kk = 0; kk < vectors; kk += 2) {
             Half16 ax[2], bx[2];
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
@@ -229,6 +232,17 @@ __global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts,
                 if (row < T && col < N) output[(size_t)row * ld + col] = accum[m][n][i];
             }
         }
+}
+
+template <int Type>
+void launch_tiled(dim3 grid, const uint16_t* dense, const uint8_t* const* experts, size_t offset,
+                  const ExpertTile* tiles, const uint16_t* x, int N, int K, int T, float* y, int ld,
+                  cudaStream_t stream, const int8_t* planar = nullptr, const uint16_t* scales = nullptr) {
+    static const bool wide = getenv("IK2_WMMA_K") && atoi(getenv("IK2_WMMA_K")) == 64;
+    if (wide && K % 64 == 0)
+        tiled_gemm<Type, 64><<<grid, 128, 0, stream>>>(dense, experts, offset, tiles, x, N, K, T, y, ld, planar, scales);
+    else
+        tiled_gemm<Type, 32><<<grid, 128, 0, stream>>>(dense, experts, offset, tiles, x, N, K, T, y, ld, planar, scales);
 }
 
 __global__ void dense_q8_wmma(const int8_t* weights, const uint16_t* scales, int N, int K,
@@ -260,15 +274,15 @@ __global__ void dense_q8_wmma(const int8_t* weights, const uint16_t* scales, int
 
 void rdna3_dense_gemm(const uint16_t* weights, int N, int K, const uint16_t* input, int T, float* output,
                       int ld, cudaStream_t stream) {
-    tiled_gemm<kDenseF16><<<dim3((N + 63) / 64, (T + 63) / 64), 128, 0, stream>>>(
-        weights, nullptr, 0, nullptr, input, N, K, T, output, ld);
+    launch_tiled<kDenseF16>(dim3((N + 63) / 64, (T + 63) / 64), weights, nullptr, 0, nullptr,
+                            input, N, K, T, output, ld, stream);
     check_launch("dense_half_gemm");
 }
 
 void rdna3_planar_gemm(const int8_t* weights, const uint16_t* scales, int N, int K, const uint16_t* input, int T,
                        float* output, int ld, cudaStream_t stream) {
-    tiled_gemm<kPlanarQ8><<<dim3((N + 63) / 64, (T + 63) / 64), 128, 0, stream>>>(
-        nullptr, nullptr, 0, nullptr, input, N, K, T, output, ld, weights, scales);
+    launch_tiled<kPlanarQ8>(dim3((N + 63) / 64, (T + 63) / 64), nullptr, nullptr, 0, nullptr,
+                            input, N, K, T, output, ld, stream, weights, scales);
     check_launch("dense_planar_gemm");
 }
 
@@ -292,7 +306,7 @@ void launch_expert_gemm(const uint8_t* const* experts, size_t offset, ExpertTile
     const dim3 grid((N + 63) / 64, tiles.capacity);
     static const bool use_lds = getenv("IK2_EXPERT_TILE_LDS") && atoi(getenv("IK2_EXPERT_TILE_LDS"));
     if (tiles.rows == 64 && use_lds)
-        tiled_gemm<Type><<<grid, 128, 0, stream>>>(nullptr, experts, offset, tiles.data, input, N, K, 0, output, N);
+        launch_tiled<Type>(grid, nullptr, experts, offset, tiles.data, input, N, K, 0, output, N, stream);
     else if (tiles.rows == 16) expert_wmma_gemm<Type, 16><<<grid, 128, 0, stream>>>(experts, offset, tiles.data, input, K, N, output);
     else if (tiles.rows == 32) expert_wmma_gemm<Type, 32><<<grid, 128, 0, stream>>>(experts, offset, tiles.data, input, K, N, output);
     else if (tiles.rows == 64) expert_wmma_gemm<Type, 64><<<grid, 128, 0, stream>>>(experts, offset, tiles.data, input, K, N, output);

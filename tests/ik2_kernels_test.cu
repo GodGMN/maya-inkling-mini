@@ -2820,7 +2820,7 @@ void test_rdna3_small_dense() {
 }
 
 void test_rdna3_dense_gemm() {
-    constexpr int K = 96, N = 141, T = 79, ld = N + 9;
+    constexpr int K = 192, N = 141, T = 79, ld = N + 9;
     auto x = fvec(T * K), w = fvec(N * K);
     std::vector<uint16_t> xh(x.size()), wh(w.size());
     for (size_t i = 0; i < x.size(); ++i) xh[i] = f2h_host(x[i]);
