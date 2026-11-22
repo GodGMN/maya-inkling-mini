@@ -8,6 +8,10 @@ The gfx1100 kernel suite passed, including FP64 checks at 392,957 keys. This bui
 
 The Radeon server offers OpenAI and Anthropic tool calls, including streamed parallel calls and multi-turn results. Its Docker preset reserves 393,216 positions. On a conversation that grew from 20K to 300K, each turn reused all previously processed tokens. Reuse resumed after compaction. [Tool conversations](docs/HIP-PORT.md#multi-turn-tool-calls-on-prometheus) · [Per-turn cache and memory measurements](docs/HIP-PORT.md#growing-conversations)
 
+For independent chats, set `IK2_CACHE_SLOTS=2`, `3` or `4` at startup. With two 196K chats and four 98K chats, every follow-up processed only its new tokens and every final answer matched its cold replay. All requests run serially. [Slot sizes, timings and VRAM](docs/HIP-PORT.md#separate-conversation-caches)
+
+The packaged server can read images on the CPU or GPU. Both encoders matched llama.cpp on three color tests and read 39% from a setup screenshot. The screenshot request took 14.06 seconds with the CPU encoder and 0.82 seconds with the HIP encoder at full context. [Vision profiles and measurements](docs/HIP-PORT.md#image-answers-and-gpu-memory)
+
 ```sh
 git clone --branch hip-port https://github.com/GodGMN/maya-inkling-mini.git
 ```

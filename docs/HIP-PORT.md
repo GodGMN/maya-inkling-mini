@@ -34,6 +34,43 @@ pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-api)
 python3 src/tests/ik2_chat_growth.py http://127.0.0.1:18085 --server-pid "$pid" >growth-direct-full.jsonl
 ```
 
+## Separate conversation caches
+
+Set `IK2_CACHE_SLOTS` in Compose or pass `--cache-slots N` to the native server. One request runs at a time. Each slot retains its token and image history, KV, convolution state and prefix checkpoints. The engine selects the longest prefix it can restore. A new conversation uses an empty slot first, then the least recently used one. A restart clears all slots. With a single slot the engine allocates no exchange buffer.
+
+All 18 follow-ups across the three settings reused every previously processed token. Each needed 20 new tokens. The nine final replies matched their independent zero-cache controls on prompt length, assistant message, finish reason and generated token count. No cgroup OOM kills occurred. Memory below is the highest device-wide reading sampled after a request. All four configurations used the CPU vision encoder and 1,024-token prefill chunks.
+
+| Slots | Context per slot | Final prompt per chat | Warm follow-up, seconds | Final cold control, seconds | Device VRAM, GiB |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 393,216 | 300,000 | See growing conversation | 259.365 | 23.08 |
+| 2 | 196,608 | 196,314 | 0.279 to 0.327 | 129.967 to 129.974 | 23.24 |
+| 3 | 131,072 | 24,538 | 0.136 to 0.181 | 8.011 to 8.023 | 23.40 |
+| 4 | 98,304 | 97,962 | 0.194 to 0.307 | 46.122 to 46.177 | 23.56 |
+
+For two, three and four slots the engine allocated 3,235.7, 2,211.7 and 1,699.7 MiB per cache plus a shared 4 MiB exchange buffer. Each conversation needs its own sliding-window cache even though the global context budget is divided among the slots. The highest anonymous RAM readings in those runs were 1.96, 1.82 and 2.04 GiB.
+
+Two image chats had identical text and different pictures. Each first request read 65 tokens from scratch. On alternating follow-ups both reused 66 of the 66 available tokens, read 19 more and correctly identified the other half of their own image. The first parcel fixture had instructed the model to keep a code, and it declined to reveal it on its initial zero-cache request. The test now uses the parcel-register prompt from the single-chat run and records a cold control for any wrong answer.
+
+From the Prometheus build directory, start a fresh instance with the indicated slot count, then run the corresponding line.
+
+```sh
+pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-slots-2)
+python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 2 --depth 196352
+pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-slots-3)
+python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 3 --depth 24576 --images
+pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-slots-4)
+python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 4 --depth 98000
+```
+
+Median single-slot decode before and after introducing slots measured 116.89 and 117.00 tok/s after 512 tokens. At 8,192 tokens both measured 107.56 tok/s. Each median is from three independent greedy requests with 128 timed decode steps.
+
+```sh
+for exe in full-direct-stop cache-slots-api; do
+    radeon python3 src/tools/ik2_bench.py --engine "./$exe" --model /weight.gguf --depths 512,8192 \
+        --ctx 393216 --chunk 1024 --gen 129 --repeats 3 --tokens water.force
+done
+```
+
 ## Multi-turn tool calls on Prometheus
 
 Run `python3 tests/ik2_tool_conversations.py http://127.0.0.1:PORT` against each listening server. The packaged gfx1100 Maya image (`gfx1100-08aad41`) and the incumbent llama.cpp image (`server-rocm-inkling-1427-r2`, port 8085) each passed all four conversations. On both the OpenAI and Anthropic APIs, in streaming and non-streaming mode, the first assistant turn called the same tool twice with distinct IDs and desk arguments. The client returned results in reverse order. Every final answer associated Larch with VX-731 and Birch with PK-284. The llama.cpp answers sometimes added a heading. Raw responses are in `maya-tools.jsonl` and `llama-tools.jsonl` in the Prometheus build directory.
