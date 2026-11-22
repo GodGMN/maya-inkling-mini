@@ -122,6 +122,23 @@ for position in 5 50 95; do
 done
 ```
 
+### Completed archive and drafter runs
+
+With 392,576 background tokens the paged E4M3 server answered 23/32 MMLU questions correctly. All 32 answers were valid and all 32 requests reused the entire archive. The 256-token control scored 24/32. The first archive length of 392,704 left too little room for question 15. The CPU preflight now checks the complete tokenized question and its eight output tokens. Generate and score the requests with `tests/ik2_multiple_choice.py --max-context 393216 --prefix-tokens 392576 --background gsm8k-test.jsonl --data mmlu32.jsonl --tokenizer ik2-tokenizer/tokenizer`. Feed them to `radeon env IK2_PAGED_KV=1 ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024`. Add `--score SERVER.log --min-cached 392576` to the generator for scoring.
+
+The paged cache returned 986 on the three-record inventory after 392,192 tokens and the exact midpoint phrase after 392,960. It measured 45.12 tok/s on the 128-step midpoint replay. The accuracy checks support retaining the 393,216-position ceiling.
+
+The official Thinking Machines drafter at revision `b85c3cfa615fc413cc9af3379f491b963f3b586a` has SHA-256 `7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2`. On the released engine, adaptive drafting raised median decode from 117.22 to 137.49 tok/s after 512 tokens and from 107.47 to 127.49 after 8,192. For a 257-token story, a single run fell from 116.26 to 89.51 tok/s. The packaged server uses plain decode. The drafter remains available through `--draft`.
+
+```sh
+for drafter in plain adaptive; do
+    args=()
+    if test "$drafter" = adaptive; then args=(--draft mtp.safetensors); fi
+    radeon env IK2_DRAFT_CTX=8192 python3 src/tools/ik2_bench.py --engine ./gfx1100-9a0f164 --model /weight.gguf \
+        --ctx 32768 --chunk 1024 --gen 129 --repeats 3 --tokens water.force --depths 512,8192 "${args[@]}"
+done
+```
+
 ## Build on Prometheus without a GPU
 
 The source tree is under `~/ai/build/maya-ik2-hip/src`. The build container mounts its parent at `/work`. The following commands reproduce the environment from a synced source tree. The llama.cpp archive is the source revision pinned by Maya's top-level CMake file.
