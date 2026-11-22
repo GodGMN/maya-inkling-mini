@@ -15,6 +15,19 @@
 
 namespace ik2::k {
 
+// A positive capacity wraps token-major rows. Global FP8 pages store sixteen tokens per KV head.
+struct Fp8KvLayout {
+    constexpr Fp8KvLayout(int ring_capacity) : ring_capacity(ring_capacity), paged(false) {}
+    const int ring_capacity;
+    const bool paged;
+#ifdef STRATA_USE_HIP
+    static constexpr Fp8KvLayout global_pages() { return Fp8KvLayout(); }
+private:
+    constexpr Fp8KvLayout() : ring_capacity(0), paged(true) {}
+#endif
+};
+
+
 /// y = x * rsqrt(mean(x^2) + eps) * w per row of D (w null: no weight).  x and y may alias.
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s);
 /// rms of n <= 3 vectors [D] in one launch, each with its own weights: y[i] = rms(x[i]) * w[i] (y may be x).
@@ -91,7 +104,7 @@ void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uin
                     cudaStream_t s);
 /// attn_flash_f16 over an FP8 (E4M3) cache: its tiles turned into FP16 as they are loaded; qk_scale with K's scale
 /// folded in, the output times v_inv_scale (as attn_decode_fp8).
-void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int KV,
+void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, Fp8KvLayout layout, int H, int KV,
                     int D, int Tq, int qpos0, float qk_scale, float v_inv_scale, const float* bias, int extent,
                     int window, const float* sink, float* out, int o_ld, float* scratch, size_t scratch_floats,
                     int n_split, cudaStream_t s);
@@ -258,18 +271,18 @@ void attn_decode_f16(const float* q, const float* r, const float* sink, const ui
 /// and pass v_inv_scale = 1/v_scale on read.  slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t).  D = 128.
 void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
                     float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel, float qk_clip,
-                    float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, int kv_cap,
+                    float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0, Fp8KvLayout layout,
                     float k_scale, float v_scale, cudaStream_t s);
 void attn_multi_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
-                    int kv_cap, int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale,
+                    Fp8KvLayout layout, int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale,
                     float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
                     float* out, cudaStream_t s);
 void attn_decode_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
-                     int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
+                     Fp8KvLayout layout, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
                      float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
                      float* out, cudaStream_t s);
 /// Unwrap nk KV rows starting at k0 from FP8 ring buffer into contiguous FP16 [nk, KD] scaled by k_inv_scale / v_inv_scale.
-void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,
+void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, Fp8KvLayout layout, int k0, int nk, int KD,
                           float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,
                           cudaStream_t s);
 
@@ -329,7 +342,7 @@ void prep_qkv_r_f16_at(float* q, const float* q_clip, const float* k_in, uint16_
                        int sink_k = 0, float* sink_y = nullptr);
 void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc,
                        float* r, const float* r_clip, int H, int KV, int D, int d_rel, float qk_clip, float rel_clip,
-                       float eps, const int* pos, bool log_scale, float alpha, float n_floor, int kv_cap,
+                       float eps, const int* pos, bool log_scale, float alpha, float n_floor, Fp8KvLayout layout,
                        float k_scale, float v_scale, uint16_t* q16, cudaStream_t s,
                        const uint16_t* sink_w = nullptr, const float* sink_x = nullptr, int sink_k = 0,
                        float* sink_y = nullptr);
@@ -340,7 +353,7 @@ void attn_decode_f16_at(const float* q, const float* r, const float* sink, const
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
                         int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s, const float* gate = nullptr, uint16_t* out16 = nullptr);
 void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
-                        int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, float v_inv_scale,
+                        Fp8KvLayout layout, int H, int Hkv, const int* pos, int P, float qk_scale, float v_inv_scale,
                         const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
                         cudaStream_t s, const float* gate = nullptr, uint16_t* out16 = nullptr);
 
@@ -359,7 +372,7 @@ void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink,
                          const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
                          const float* gate, uint16_t* out16, cudaStream_t s);
 void attn_decode_mma_fp8(const uint16_t* q16, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
-                         int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
+                         Fp8KvLayout layout, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
                          float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
                          float* out, const float* gate, uint16_t* out16, cudaStream_t s);
 
@@ -451,7 +464,7 @@ void attn_block_f16(const uint16_t* q16, const float* r, int r_ld, const float* 
                     const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
                     const float* gate, int gate_ld, uint16_t* out16, cudaStream_t s);
 void attn_block_fp8(const uint16_t* q16, const float* r, int r_ld, const float* sink, const uint8_t* kc,
-                    const uint8_t* vc, int kv_cap, int H, int Hkv, const int* pos, int T, int n_split, float qk_scale,
+                    const uint8_t* vc, Fp8KvLayout layout, int H, int Hkv, const int* pos, int T, int n_split, float qk_scale,
                     float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
                     float* out, const float* gate, int gate_ld, uint16_t* out16, cudaStream_t s);
 size_t attn_block_scratch(int H, int T, int n_split);
@@ -492,7 +505,7 @@ void experts_block_down(const uint8_t* const* blob, const int* n, const int* row
 void prep_qkv_r_fp8_block(float* q, int q_ld, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in,
                           uint8_t* vc, float* r, int r_ld, const float* r_clip, int T, int H, int KV, int D, int d_rel,
                           float qk_clip, float rel_clip, float eps, const int* pos, bool log_scale, float alpha,
-                          float n_floor, int kv_cap, float k_scale, float v_scale, uint16_t* q16, cudaStream_t s,
+                          float n_floor, Fp8KvLayout layout, float k_scale, float v_scale, uint16_t* q16, cudaStream_t s,
                           const uint16_t* sink_w, const float* sink_x, int sink_k, float* sink_y);
 void prep_qkv_r_f16_block(float* q, int q_ld, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in,
                           uint16_t* vc, float* r, int r_ld, const float* r_clip, int T, int H, int KV, int D, int d_rel,

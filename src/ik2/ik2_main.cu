@@ -261,6 +261,13 @@ struct Layer {
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
     int kv_cap = 0;
+    bool paged_kv = false;
+    k::Fp8KvLayout fp8_layout() const {
+#ifdef STRATA_USE_HIP
+        if (paged_kv) return k::Fp8KvLayout::global_pages();
+#endif
+        return sliding ? kv_cap : 0;
+    }
     float *h_k, *h_v, *h_attn, *h_mlp;             // conv histories [3][C']
     float *rec_old[4] = {}, *rec_x[4] = {};        // (speculative) the convs' histories and inputs of a verify window
 };
@@ -1617,7 +1624,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     if (Ly.kc8) {
         k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
-                          Ly.kv_cap, k_scale, v_scale, g_s);
+                          Ly.fp8_layout(), k_scale, v_scale, g_s);
     } else {
         k::prep_qkv_r_f16(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
@@ -1633,7 +1640,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
     if (T == 1) {
         if (Ly.kc8) {
-            k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
+            k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, Ly.fp8_layout(), c.H, c.KV, c.D, k0, nk, pos0,
                                qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         } else {
             k::attn_decode_f16(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0, qk_scale,
@@ -1641,7 +1648,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         }
     } else if (T <= 8 && g_group && g_group_attn) {
         if (Ly.kc8) {
-            k::attn_multi_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0,
+            k::attn_multi_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, Ly.fp8_layout(), T, c.H, c.KV, k0, nk, pos0,
                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         } else {
             k::attn_multi_f16(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0, qk_scale,
@@ -1676,7 +1683,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 const int k_lo = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1) : 0;
                 const int ns = k::attn_flash_splits(Tq, c.H, pos0 + ts + Tq - k_lo, g_n_sm);
                 if (Ly.kc8)
-                    k::attn_flash_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, Tq,
+                    k::attn_flash_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, Ly.fp8_layout(), c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale * k_inv, v_inv, W.relb, extent, window,
                                       sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
                 else
@@ -1695,7 +1702,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             if (Ly.kc8) {
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
-                    k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv, W.kv_k16,
+                    k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, Ly.fp8_layout(), k0_s + k_off, nk_c, KD, k_inv, v_inv, W.kv_k16,
                                             W.kv_v16, g_s);
                     for (int g = 0; g < c.KV; ++g) {
                         const uint16_t* Kp = W.kv_k16 + (size_t) g * c.D;
@@ -1710,7 +1717,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
                     if (nk_s > W.kv_tmp_cap) {
-                        k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv,
+                        k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, Ly.fp8_layout(), k0_s + k_off, nk_c, KD, k_inv, v_inv,
                                                 W.kv_k16, W.kv_v16, g_s);
                     }
                     const float beta = k_off == 0 ? zero : one;
@@ -2411,14 +2418,14 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
         uint16_t* q16 = mma ? W.x16 : nullptr;
         if (Ly.kc8) {
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
-                                 c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap,
+                                 c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.fp8_layout(),
                                  k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
             if (mma)
-                k::attn_decode_mma_fp8(q16, r_p, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV, W.pos, 0, ns,
+                k::attn_decode_mma_fp8(q16, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.fp8_layout(), c.H, c.KV, W.pos, 0, ns,
                                        qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
                                        W.o, gate_p, W.x16, g_s);
             else
-                k::attn_decode_fp8_at(q_p, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
+                k::attn_decode_fp8_at(q_p, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.fp8_layout(), c.H, c.KV, W.pos, P,
                                       qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
                                       W.o, g_s, split_gate, split_half);
         } else {
@@ -2760,8 +2767,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         if (Ly.kc8) {
             k::prep_qkv_r_fp8_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, r_ld, Ly.r_clip, T, c.H,
                                     c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha,
-                                    c.n_floor, Ly.kv_cap, k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
-            k::attn_block_fp8(q16, r_p, r_ld, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV, W.pos, T, ns, qk_scale / k_scale,
+                                    c.n_floor, Ly.fp8_layout(), k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
+            k::attn_block_fp8(q16, r_p, r_ld, W.sink, Ly.kc8, Ly.vc8, Ly.fp8_layout(), c.H, c.KV, W.pos, T, ns, qk_scale / k_scale,
                               1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, gate_ld, W.x16,
                               g_s);
         } else {
@@ -4687,18 +4694,26 @@ int main(int argc, char** argv) {
         }
     }
     // the visits of a token and their state (FP8 E4M3 or FP16 KV; sliding layers ring-buffered in both CLI and --serve)
+    const bool paged_kv = getenv("IK2_PAGED_KV") && atoi(getenv("IK2_PAGED_KV"));
+#ifdef STRATA_USE_HIP
+    if (paged_kv && (!fp8_kv(false) || c.D != 128)) die("IK2_PAGED_KV requires global E4M3 KV with 128-wide heads");
+#else
+    if (paged_kv) die("IK2_PAGED_KV requires the gfx1100 backend");
+#endif
     M.V.resize(c.n_visit);
     for (int v = 0; v < c.n_visit; ++v) {
         Visit& Vi = M.V[v];
         if (c.n_pass == 1 || v < c.core0) Vi.l = v;
         else if (v < c.core0 + c.n_pass * n_core) Vi.l = c.core0 + (v - c.core0) % n_core, Vi.pass = (v - c.core0) / n_core;
         else Vi.l = v - (c.n_pass - 1) * n_core;
-        const Layer& Ly = M.L[Vi.l];
+        Layer& Ly = M.L[Vi.l];
+        Ly.paged_kv = paged_kv && !Ly.sliding;
         use_dev(Ly.dev);
         Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
         if (fp8_kv(Ly.sliding)) {
-            Vi.kc8 = kv_alloc<uint8_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
-            Vi.vc8 = kv_alloc<uint8_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
+            const size_t slots = Ly.paged_kv ? ((size_t)Vi.kv_cap + 15) / 16 * 16 : Vi.kv_cap;
+            Vi.kc8 = kv_alloc<uint8_t>(slots * KD, Ly.sliding);
+            Vi.vc8 = kv_alloc<uint8_t>(slots * KD, Ly.sliding);
         } else {
             Vi.kc = kv_alloc<uint16_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
             Vi.vc = kv_alloc<uint16_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
@@ -4723,7 +4738,8 @@ int main(int argc, char** argv) {
     {
         size_t kv_bytes = 0;
         for (const auto& Vi : M.V) kv_bytes += (size_t) Vi.kv_cap * KD * (Vi.kc8 ? 1 : 2) * 2;
-        std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", kv_format_name(),
+        std::printf("kv cache: %s%s (%.2f GiB across %d layer%s)\n", kv_format_name(),
+                    paged_kv ? ", 16-token global pages" : "",
                     kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
         std::fflush(stdout);
     }

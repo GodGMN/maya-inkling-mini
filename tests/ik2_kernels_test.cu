@@ -1400,6 +1400,34 @@ float e4m3fn_to_f32_host(uint8_t q);
 // 1 to 8 heads a K / V head, linear and ring caches, a window, the bias within and past its extent, the sink, a
 // first token, a context shorter than a step, splits with and without keys; the FP8 cache with every finite byte
 // (the subnormals among them).
+#ifdef STRATA_USE_HIP
+constexpr int attention_formats = 3; // Half, E4M3 rows, E4M3 global pages.
+#else
+constexpr int attention_formats = 2;
+#endif
+
+k::Fp8KvLayout test_fp8_layout(int format, int ring) {
+#ifdef STRATA_USE_HIP
+    if (format == 2) return k::Fp8KvLayout::global_pages();
+#endif
+    return ring;
+}
+
+size_t page_offset(int token, int head, int d, int heads, bool value) {
+    const size_t page = ((size_t)(token / 16) * heads + head) * 2048;
+    return page + (value ? d * 16 + token % 16 : (token % 16) * 128 + d);
+}
+
+std::vector<uint8_t> page_cache(const std::vector<uint8_t>& linear, int heads, bool value) {
+    const int positions = linear.size() / (128 * heads);
+    std::vector<uint8_t> pages((size_t)((positions + 15) / 16) * heads * 2048, 0x7f);
+    for (int t = 0; t < positions; ++t)
+        for (int h = 0; h < heads; ++h)
+            for (int d = 0; d < 128; ++d)
+                pages[page_offset(t, h, d, heads, value)] = linear[((size_t)t * heads + h) * 128 + d];
+    return pages;
+}
+
 void test_attn_decode_mma() {
     const int D = 128, d_rel = 16;
     struct Case {
@@ -1419,8 +1447,9 @@ void test_attn_decode_mma() {
         {12, 2, 2000, 256, 256, 400, 2, "ring 400, window 256, 6 heads"},
         {10, 2, 5000, 1024, 1024, 1056, 4, "ring 1056, window 1024, 5 heads"},
     };
-    for (int fp8 = 0; fp8 < 2; ++fp8)
+    for (int fp8 = 0; fp8 < attention_formats; ++fp8)
         for (const Case& c : cases) {
+            if (fp8 == 2 && c.kv_cap) continue;
             const int H = c.H, KV = c.KV, n_pos = c.qpos + 1, rows = c.kv_cap > 0 ? c.kv_cap : n_pos;
             const float k_inv = fp8 ? 1.0f / 16.0f : 1.0f, v_inv = fp8 ? 1.0f / 32.0f : 1.0f;
             // the cache's values as the kernel reads them: kf, vf [n_pos][KV * D] (before the scales)
@@ -1460,12 +1489,24 @@ void test_attn_decode_mma() {
             for (size_t i = 0; i < qf.size(); ++i) qf[i] = h2f_host(q16[i]);
             float *dq32 = dev(qf), *gated = dev_n<float>(qf.size());
             float* split_part = dev_n<float>((size_t)H * c.n_split * 130);
+            std::vector<float> scalar, multi;
             if (fp8) {
-                uint8_t *dk = dev(k8), *dv = dev(v8);
-                k::attn_decode_mma_fp8(dq, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, -1, c.n_split, scale * k_inv, v_inv, dp,
+                uint8_t *dk = dev(fp8 == 2 ? page_cache(k8, KV, false) : k8), *dv = dev(fp8 == 2 ? page_cache(v8, KV, true) : v8);
+                k::attn_decode_mma_fp8(dq, dr, ds, dk, dv, test_fp8_layout(fp8, c.kv_cap), H, KV, dpos, -1, c.n_split, scale * k_inv, v_inv, dp,
                                        d_rel, c.extent, c.window, dscr, dout, dg, dout16, 0);
-                k::attn_decode_fp8_at(dq32, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, c.n_split, scale * k_inv,
+                k::attn_decode_fp8_at(dq32, dr, ds, dk, dv, test_fp8_layout(fp8, c.kv_cap), H, KV, dpos, c.n_split, scale * k_inv,
                                       v_inv, dp, d_rel, c.extent, c.window, split_part, gated, 0, dg);
+                if (fp8 == 2) {
+                    float* tmp = dev_n<float>((size_t)H * 128 * 130);
+                    float* result = dev_n<float>((size_t)H * D);
+                    k::attn_decode_fp8(dq32, dr, ds, dk, dv, test_fp8_layout(fp8, 0), H, KV, D, 0, n_pos, c.qpos,
+                                       scale * k_inv, v_inv, dp, d_rel, c.extent, c.window, tmp, result, 0);
+                    scalar = host(result, (size_t)H * D);
+                    k::attn_multi_fp8(dq32, dr, ds, dk, dv, test_fp8_layout(fp8, 0), 1, H, KV, 0, n_pos, c.qpos,
+                                      scale * k_inv, v_inv, dp, d_rel, c.extent, c.window, tmp, result, 0);
+                    multi = host(result, (size_t)H * D);
+                    cudaFree(tmp), cudaFree(result);
+                }
                 CU(cudaDeviceSynchronize());
                 cudaFree(dk), cudaFree(dv);
             } else {
@@ -1509,9 +1550,15 @@ void test_attn_decode_mma() {
                 }
             }
             char label[96];
-            std::snprintf(label, sizeof label, "mma %s %s", fp8 ? "fp8" : "f16", c.name);
+            std::snprintf(label, sizeof label, "mma %s %s", fp8 == 2 ? "paged fp8" : fp8 ? "fp8" : "f16", c.name);
             // (P is FP16 in the P V product: 2^-11 of a term)
             expect("split attention and gate", host(gated, want.size()), want, 1e-3, 1e-5);
+            if (fp8 == 2) {
+                auto ungated = want;
+                for (size_t i = 0; i < ungated.size(); ++i) ungated[i] *= 1.0 + std::exp(-(double)gate[i]);
+                expect("paged scalar decode", scalar, ungated, 1e-3, 1e-5);
+                expect("paged multi-query decode", multi, ungated, 1e-3, 1e-5);
+            }
             cudaFree(dq32), cudaFree(gated), cudaFree(split_part);
             const auto got = host(dout, want.size());
             expect(label, got, want, 1e-2, std::max(1e-6, 1e-3 * mag));
@@ -1543,10 +1590,12 @@ void test_attn_flash() {
         {9, 40, 1 << 30, 64, 0, 7, "attn_flash 9 queries, empty splits"},
 #ifdef STRATA_USE_HIP
         {3, 0, 1 << 30, 23, 0, 7, "verify attention from 0, empty splits", true},
+        {8, 127, 64, 35, 0, 3, "verify attention with an unaligned window", true},
         {8, 127, 64, 35, 80, 3, "verify attention ring, three column tiles", true},
 #endif
     };
-    for (bool fp8 : {false, true}) for (const Case& c : cases) {
+    for (int fp8 = 0; fp8 < attention_formats; ++fp8) for (const Case& c : cases) {
+        if (fp8 == 2 && c.kv_cap) continue;
         const int n_pos = c.qpos0 + c.Tq;   // positions written so far
         const int rows = c.kv_cap > 0 ? c.kv_cap : n_pos;
         std::vector<uint8_t> k8((size_t) rows * KV * D), v8(k8.size());
@@ -1595,8 +1644,8 @@ void test_attn_flash() {
             float *rel = dev(r), *pr = dev(proj), *g = dev(gate);
             uint16_t* out16 = dev_n<uint16_t>((size_t)c.Tq * o_ld);
             if (fp8) {
-                auto *dk = dev(k8), *dv = dev(v8);
-                k::attn_block_fp8(dq, rel, r_ld, ds, dk, dv, c.kv_cap, H, KV, pos, c.Tq, c.n_split,
+                auto *dk = dev(fp8 == 2 ? page_cache(k8, KV, false) : k8), *dv = dev(fp8 == 2 ? page_cache(v8, KV, true) : v8);
+                k::attn_block_fp8(dq, rel, r_ld, ds, dk, dv, test_fp8_layout(fp8, c.kv_cap), H, KV, pos, c.Tq, c.n_split,
                                   scale, v_scale, pr, dr, c.extent, c.window, dscr, dout, g, gate_ld, out16, 0);
                 CU(cudaDeviceSynchronize());
                 cudaFree(dk), cudaFree(dv);
@@ -1614,8 +1663,8 @@ void test_attn_flash() {
             expect_true("verify attention returns rounded FP16 output", rounded);
             cudaFree(pos), cudaFree(out16), cudaFree(rel), cudaFree(pr), cudaFree(g);
         } else if (fp8) {
-            uint8_t *dk = dev(k8), *dv = dev(v8);
-            k::attn_flash_fp8(dq, q_ld, dk, dv, c.kv_cap, H, KV, D, c.Tq, c.qpos0, scale, v_scale, db,
+            uint8_t *dk = dev(fp8 == 2 ? page_cache(k8, KV, false) : k8), *dv = dev(fp8 == 2 ? page_cache(v8, KV, true) : v8);
+            k::attn_flash_fp8(dq, q_ld, dk, dv, test_fp8_layout(fp8, c.kv_cap), H, KV, D, c.Tq, c.qpos0, scale, v_scale, db,
                               c.extent, c.window, ds, dout, o_ld, dscr, scr, c.n_split, 0);
             CU(cudaDeviceSynchronize());
             cudaFree(dk), cudaFree(dv);
@@ -1658,7 +1707,7 @@ void test_attn_flash() {
             }
         }
         char name[96];
-        std::snprintf(name, sizeof name, "%s %s", c.name, fp8 ? "fp8" : "f16");
+        std::snprintf(name, sizeof name, "%s %s", c.name, fp8 == 2 ? "paged fp8" : fp8 ? "fp8" : "f16");
         expect(name, got, want, 1e-2, 2e-3);
         cudaFree(dq);
         for (float* p : {db, ds, dout, dscr}) cudaFree(p);
@@ -2015,9 +2064,9 @@ void test_fp8_kv() {
         const int T = 5, H = 48, KV = 8, D = 128, d_rel = 16, kv_cap = 1056;
         const float qk_clip = 22.627416610717773f, rel_clip = 8.0f, eps = 1e-6f, alpha = 0.1f, n_floor = 128000.0f;
         const float k_scale = 16.0f, v_scale = 32.0f, k_inv = 1.0f / k_scale, v_inv = 1.0f / v_scale;
-        for (int full = 0; full < 2; ++full) {
-            const int cap = full ? 0 : kv_cap, pos0 = full ? 100 : 1054;
-            const int kc_rows = cap > 0 ? cap : pos0 + T;
+        for (int full = 0; full < attention_formats; ++full) {
+            const int cap = full ? 0 : kv_cap, pos0 = full ? 109 : 1054;
+            const int kc_rows = full == 2 ? ((pos0 + T + 15) / 16) * 16 : cap > 0 ? cap : pos0 + T;
             auto q = fvec((size_t) T * H * D, 4.0f), qc = fvec((size_t) H * D, 2.0f),
                  k_in = fvec((size_t) T * KV * D, 4.0f), v_in = fvec((size_t) T * KV * D, 3.0f),
                  r = fvec((size_t) T * H * d_rel, 4.0f), rc = fvec((size_t) H * d_rel, 2.0f);
@@ -2028,7 +2077,7 @@ void test_fp8_kv() {
                     *dvc = dev_n<uint8_t>((size_t) kc_rows * KV * D);
             int* dpos = dev(pos);
             k::prep_qkv_r_fp8(dq, dqc, dk, dkc, dv, dvc, dr, drc, T, H, KV, D, d_rel, qk_clip, rel_clip, eps,
-                              full ? dpos : nullptr, alpha, n_floor, pos0, cap, k_scale, v_scale, 0);
+                              full ? dpos : nullptr, alpha, n_floor, pos0, test_fp8_layout(full, cap), k_scale, v_scale, 0);
             std::vector<double> wq(q.size()), wr(r.size()), wk((size_t) T * KV * D), wv((size_t) T * KV * D);
             for (int t = 0; t < T; ++t) {
                 const double tau =
@@ -2072,7 +2121,7 @@ void test_fp8_kv() {
             }
             // Also check unpack_kv_fp8_to_f16 across wrapped slots [pos0 .. pos0+T)
             uint16_t *uk16 = dev_n<uint16_t>((size_t) T * KV * D), *uv16 = dev_n<uint16_t>((size_t) T * KV * D);
-            k::unpack_kv_fp8_to_f16(dkc, dvc, cap, pos0, T, KV * D, k_inv, v_inv, uk16, uv16, 0);
+            k::unpack_kv_fp8_to_f16(dkc, dvc, test_fp8_layout(full, cap), pos0, T, KV * D, k_inv, v_inv, uk16, uv16, 0);
             const auto hk_un = host(uk16, (size_t) T * KV * D), hv_un = host(uv16, (size_t) T * KV * D);
             const auto kc_raw = host(dkc, (size_t) kc_rows * KV * D), vc_raw = host(dvc, (size_t) kc_rows * KV * D);
             std::vector<float> got_k((size_t) T * KV * D), got_v((size_t) T * KV * D);
@@ -2081,7 +2130,9 @@ void test_fp8_kv() {
             for (int t = 0; t < T; ++t) {
                 const int slot = cap > 0 ? (pos0 + t) % cap : (pos0 + t);
                 for (size_t j = 0; j < (size_t) KV * D; ++j) {
-                    const uint8_t bk = kc_raw[(size_t) slot * KV * D + j], bv = vc_raw[(size_t) slot * KV * D + j];
+                    const size_t k = full == 2 ? page_offset(slot, j / D, j % D, KV, false) : (size_t)slot * KV * D + j;
+                    const size_t v = full == 2 ? page_offset(slot, j / D, j % D, KV, true) : (size_t)slot * KV * D + j;
+                    const uint8_t bk = kc_raw[k], bv = vc_raw[v];
                     no_nan &= ((bk & 0x7F) != 0x7F) && ((bv & 0x7F) != 0x7F);
                     got_k[(size_t) t * KV * D + j] = h2f_host(hk_un[(size_t) t * KV * D + j]);
                     got_v[(size_t) t * KV * D + j] = h2f_host(hv_un[(size_t) t * KV * D + j]);

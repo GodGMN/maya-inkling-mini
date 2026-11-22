@@ -366,3 +366,18 @@ CUDA 12.8 compiled and linked the engine and its device tests for sm_86 with the
 cmake -S . -B build-cuda -G Ninja -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=ON
 cmake --build build-cuda --target maya-ik2 ik2_kernels_test -j4
 ```
+
+### Global E4M3 pages
+
+`IK2_PAGED_KV=1` groups 16 positions per KV head and transposes V inside each page. Sliding attention retains its ring. A 131,072-token midpoint retrieval with the direct page reader returned the exact same four-word phrase as the token-major layout. The 128-step decode measured 65.07 tok/s with pages and 59.76 with token-major KV. Cold prefill took 101.342 and 78.134 seconds respectively. These are single runs with `--ctx 393216 --chunk 1024` and `--decode-steps 128` in the retrieval command above.
+
+The paged prefill agreed with the FP64 reference on 251 of 256 held-out next-token predictions. Mean KL was 0.0022271 across the full vocabulary. Next-token perplexity on the 255 labels was 3.9611 for Maya and 3.9677 for the reference. The device tests cover page boundaries, partial pages, transposed V, causal masking and the stored K/V bytes.
+
+```sh
+export IK2_PAGED_KV=1
+./build-ik2/ik2_kernels_test
+IK2_PREFILL_LOGITS_OUT=teacher-pages.f32 ./build-ik2/maya-ik2 --model /weight.gguf \
+    --ctx 1024 --chunk 64 --tokens @heldout-teacher.all --gen 0
+oracle-env/bin/python src/tools/ik2_compare_decode.py teacher-pages.f32 --ref heldout-teacher-ref.npy \
+    --tokens heldout-teacher.all --vocab 200058 --prefill --prompt-length 256
+```

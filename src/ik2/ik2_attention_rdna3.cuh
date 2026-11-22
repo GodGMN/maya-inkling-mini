@@ -21,7 +21,7 @@ __device__ __forceinline__ AttnHalf16 cache_fragment(const KV* ptr) {
     return out;
 }
 
-template <bool Prefill, bool Block = false, int Waves = 1, bool StageKV = (Waves > 1), class KV>
+template <bool Prefill, bool Block = false, int Waves = 1, bool StageKV = (Waves > 1), bool Paged = false, class KV>
 __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc, const KV* vc, int ring,
                                int H, int Hkv, const int* pos, int qpos, float qscale, const float* proj,
                                int dr, int extent, int window, float* scratch, int Tq, int q_ld, const float* bias, int r_ld = 0) {
@@ -56,25 +56,35 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
     if constexpr (Waves == 1) __syncthreads();
     float m = -INFINITY, sum = 0;
     AttnFloat8 out[8] = {};
-    for (int key = start + 16 * split; key < end; key += 16 * splits) {
+    for (int key = (Paged ? start / 16 * 16 : start) + 16 * split; key < end; key += 16 * splits) {
         const int key_l = key + l;
         const size_t off = (size_t)(ring ? key_l % ring : key_l) * kd + kv_head * 128;
+        const size_t page = Paged ? kv_page_base(key, kv_head, Hkv) : 0;
         AttnFloat8 dot = {};
         if constexpr (StageKV) {
             // Consecutive work-items load consecutive 16-feature fragments. All query waves share
             // these keys and the transposed values, including the final partial tile.
             for (int f = threadIdx.x; f < 128; f += Waves * 32) {
                 const int t = f >> 3, d = f & 7, kp = key + t;
-                const size_t src = (size_t)(ring ? kp % ring : kp) * kd + kv_head * 128 + d * 16;
-                AttnHalf16 k = {}, v = {};
-                if (kp < end) {
-                    k = cache_fragment(kc + src);
-                    v = cache_fragment(vc + src);
-                }
+                const size_t src = Paged ? page + t * 128 + d * 16 :
+                    (size_t)(ring ? kp % ring : kp) * kd + kv_head * 128 + d * 16;
+                AttnHalf16 k = {};
+                if (kp < end) k = cache_fragment(kc + src);
                 keys[t][d] = k;
+                if constexpr (Paged) {
+                    AttnHalf16 v = cache_fragment(vc + page + f * 16);
+                    if (key + 16 > end) {
 #pragma unroll
-                for (int i = 0; i < 16; ++i)
-                    reinterpret_cast<_Float16*>(columns)[(d * 16 + i) * 16 + t] = v[i];
+                        for (int i = 0; i < 16; ++i) if (key + i >= end) v[i] = 0;
+                    }
+                    columns[f] = v;
+                } else {
+                    AttnHalf16 v = {};
+                    if (kp < end) v = cache_fragment(vc + src);
+#pragma unroll
+                    for (int i = 0; i < 16; ++i)
+                        reinterpret_cast<_Float16*>(columns)[(d * 16 + i) * 16 + t] = v[i];
+                }
             }
             __syncthreads();
         }
@@ -82,13 +92,13 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
         for (int d = 0; d < 8; ++d) {
             if constexpr (!StageKV) {
                 AttnHalf16 k = {};
-                if (key_l < end) k = cache_fragment(kc + off + d * 16);
-                dot = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(k, query[l][d], dot);
+                if (key_l < end) k = cache_fragment(kc + (Paged ? page + l * 128 : off) + d * 16);
+                dot = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(k, Waves > 1 ? query_reg[d] : query[l][d], dot);
             } else {
                 dot = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(keys[l][d], Waves > 1 ? query_reg[d] : query[l][d], dot);
             }
         }
-        if constexpr (!StageKV) {
+        if constexpr (!StageKV && !Paged) {
 #pragma unroll
             for (int d = hi; d < 8; d += 2) {
                 AttnHalf16 v = {};
@@ -129,7 +139,13 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
 #pragma unroll
         for (int d = 0; d < 8; ++d) {
             AttnHalf16 value;
-            if constexpr (!StageKV) {
+            if constexpr (Paged && !StageKV) {
+                value = cache_fragment(vc + page + (16 * d + l) * 16);
+                if (key + 16 > end) {
+#pragma unroll
+                    for (int t = 0; t < 16; ++t) if (key + t >= end) value[t] = 0;
+                }
+            } else if constexpr (!StageKV) {
 #pragma unroll
                 for (int t = 0; t < 16; ++t) value[t] = values[t][16 * d + l];
             } else value = columns[16 * d + l];
@@ -137,7 +153,7 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
             for (int i = 0; i < 8; ++i) out[d][i] *= row_scale[i];
             out[d] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(prob, value, out[d]);
         }
-        __syncthreads();
+        if constexpr (!Paged || StageKV) __syncthreads();
     }
     sum += __shfl_xor(sum, 16, 32);
     if (lane < queries) {
@@ -159,7 +175,7 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
 
 // Sixteen independent online softmax reductions per workgroup. Eight adjacent lanes cover a 128-wide
 // head for one key. Each lane reads 16 consecutive KV elements without rounding the FP32 query.
-template <class KV>
+template <class KV, bool Paged = false>
 __global__ void rdna3_decode_split(const float* q, const float* r, const KV* kc, const KV* vc, int ring,
                                    int H, int Hkv, const int* position, float scale, const float* proj,
                                    int dr, int extent, int window, float* scratch) {
@@ -175,7 +191,8 @@ __global__ void rdna3_decode_split(const float* q, const float* r, const KV* kc,
     float maximum = -INFINITY, sum = 0;
     for (int key = start + stream; key < end; key += streams) {
         const int slot = ring ? key % ring : key;
-        const size_t off = ((size_t)slot * Hkv + kvh) * 128 + channel;
+        const size_t page = Paged ? kv_page_base(slot, kvh, Hkv) : 0;
+        const size_t off = (Paged ? page + (slot % 16) * 128 : ((size_t)slot * Hkv + kvh) * 128) + channel;
         const AttnHalf16 keys = cache_fragment(kc + off);
         float dot = 0;
 #pragma unroll
@@ -195,7 +212,12 @@ __global__ void rdna3_decode_split(const float* q, const float* r, const KV* kc,
         const float beta = expf(score - next), alpha = expf(maximum - next);
         sum = sum * alpha + beta;
         maximum = next;
-        const AttnHalf16 values = cache_fragment(vc + off);
+        AttnHalf16 values;
+        if constexpr (Paged) {
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+                values[i] = __builtin_bit_cast(_Float16, e4m3fn_to_f16(vc[page + (channel + i) * 16 + slot % 16]));
+        } else values = cache_fragment(vc + off);
 #pragma unroll
         for (int i = 0; i < 16; ++i) output[i] = output[i] * alpha + (float)values[i] * beta;
     }
