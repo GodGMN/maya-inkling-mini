@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--prefix-tokens", type=int, default=0, help="exact length of a shared archive before the questions")
     parser.add_argument("--background", type=Path, help="JSONL with distractor text in a question field")
     parser.add_argument("--min-cached", type=int, default=0, help="stop scoring if a question reuses fewer tokens")
+    parser.add_argument("--max-context", type=int, help="check that every question and its eight output tokens fit before warming the archive")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--score", type=Path, help="stdout from the prepared Maya requests")
     mode.add_argument("--llama-url")
@@ -38,12 +39,28 @@ def main():
         if length < 0 or not fill:
             parser.error("the prefix is too short or the archive is empty")
         prefix.extend((fill * ((length + len(fill) - 1) // len(fill)))[:length])
-        if args.llama_url:
-            warm = llama_completion(args.llama_url, prefix, 1, reuse=True)
-            if warm[1] != len(prefix):
-                raise ValueError("incomplete archive prefill")
-        elif not args.score:
-            print("GEN 1 0 1 1 - " + ",".join(map(str, prefix)))
+    questions = []
+    for i, row in enumerate(data):
+        if len(row["choices"]) != 4 or row["answer"] not in range(4):
+            raise ValueError(f"invalid choices or label in row {i}")
+        options = "\n".join(f"{letter}. {choice}" for letter, choice in zip("ABCD", row["choices"]))
+        question = f'{row["question"]}\n\n{options}\n\nReply with the single letter of the correct answer.'
+        if prefix:
+            text = "\n\nQuestion:\n" + question + after + FINAL
+        else:
+            text = template.render(messages=[dict(role="user", content=question)], tools=[],
+                                   add_generation_prompt=True, reasoning_effort="none") + FINAL
+        tokens = tok.encode(text, parse_special=True)
+        required = len(prefix) + len(tokens) + 8
+        if args.max_context is not None and required > args.max_context:
+            parser.error(f"row {i} needs {required} context positions including eight output tokens, limit {args.max_context}")
+        questions.append(tokens)
+    if prefix and args.llama_url:
+        warm = llama_completion(args.llama_url, prefix, 1, reuse=True)
+        if warm[1] != len(prefix):
+            raise ValueError("incomplete archive prefill")
+    elif prefix and not args.score:
+        print("GEN 1 0 1 1 - " + ",".join(map(str, prefix)))
     if args.score:
         with args.score.open() as f:
             runs = list(responses(f))
@@ -54,17 +71,8 @@ def main():
         if len(runs) != len(data):
             raise ValueError(f"expected {len(data)} responses, got {len(runs)}")
     correct = invalid = 0
-    for i, row in enumerate(data):
-        if len(row["choices"]) != 4 or row["answer"] not in range(4):
-            raise ValueError(f"invalid choices or label in row {i}")
-        options = "\n".join(f"{letter}. {choice}" for letter, choice in zip("ABCD", row["choices"]))
-        question = f'{row["question"]}\n\n{options}\n\nReply with the single letter of the correct answer.'
-        if prefix:
-            ids = prefix + tok.encode("\n\nQuestion:\n" + question + after + FINAL, parse_special=True)
-        else:
-            chat = template.render(messages=[dict(role="user", content=question)], tools=[],
-                                   add_generation_prompt=True, reasoning_effort="none")
-            ids = tok.encode(chat + FINAL, parse_special=True)
+    for i, (row, tokens) in enumerate(zip(data, questions)):
+        ids = prefix + tokens
         if args.llama_url:
             result = llama_completion(args.llama_url, ids, 8, reuse=bool(prefix))
         elif args.score:

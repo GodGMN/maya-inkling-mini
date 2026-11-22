@@ -66,6 +66,8 @@ def responses(log):
     for line in log:
         if line.startswith("@TOK "):
             ids.append(int(line.split()[1]))
+        elif line.startswith("@END error "):
+            raise ValueError(f"engine rejected request: {line.strip()}")
         elif line.startswith("@END "):
             _, reason, prompt, cached, pp, tg = line.split()
             yield ids, int(prompt), int(cached), reason, float(pp), float(tg)
