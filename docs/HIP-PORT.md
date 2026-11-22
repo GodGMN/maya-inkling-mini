@@ -500,3 +500,13 @@ for tile in 64 256; do
 done
 IK2_GATE_TILE=256 ./build-ik2/ik2_kernels_test
 ```
+
+### Repeated requests against a shared prefix
+
+The server has eight snapshots of the sliding KV and convolution state. Previously, changing the end of a request invalidated newer snapshots, but the next save could overwrite the shared prefix while empty slots were available. In a replay with a 256-token prefix the ninth branch recomputed all 256 tokens. The server now chooses an empty slot first. All 12 branches reused the full prefix and the last one produced the same four predictions as a cold replay.
+
+```sh
+# Use the Radeon preset environment.
+python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    --tokens water.force --branches 12
+```

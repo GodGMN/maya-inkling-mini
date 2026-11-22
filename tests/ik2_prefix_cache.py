@@ -27,7 +27,7 @@ def generate(engine, prompt, length):
     return tokens, int(end[3])
 
 
-def cancel_and_resume(engine, request, control_ids):
+def cancel_and_resume(engine, request, control_ids, cancel_after):
     fields = request.split()
     if len(fields) != 7 or fields[0] != "GEN":
         raise ValueError("expected a tokenized GEN request")
@@ -38,11 +38,11 @@ def cancel_and_resume(engine, request, control_ids):
     for line in engine.stdout:
         if line.startswith("@TOK "):
             emitted.append(int(line.split()[1]))
-            if len(emitted) == 128:
+            if len(emitted) == cancel_after:
                 engine.stdin.write("STOP\n")
                 engine.stdin.flush()
         elif line.startswith("@END "):
-            if line.split()[1] != "cancelled" or len(emitted) < 128:
+            if line.split()[1] != "cancelled" or len(emitted) < cancel_after:
                 raise RuntimeError(f"copy request failed to cancel: {line.rstrip()}")
             break
     else:
@@ -63,16 +63,23 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--tokens", required=True, type=Path, help="comma-separated IDs of a reference passage")
     ap.add_argument("--cancel-request", type=Path, help="also interrupt the first long copy request in this file")
+    ap.add_argument("--chunk", type=int, default=256, help="prefill chunk size and first shared prefix")
+    ap.add_argument("--cancel-after", type=int, default=128, help="send STOP after this many emitted copy tokens")
+    ap.add_argument("--branches", type=int, default=0, help="branch repeatedly from one shared prefix")
     args = ap.parse_args()
+    if args.branches < 0:
+        ap.error("branches must be nonnegative")
+    if min(args.chunk, args.cancel_after) < 1:
+        ap.error("chunk and cancellation position must be positive")
     ids = [int(s) for s in args.tokens.read_text().strip().split(",")]
     distinct = list(dict.fromkeys(ids))
     if len(distinct) < 2:
         ap.error("the passage needs two distinct token IDs")
     a, b = distinct[:2]
-    cmd = [args.engine, "--serve-ik2", "--model", args.model, "--ctx", "4096", "--chunk", "256"]
+    cmd = [args.engine, "--serve-ik2", "--model", args.model, "--ctx", str(max(4096, 7 * args.chunk + 64)), "--chunk", str(args.chunk)]
     with subprocess.Popen(cmd, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as engine:
         receive(engine, "@READY ")
-        for depth in (256, 1792):
+        for depth in (args.chunk, 7 * args.chunk):
             # Chunk boundaries match the cold replay. The larger prefix wraps the sliding KV ring.
             base = list(itertools.islice(itertools.cycle(ids), depth))
             generate(engine, base, 4)
@@ -85,8 +92,21 @@ def main():
                 raise RuntimeError(f"prefix {depth}: cached {reused}, cold cached {reused_cold}, "
                                    f"predictions {cached} vs {cold}")
             print(f"{depth} cached tokens, 16/16 predictions match the cold replay", flush=True)
+        if args.branches:
+            base = [b] * args.chunk
+            generate(engine, base, 1)
+            for i in range(args.branches):
+                branch = base + [distinct[i % 2]] * 16
+                last, reused = generate(engine, branch, 4)
+                if reused != len(base):
+                    raise RuntimeError(f"branch {i + 1}: reused {reused} of {len(base)} common tokens")
+            generate(engine, [a], 1)
+            cold, reused = generate(engine, branch, 4)
+            if reused or cold != last:
+                raise RuntimeError(f"last branch differs on cold replay: {last} vs {cold}, cached {reused}")
+            print(f"{args.branches} alternating branches reused all {len(base)} shared tokens", flush=True)
         if args.cancel_request:
-            cancel_and_resume(engine, args.cancel_request.read_text().splitlines()[0], ids)
+            cancel_and_resume(engine, args.cancel_request.read_text().splitlines()[0], ids, args.cancel_after)
         engine.stdin.write("QUIT\n")
         engine.stdin.close()
         if engine.wait():

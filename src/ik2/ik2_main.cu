@@ -5637,6 +5637,14 @@ int main(int argc, char** argv) {
             if (L < ids.size()) {
                 hist = ids;
                 hist_sig = sig;
+                // Branching invalidates newer snapshots. Reuse an empty slot before evicting a shared prefix.
+                for (size_t i = 0; i < snaps.size(); ++i) {
+                    const int slot = (snap_next + (int)i) % (int)snaps.size();
+                    if (snaps[slot].pos < 0) {
+                        snap_next = slot;
+                        break;
+                    }
+                }
                 Snap& sn = snaps[snap_next];
                 snap_next = (snap_next + 1) % (int) snaps.size();
                 sn.pos = (int) hist.size();
