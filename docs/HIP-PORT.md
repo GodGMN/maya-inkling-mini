@@ -222,6 +222,20 @@ oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /we
     --llama-url http://192.168.100.111:8085
 ```
 
+At a 4,096-token cap, the cooperative RDNA3 configuration answered **93/96** on questions 0–95 and **94/96** on 96–191. All 192 requests finished. The three misses on the first set were questions 12, 40 and 93. On the second set they were 100 and 119. Across the two runs, generation averaged 108.41 and 108.15 tok/s respectively, computed as the sum of generated tokens after the first token divided by the sum of decode seconds. Neither run reused a prompt prefix. These raw token requests let the model emit a reasoning channel.
+
+```sh
+# Use the cooperative prefill environment below with IK2_EXPERT_TILE_LDS=1.
+for offset in 0 96; do
+    oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf \
+        --count 96 --offset "$offset" --max-tokens 4096 >"gsm-$offset.requests"
+    ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 8192 --chunk 1024 \
+        <"gsm-$offset.requests" >"gsm-$offset.log"
+    oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf \
+        --count 96 --offset "$offset" --score "gsm-$offset.log"
+done
+```
+
 ### Larger prefill chunks and exact router accumulation
 
 On the installed IQ4_NL model, the 56 attention projection matrices occupy 1,228 MiB when dequantized to FP16. `IK2_PREFILL_DENSE=1` retains those matrices when VRAM has room after the expert cache and headroom. Decode continues to read the original planar Q8. The grouped expert kernel expands signed byte pairs and applies the original FP16 block scale. It can reuse one loaded weight tile across 16, 32 or 64 routed tokens. The table uses the 16-token tile.

@@ -6,7 +6,7 @@ At 8,192 tokens, Maya read the uncached prompt at **3,127 tok/s** with 2,048-tok
 
 On an exact-copy request, verification against the prompt itself reached **271 tok/s**. On a single-edit request it reached **197 tok/s**. Both returned the requested text exactly, using only the target model. [Copy and edit commands](docs/HIP-PORT.md#copy-and-edit-requests-without-a-drafter)
 
-The gfx1100 kernel suite passes. On the same 96 GSM8K questions with a 1,024-token output limit, Maya scored 90 and llama.cpp scored 93. Maya reached the limit on all three questions that account for the difference. The full-vocabulary checks include short passages and a 114-token prompt. [Quality checks](docs/HIP-PORT.md#rdna3-expert-and-attention-kernels)
+The gfx1100 kernel suite passes. Maya answered **187 of 192** GSM8K questions correctly with a 4,096-token output limit. Every response finished. On the original 96-question run with a 1,024-token cap, Maya scored 90 and llama.cpp scored 93. [Quality checks and commands](docs/HIP-PORT.md#gsm8k)
 
 ```sh
 git clone --branch hip-port https://github.com/GodGMN/maya-inkling-mini.git
