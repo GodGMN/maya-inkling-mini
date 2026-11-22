@@ -1,6 +1,7 @@
 """Exercise parallel tool calls and result feedback against a live Inkling server."""
 import argparse
 import json
+import re
 from urllib.request import Request, urlopen
 
 VALUES = {"Larch": "VX-731", "Birch": "PK-284"}
@@ -73,6 +74,14 @@ def anthropic_turn(url, body, stream):
     return {"role": "assistant", "content": [blocks[i] for i in sorted(blocks)]}, finish
 
 
+def matched_results(answer):
+    # Between each desk and the next one, look for that desk's returned value.
+    names = "|".join(map(re.escape, VALUES))
+    parts = re.split(rf"\b({names})\b", answer, flags=re.IGNORECASE)
+    results = {desk.casefold(): text for desk, text in zip(parts[1::2], parts[2::2])}
+    return all(code in results.get(desk.casefold(), "") for desk, code in VALUES.items())
+
+
 def run(url, model, api, stream):
     messages = [{"role": "user", "content": QUESTION}]
     base = dict(model=model, messages=messages, temperature=0, max_tokens=1536, stream=stream)
@@ -105,7 +114,7 @@ def run(url, model, api, stream):
     answer = final.get("content") or ""
     if api == "anthropic":
         answer = " ".join(b["text"] for b in answer if b["type"] == "text")
-    if finish != ("stop" if api == "openai" else "end_turn") or not all(v in answer for v in VALUES.values()):
+    if finish != ("stop" if api == "openai" else "end_turn") or not matched_results(answer):
         raise ValueError(f"tool results missing from final answer: {finish=} {answer=}")
     return dict(ids=[c[0] for c in calls], answer=answer)
 
