@@ -1,24 +1,49 @@
 # Inkling 2 Mini on AMD Radeon RX 7900 XTX
 
-This is an AMD (HIP/ROCm) port of [alesha-pro/maya-inkling-mini](https://github.com/alesha-pro/maya-inkling-mini). The CUDA engine, the RTX 3090 results and everything described under [About this repo](#about-this-repo) are their work and that of the Project Maya contributors. This repo adds the ROCm build, the RDNA3 (gfx1100) kernels and the RX 7900 XTX measurements.
+An AMD (HIP/ROCm) port of [alesha-pro/maya-inkling-mini](https://github.com/alesha-pro/maya-inkling-mini), the CUDA engine for Thinking Machines' 26B looped MoE. The engine, the RTX 3090 results and everything under [About this repo](#about-this-repo) are their work and that of the Project Maya contributors. This repo adds the ROCm build, RDNA3 (gfx1100) kernels and RX 7900 XTX measurements.
 
-On Prometheus’s RX 7900 XTX, `maya-ik2` decoded at **117.11 tok/s after 512 input tokens**, **107.47 after 8,192** and **93.70 after 32,768**, with 393,216 context positions reserved. It read an uncached 8,192-token prompt at **3,365.65 tok/s**. All measurements use the installed ggml-org IQ4_NL weights and FP8 KV. On contiguous archive text, decode measured 116.79 and 107.56 tok/s at 512 and 8,192. Each figure is a median of three greedy requests. [Measurements and commands](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
+On one RX 7900 XTX with the [ggml-org IQ4_NL weights](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF) and an FP8 KV cache, with 393,216 context positions reserved:
 
-On a Python rename that required returning 886 tokens, a 256-token verification window reached **693.6 tok/s**. A 512-token window copied a repetitive inventory at **996.6 tok/s**. All three repeats produced the requested text exactly. Both tasks used direct answers and proposals from the prompt itself. [Copy and edit commands](docs/HIP-PORT.md#larger-copy-and-edit-windows)
+| | tok/s |
+|---|---:|
+| Decode after 512 input tokens | **117.1** |
+| Decode after 8,192 | 107.5 |
+| Decode after 32,768 | 93.7 |
+| Prefill, uncached 8,192-token prompt | 3,365.7 |
+| Editing code (Python rename returning 886 tokens) | 693.6 |
 
-The gfx1100 kernel suite passed, including FP64 checks at 392,957 keys. This build answered **184/192** GSM8K questions correctly with a 4,096-token cap and **207/256** multiple-choice questions across eight MMLU subjects. One arithmetic response reached the cap. Keeping sliding-window KV in FP16 scored **188/192** on the same arithmetic questions with zero capped responses and **206/256** on MMLU. That mode decoded at 117.65 tok/s after 512 input tokens. [Quality checks and commands](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
+Each figure is the median of three greedy requests. [Measurements and commands](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
 
-The Radeon server offers OpenAI and Anthropic tool calls, including streamed parallel calls and multi-turn results. Its Docker preset reserves 393,216 positions. On a conversation that grew from 20K to 300K, each turn reused all previously processed tokens. Reuse resumed after compaction. [Tool conversations](docs/HIP-PORT.md#multi-turn-tool-calls-on-prometheus) · [Per-turn cache and memory measurements](docs/HIP-PORT.md#growing-conversations)
+* **Quality.** The gfx1100 kernel suite passes, including FP64 checks at 392,957 keys. 184/192 on GSM8K and 207/256 on eight MMLU subjects; with sliding-window KV in FP16, 188/192 and 206/256. [Quality checks](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
+* **Tools.** OpenAI and Anthropic tool calls, including streamed parallel calls and multi-turn results. A conversation that grew from 20K to 300K tokens reused every previously processed token on each turn. [Tool conversations](docs/HIP-PORT.md#growing-conversations)
+* **Several chats.** `IK2_CACHE_SLOTS=2`, `3` or `4` splits the context into independent caches, so each follow-up processes only its new tokens. Requests run one at a time. [Slot sizes and VRAM](docs/HIP-PORT.md#separate-conversation-caches)
+* **Images.** The GPU image encoder reads a new screenshot in 0.7 to 1.6 s at full context and adds 404 MiB of VRAM. [Image timings](docs/HIP-PORT.md#image-latency-on-port-8085)
 
-For independent chats, set `IK2_CACHE_SLOTS=2`, `3` or `4` at startup. With two 196K chats and four 98K chats, every follow-up processed only its new tokens and every final answer matched its cold replay. All requests run serially. [Slot sizes, timings and VRAM](docs/HIP-PORT.md#separate-conversation-caches)
+## ROCm quick start
 
-Prometheus serves Maya on port 8085 under the Hyperion model name `inkling-2-mini`. The deployed GPU encoder read three different screenshots in **1.56, 0.88 and 0.66 seconds** at full context. The first was the first request after startup. It uses the original FP16 image weights and adds 404 MiB of GPU memory. The previous CPU encoder took about 14 seconds per new screenshot. [Image timings and memory](docs/HIP-PORT.md#image-latency-on-port-8085) · [API routes and private benchmark results](docs/HIP-PORT.md#live-service-on-prometheus)
+Linux, an RX 7900 XTX (`gfx1100`, 24 GB) and ROCm. The 20 GB 7900 XT and 16 GB 7900 GRE share the target but don't fit the full-context configuration; other RDNA3 cards need their own build. [Which GPUs can run it](docs/HIP-PORT.md#which-gpus-and-models-can-run-it)
 
 ```sh
-git clone --branch hip-port https://github.com/GodGMN/maya-inkling-mini.git
+git clone https://github.com/GodGMN/maya-inkling-mini && cd maya-inkling-mini
+
+# llama.cpp at the revision Maya's CMake pins
+curl -fLsS https://codeload.github.com/ggml-org/llama.cpp/tar.gz/3cf03257f219afbe7334045ff7c6a06ac68c627d | tar xz -C ..
+
+cmake -S . -B build-ik2 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_HIP=ON -DSTRATA_PREFILL_MMQ=ON -DSTRATA_BUILD_TESTS=OFF \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=/opt/rocm \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1100 -DGPU_TARGETS=gfx1100 \
+  -DSTRATA_GGML_DIR="$PWD/../llama.cpp-3cf03257f219afbe7334045ff7c6a06ac68c627d"
+cmake --build build-ik2 --target maya-ik2
+
+hf download ggml-org/Inkling-2-Mini-GGUF Inkling-2-Mini-IQ4_NL.gguf --local-dir models
+python3 tools/strata_tokenizer.py --gguf models/Inkling-2-Mini-IQ4_NL.gguf --out ik2 \
+  --chat-template tools/ik2/chat_template.jinja
+python3 serve/server.py --engine maya --config docs/inkling2-mini/ik2-mini-gfx1100.json \
+  --host 127.0.0.1 --port 18085
 ```
 
-[Run the prepared Docker image on Prometheus](docs/HIP-PORT.md#run-the-packaged-image-on-prometheus) · [Build the HIP engine](docs/HIP-PORT.md#build-on-prometheus-without-a-gpu) · [Serve it from a checkout](docs/HIP-PORT.md#serve-the-iq4_nl-model-on-gfx1100)
+Then point any OpenAI or Anthropic client at `http://127.0.0.1:18085/v1`, model `inkling-2-mini`. If your machine has no ROCm toolchain, the [build guide](docs/HIP-PORT.md#build-on-prometheus-without-a-gpu) runs the same build inside the `ghcr.io/ggml-org/llama.cpp:server-rocm-b11176` container. A [Docker image with the image encoder](docs/HIP-PORT.md#run-the-packaged-image-on-prometheus) is also described there.
 
 ## Upstream CUDA results on RTX 3090
 
