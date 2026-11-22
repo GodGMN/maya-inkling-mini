@@ -19,6 +19,7 @@
     "IK2_DENSE_WMMA": "1",
     "IK2_DECODE_SUBWAVE": "1",
     "IK2_ATTN_MMA": "3",
+    "IK2_GRAPH_PAIR": "1",
     "IK2_ATTN_STAGED": "1",
     "IK2_SHARED_COMBINE": "1",
     "IK2_RESIDENT_ONLY": "1",

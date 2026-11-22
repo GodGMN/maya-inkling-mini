@@ -2597,6 +2597,14 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     } else {
         FastGraph& G =
             g_fgraph[(tier_active && (stage_cold || !host_plan.active.empty())) || host_plan.forced][(int)out_mode];
+#ifdef STRATA_USE_HIP
+        // A chat server can alternate between short and long requests on successive turns.
+        static FastGraph previous[4];
+        static const bool keep_pair = getenv("IK2_GRAPH_PAIR") && atoi(getenv("IK2_GRAPH_PAIR"));
+        if (keep_pair && G.exec && G.attention_bucket != attention_bucket && !g_managed_experts &&
+            !tier_active && !host_plan.forced && !stage_cold)
+            std::swap(G, previous[(int)out_mode]);
+#endif
         if (G.exec && G.attention_bucket != attention_bucket) {
             CU(cudaGraphExecDestroy(G.exec));
             CU(cudaGraphDestroy(G.graph));

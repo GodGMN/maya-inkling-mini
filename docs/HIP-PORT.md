@@ -703,3 +703,35 @@ for cache in 1 0 2; do
 done
 cmp cache-0.f32 cache-1.f32 && cmp cache-1.f32 cache-2.f32
 ```
+
+### Alternating prompt lengths
+
+The preset keeps the two most recently used decode graphs for each output mode. When successive requests cross an attention depth boundary, the engine can replay the previous graph. On 24 alternating uncached prompts of 128 and 2,048 tokens, both configurations returned the same 120 greedy token IDs. After the first two requests of each length, the median time for four decode steps fell from 38 to 34 ms at 128 tokens and from 40 to 36 ms at 2,048. The second graph used another 2 MiB of reported device memory at a context reservation of 393,216. A separate run visited depths 128, 2,048 and 8,192 in the order A, B, C, A, C, B, first greedy and then with temperature 0.7, top-p 0.95 and seed 1. All 60 generated token IDs matched with the cache enabled and disabled. Expert placement in managed or host memory retains its existing graph lifecycle.
+
+```sh
+python3 - <<'PY'
+from pathlib import Path
+ids = Path("profile-pp-ids").read_text().strip().split(",")
+with Path("mixed.requests").open("w") as out:
+    for r in range(12):
+        for j, n in enumerate((128, 2048)):
+            prompt = [str(1000 + 2 * r + j)] + ids[r:r+n-1]
+            print("GEN 5 0 1 1 -", ",".join(prompt), file=out)
+    print("QUIT", file=out)
+PY
+for pair in 0 1; do
+    IK2_GRAPH_PAIR=$pair ./build-ik2/maya-ik2 --model /weight.gguf --serve-ik2 --ctx 393216 --chunk 1024 \
+        <mixed.requests >"mixed-$pair.log"
+    grep '^@TOK ' "mixed-$pair.log" >"mixed-$pair.ids"
+done
+cmp mixed-0.ids mixed-1.ids
+python3 - <<'PY'
+from statistics import median
+for pair in (0, 1):
+    rows = [l.split() for l in open(f"mixed-{pair}.log") if l.startswith("@END ")][4:]
+    for n in (128, 2048):
+        times = [float(r[5]) for r in rows if int(r[2]) == n]
+        assert len(times) == 10
+        print(pair, n, 1000 * median(times), "ms")
+PY
+```
