@@ -6,6 +6,8 @@ On a Python rename that required returning 886 tokens, a 256-token verification 
 
 The gfx1100 kernel suite passed, including FP64 checks at 392,957 keys. This build answered **184/192** GSM8K questions correctly with a 4,096-token cap and **207/256** multiple-choice questions across eight MMLU subjects. One arithmetic response reached the cap. Keeping sliding-window KV in FP16 scored **188/192** on the same arithmetic questions with zero capped responses and **206/256** on MMLU. That mode decoded at 117.65 tok/s after 512 input tokens. [Quality checks and commands](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
 
+The Radeon server offers OpenAI and Anthropic tool calls, including streamed parallel calls and multi-turn results. Its Docker preset reserves 393,216 positions. On a conversation that grew from 20K to 300K, each turn reused all previously processed tokens. Reuse resumed after compaction. [Tool conversations](docs/HIP-PORT.md#multi-turn-tool-calls-on-prometheus) · [Per-turn cache and memory measurements](docs/HIP-PORT.md#growing-conversations)
+
 ```sh
 git clone --branch hip-port https://github.com/GodGMN/maya-inkling-mini.git
 ```
