@@ -649,7 +649,10 @@ for k in 32 64; do IK2_WMMA_K=$k ./build-ik2/ik2_kernels_test; done
 The Radeon preset chooses the MoE tile height from the number of routed rows per expert. On this model it uses 16 rows through 128 input tokens, 32 rows through 256, and 64 rows above that. The 64-row case uses fused SwiGLU. Median prefill time for 16, 32, 64 and 128 new tokens fell from 63, 88, 101 and 116 ms to 57, 80, 91 and 108 ms. At 256, 512, 1,024 and 2,048 tokens both settings measured 141, 180, 290 and 513 ms. At chunk sizes 64 and 256, all 256 held-out prefill rows matched the fixed-height run byte for byte across the full vocabulary.
 
 ```sh
-# Start with the Radeon preset environment. The natural token fixture construction is shown above.
+# Use the Radeon preset and the GSM8K test file and tokenizer from the retrieval check.
+oracle-env/bin/python src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
+    --depths 32768 >needle-32768.request
+python3 -c 'from pathlib import Path; ids=Path("needle-32768.request").read_text().splitlines()[0].split()[-1].split(","); Path("profile-pp-ids").write_text(",".join(ids[:8192]))'
 for rows in auto 64; do
     IK2_WMMA_K=32 IK2_PREFILL_TILE=$rows python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 \
         --model /weight.gguf --tokens profile-pp-ids --depths 16,32,64,128,256,512,1024,2048 --chunk 2048 --gen 3 --repeats 5
@@ -662,3 +665,16 @@ for chunk in 64 256; do cmp "tile-$chunk-auto.f32" "tile-$chunk-64.f32"; done
 ```
 
 On the three-record inventory, the direct-answer prompt returned the correct 986 at 256 and 2,048 input tokens and 1,008 at 32,768. Allowing the model to reason before answering produced 986 at all three depths. The model used 355, 169 and 488 generated tokens respectively. Switching all KV entries to FP16 did not recover the 32,768-token direct answer. Run the ledger command above with `--depths 256,2048,32768`, then remove `--direct-answer` and use `--max-tokens 512` for the reasoning control.
+
+### NVFP4 expert WMMA on RDNA3
+
+The Radeon kernel unpacks GGUF NVFP4 in registers. Each 36-byte block holds 64 E2M1 weights and four unsigned E4M3 scales. Batched prefill can group resident experts and apply the same capped SwiGLU as the IQ4_NL path. For single-token NVFP4 decode, `IK2_EXPERT_MMA=1` enables a WMMA gate/up product with a two-half representation of the FP32 input and a down projection over the FP16 hidden state. The default for single-token NVFP4 on HIP remains scalar.
+
+In the first grouped implementation, adding each matrix tile directly to its WMMA accumulator gave −2.19387 for an FP64 reference of −2.19205. One output of 4,512 exceeded its test tolerance. Adding independently rounded 16-channel dot products in FP32 passed the original test. The complete Radeon suite passed with register and LDS tiles, including tile heights 16, 32 and 64 and both 32- and 64-channel K depths. The single-token test compares all 640 gate/up outputs and 1,280 down outputs to independent FP64 evaluations of the packed bytes. These NVFP4 results use generated expert weights. All full-model performance and quality results for this port use the installed IQ4_NL checkpoint.
+
+```sh
+for k in 32 64; do
+    IK2_EXPERT_MMA=1 IK2_WMMA_K=$k IK2_EXPERT_TILE_LDS=1 ./build-ik2/ik2_kernels_test
+done
+IK2_EXPERT_MMA=1 IK2_WMMA_K=32 IK2_EXPERT_TILE_LDS=0 ./build-ik2/ik2_kernels_test
+```

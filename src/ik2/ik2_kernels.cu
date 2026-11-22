@@ -6046,11 +6046,7 @@ void expert_limb_mv(bool gate, const uint8_t* const* blob, size_t offset, int C,
     check("nv_expert_limb");
 }
 bool experts_mma_fits(int ty_gate, int ty_up, int ty_down, int C, int F) {
-#ifdef STRATA_USE_HIP
-    return false;
-#else
     return ty_gate == kNVFP4 && ty_up == kNVFP4 && ty_down == kNVFP4 && C % 64 == 0 && F % 64 == 0;
-#endif
 }
 #ifndef STRATA_USE_HIP
 static int experts_mma_split(bool gate) {
@@ -6073,28 +6069,20 @@ static void launch_experts_mma(const uint8_t* const* blob, int S, size_t off, co
     else IK2_MMA_LAUNCH(4);
 #undef IK2_MMA_LAUNCH
 }
-#endif
 void experts_gate_up_swiglu_mma(const uint8_t* const* blob, int S, size_t eb0, const uint16_t* x16, int C, int F,
                                 const float* sg, const float* su, float gcap, float ucap, uint16_t* h,
                                 cudaStream_t s) {
-#ifdef STRATA_USE_HIP
-    unavailable_mma(__func__);
-#else
     if (S <= 0) return;
     launch_experts_mma<true>(blob, S, eb0, x16, 0, C, F, sg, su, gcap, ucap, h, nullptr, s);
     check("experts_gate_up_swiglu_mma");
-#endif
 }
 void experts_down_mma(const uint8_t* const* blob, int S, size_t off_down, const uint16_t* h, int C, int F, float* y,
                       cudaStream_t s) {
-#ifdef STRATA_USE_HIP
-    unavailable_mma(__func__);
-#else
     if (S <= 0) return;
     launch_experts_mma<false>(blob, S, off_down, h, F, C, F, nullptr, nullptr, 0.0f, 0.0f, nullptr, y, s);
     check("experts_down_mma");
-#endif
 }
+#endif
 void experts_gate_up(const uint8_t* const* blob, const int* tok, int S, int ty_gate, int ty_up, size_t eb0,
                      const float* x, int C, int F, float* gu, cudaStream_t s) {
     if (S <= 0) return;

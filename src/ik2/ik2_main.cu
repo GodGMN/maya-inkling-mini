@@ -2501,7 +2501,11 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
             C % 64 == 0 && (((limb & 1) && Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4) || ((limb & 4) && q8_gate) || ((limb & 16) && iq4_gate));
         const bool fast_down =
             c.F % 64 == 0 && (((limb & 2) && Ly.ty[2] == k::kNVFP4) || ((limb & 8) && Ly.ty[2] == k::kQ8_0) || ((limb & 32) && Ly.ty[2] == k::kIQ4_NL));
-        static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+#ifdef STRATA_USE_HIP
+        static const bool exp_mma = getenv("IK2_EXPERT_MMA") && atoi(getenv("IK2_EXPERT_MMA"));
+#else
+        static const bool exp_mma = !getenv("IK2_EXPERT_MMA") || atoi(getenv("IK2_EXPERT_MMA"));
+#endif
         const bool exp_tc = exp_mma && !fast_gate && !fast_down && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
@@ -3113,9 +3117,10 @@ bool resident_wmma_prefill(const Config& c, const Layer& ly, int T, Work& w) {
     }();
     const int tile_rows = fixed_rows ? fixed_rows : S <= 8 * c.E ? 16 : S <= 16 * c.E ? 32 : 64;
     const int capacity = k::expert_tile_capacity(S, c.E, tile_rows);
+    const int block = ly.ty[0] == k::kNVFP4 ? 64 : 32;
     if (!enabled || !g_fast || T < 2 || !ly.tab_blob || c.E > 1024 ||
-        ly.ty[0] != ly.ty[1] || ly.ty[0] != ly.ty[2] || (ly.ty[0] != k::kIQ4_NL && ly.ty[0] != k::kQ8_0) ||
-        C % 32 || F % 32 || (size_t)capacity * sizeof(k::ExpertTile) > (size_t)T * F * sizeof(uint16_t) ||
+        ly.ty[0] != ly.ty[1] || ly.ty[0] != ly.ty[2] || (ly.ty[0] != k::kIQ4_NL && ly.ty[0] != k::kQ8_0 && ly.ty[0] != k::kNVFP4) ||
+        C % block || F % block || (size_t)capacity * sizeof(k::ExpertTile) > (size_t)T * F * sizeof(uint16_t) ||
         (size_t)S * (2 * std::max(C, F) + 4 * C) > w.lg_cap * sizeof(float) ||
         (size_t)S * 2 * F * sizeof(float) > w.gu32_bytes) return false;
     k::ExpertTiles tiles{reinterpret_cast<k::ExpertTile*>(w.h16), capacity, tile_rows};
@@ -4274,8 +4279,7 @@ int main(int argc, char** argv) {
     }
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
 #ifdef STRATA_USE_HIP
-    for (const char* flag : {"IK2_EXPERT_MMA", "IK2_GROUP_MMA",
-                             "IK2_WGMMA"}) {
+    for (const char* flag : {"IK2_GROUP_MMA", "IK2_WGMMA"}) {
         if (getenv(flag) && std::atoi(getenv(flag))) die(std::string(flag) + " requires CUDA tensor cores");
     }
     if (serve && !draft_path.empty() && getenv("IK2_BLOCK") && !atoi(getenv("IK2_BLOCK")))

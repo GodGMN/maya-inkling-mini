@@ -2990,81 +2990,81 @@ void test_rdna3_expert_groups() {
 }
 
 // Three nonempty experts separated by an empty one, including a partial token tile and a partial output workgroup.
-void test_rdna3_expert_gemm() {
-    constexpr int E = 4, N = 48, K = 96, T = 94;
+void test_rdna3_expert_gemm(int type, int K, const char* name) {
+    constexpr int E = 4, N = 48, T = 94;
     const std::vector<int> starts{0, 1, 1, 74, T};
     std::vector<uint16_t> x(T * K);
     for (auto& v : x) v = f2h_host(frand(0.75f));
     auto* dx = dev(x);
     auto* dy = dev_n<float>(T * N);
-    for (int type : {k::kIQ4_NL, k::kQ8_0}) {
-        auto raw = rand_blocks(type, (size_t)E * 2 * N * K);
-        auto* weights = dev(raw);
-        const size_t matrix_bytes = raw.size() / (2 * E);
-        std::vector<const uint8_t*> blob(E);
-        for (int e = 0; e < E; ++e) blob[e] = weights + 2 * e * matrix_bytes;
-        auto** db = dev(blob);
-        std::vector<double> products[2];
-        for (int matrix = 0; matrix < 2; ++matrix) {
-            const size_t offset = matrix * matrix_bytes;
-            std::vector<double> expected(T * N);
-            std::vector<float> w(N * K);
-            for (int e = 0; e < E; ++e) {
-                k::decode_host(type, raw.data() + 2 * e * matrix_bytes + offset, N * K, w.data());
-                for (int t = starts[e]; t < starts[e + 1]; ++t)
-                    for (int n = 0; n < N; ++n)
-                        for (int i = 0; i < K; ++i)
-                            expected[t * N + n] += (double)h2f_host(x[t * K + i]) * h2f_host(f2h_host(w[n * K + i]));
-            }
-            for (int tile_rows : {16, 32, 64}) {
-                std::vector<k::ExpertTile> tiles;
-                for (int e = 0; e < E; ++e)
-                    for (int row = starts[e]; row < starts[e+1]; row += tile_rows)
-                        tiles.push_back({e, row, std::min(row + tile_rows, starts[e+1])});
-                tiles.push_back({0, 0, 0});
-                auto* dt = dev(tiles);
-                k::rdna3_expert_gemm(type, db, offset, {dt, (int)tiles.size(), tile_rows}, dx, K, N, dy, 0);
-                expect(type == k::kIQ4_NL ? "RDNA3 WMMA IQ4_NL expert GEMM" : "RDNA3 WMMA Q8_0 expert GEMM",
-                       host(dy, T * N), expected, 1e-4, 1e-3);
-                cudaFree(dt);
-            }
-            products[matrix] = std::move(expected);
-        }
-        std::vector<float> sg(T), su(T);
+    auto raw = rand_blocks(type, (size_t)E * 2 * N * K);
+    auto* weights = dev(raw);
+    const size_t matrix_bytes = raw.size() / (2 * E);
+    std::vector<const uint8_t*> blob(E);
+    for (int e = 0; e < E; ++e) blob[e] = weights + 2 * e * matrix_bytes;
+    auto** db = dev(blob);
+    std::vector<double> products[2];
+    for (int matrix = 0; matrix < 2; ++matrix) {
+        const size_t offset = matrix * matrix_bytes;
         std::vector<double> expected(T * N);
-        for (int t = 0; t < T; ++t) {
-            sg[t] = ((t % 13) - 6) * 0.0125f;
-            su[t] = ((t % 9) - 4) * 0.015625f;
-            for (int n = 0; n < N; ++n) {
-                const int i = t * N + n;
-                const double g = products[0][i] * sg[t], u = products[1][i] * su[t];
-                expected[i] = 12. * std::tanh(g / 12.) / (1. + std::exp(-g)) * 19. * std::tanh(u / 19.);
-            }
+        std::vector<float> w(N * K);
+        for (int e = 0; e < E; ++e) {
+            const uint8_t* block = raw.data() + 2 * e * matrix_bytes + offset;
+            if (type == k::kNVFP4) {
+                for (size_t i = 0; i < w.size(); ++i) w[i] = nvfp4_def(block, i);
+            } else k::decode_host(type, block, N * K, w.data());
+            for (int t = starts[e]; t < starts[e + 1]; ++t)
+                for (int n = 0; n < N; ++n)
+                    for (int i = 0; i < K; ++i)
+                        expected[t * N + n] += (double)h2f_host(x[t * K + i]) * h2f_host(f2h_host(w[n * K + i]));
         }
-        std::vector<k::ExpertTile> ranges;
-        for (int e = 0; e < E; ++e)
-            for (int row = starts[e]; row < starts[e + 1]; row += 64)
-                ranges.push_back({e, row, std::min(row + 64, starts[e + 1])});
-        ranges.push_back({0, 0, 0});
-        auto* dt = dev(ranges);
-        const k::ExpertTiles tiles{dt, (int)ranges.size(), 64};
-        auto* dsg = dev(sg);
-        auto* dsu = dev(su);
-        auto* tmp = dev_n<float>(T * 2 * N);
-        auto* split = dev_n<uint16_t>(T * N);
-        auto* fused = dev_n<uint16_t>(T * N);
-        k::rdna3_expert_gemm(type, db, 0, tiles, dx, K, 2 * N, tmp, 0);
-        k::swiglu_cap_f32(tmp, T, N, dsg, dsu, 12.f, 19.f, split, 0);
-        k::rdna3_expert_swiglu(type, db, tiles, dx, K, N, dsg, dsu, 12.f, 19.f, fused, 0);
-        auto result = host(fused, T * N);
-        expect_true("WMMA fused expert SwiGLU matches separate projections and activation", result == host(split, T * N));
-        std::vector<float> floats(result.size());
-        std::transform(result.begin(), result.end(), floats.begin(), h2f_host);
-        expect("WMMA fused expert SwiGLU vs FP64", floats, expected, 5e-4, 2e-4);
-        cudaFree(dt); cudaFree(dsg); cudaFree(dsu); cudaFree(tmp); cudaFree(split); cudaFree(fused);
-        cudaFree(db);
-        cudaFree(weights);
+        for (int tile_rows : {16, 32, 64}) {
+            std::vector<k::ExpertTile> tiles;
+            for (int e = 0; e < E; ++e)
+                for (int row = starts[e]; row < starts[e+1]; row += tile_rows)
+                    tiles.push_back({e, row, std::min(row + tile_rows, starts[e+1])});
+            tiles.push_back({0, 0, 0});
+            auto* dt = dev(tiles);
+            k::rdna3_expert_gemm(type, db, offset, {dt, (int)tiles.size(), tile_rows}, dx, K, N, dy, 0);
+            expect(name, host(dy, T * N), expected, 1e-4, 1e-3);
+            cudaFree(dt);
+        }
+        products[matrix] = std::move(expected);
     }
+    std::vector<float> sg(T), su(T);
+    std::vector<double> expected(T * N);
+    for (int t = 0; t < T; ++t) {
+        sg[t] = ((t % 13) - 6) * 0.0125f;
+        su[t] = ((t % 9) - 4) * 0.015625f;
+        for (int n = 0; n < N; ++n) {
+            const int i = t * N + n;
+            const double g = products[0][i] * sg[t], u = products[1][i] * su[t];
+            expected[i] = 12. * std::tanh(g / 12.) / (1. + std::exp(-g)) * 19. * std::tanh(u / 19.);
+        }
+    }
+    std::vector<k::ExpertTile> ranges;
+    for (int e = 0; e < E; ++e)
+        for (int row = starts[e]; row < starts[e + 1]; row += 64)
+            ranges.push_back({e, row, std::min(row + 64, starts[e + 1])});
+    ranges.push_back({0, 0, 0});
+    auto* dt = dev(ranges);
+    const k::ExpertTiles tiles{dt, (int)ranges.size(), 64};
+    auto* dsg = dev(sg);
+    auto* dsu = dev(su);
+    auto* tmp = dev_n<float>(T * 2 * N);
+    auto* split = dev_n<uint16_t>(T * N);
+    auto* fused = dev_n<uint16_t>(T * N);
+    k::rdna3_expert_gemm(type, db, 0, tiles, dx, K, 2 * N, tmp, 0);
+    k::swiglu_cap_f32(tmp, T, N, dsg, dsu, 12.f, 19.f, split, 0);
+    k::rdna3_expert_swiglu(type, db, tiles, dx, K, N, dsg, dsu, 12.f, 19.f, fused, 0);
+    auto result = host(fused, T * N);
+    expect_true("WMMA fused expert SwiGLU matches separate projections and activation", result == host(split, T * N));
+    std::vector<float> floats(result.size());
+    std::transform(result.begin(), result.end(), floats.begin(), h2f_host);
+    expect("WMMA fused expert SwiGLU vs FP64", floats, expected, 5e-4, 2e-4);
+    cudaFree(dt); cudaFree(dsg); cudaFree(dsu); cudaFree(tmp); cudaFree(split); cudaFree(fused);
+    cudaFree(db);
+    cudaFree(weights);
     cudaFree(dy);
     cudaFree(dx);
 }
@@ -3182,7 +3182,8 @@ void test_experts_mma() {
     std::vector<const uint8_t*> ptrs;
     for (int j = 0; j < S; ++j) ptrs.push_back(device_pool + 3 * j * matrix_bytes);
     auto** blobs = dev(ptrs);
-    auto* input = dev(fvec(C, 3.0f));
+    const auto x = fvec(C, 3.0f);
+    auto* input = dev(x);
     auto* tokens = dev(std::vector<int>(S, 0));
     auto sgv = fvec(S), suv = fvec(S);
     auto *sg = dev(sgv), *su = dev(suv);
@@ -3201,7 +3202,31 @@ void test_experts_mma() {
     k::experts_down_mma(blobs, S, 2 * matrix_bytes, ref, C, F, y_got, 0);
     const auto want = host(y_ref, S * C);
     expect("experts_down_mma", host(y_got, S * C), std::vector<double>(want.begin(), want.end()), 2e-5, 0.25);   // (random scales reach 240: sums of terms of 1e4 and more that cancel)
+    std::vector<double> cpu_down(S * C);
+    for (int slot = 0; slot < S; ++slot) {
+        const uint8_t* gate = pool.data() + 3 * slot * matrix_bytes;
+        const uint8_t* up = gate + matrix_bytes;
+        const uint8_t* down = up + matrix_bytes;
+        for (int r = 0; r < F; ++r) {
+            double g = 0, u = 0;
+            for (int k = 0; k < C; ++k) {
+                g += nvfp4_def(gate, r * C + k) * x[k];
+                u += nvfp4_def(up, r * C + k) * x[k];
+            }
+            g *= sgv[slot];
+            u *= suv[slot];
+            expected[slot * F + r] = 20. * std::tanh(g / 20.) / (1. + std::exp(-g)) * 20. * std::tanh(u / 20.);
+        }
+        for (int r = 0; r < C; ++r)
+            for (int k = 0; k < F; ++k)
+                cpu_down[slot * C + r] += nvfp4_def(down, r * F + k) * h2f_host(h_ref[slot * F + k]);
+    }
+    expect("NVFP4 token WMMA SwiGLU vs FP64", actual, expected, 1e-3, 1e-3);
+    expect("NVFP4 token WMMA down vs FP64", host(y_got, S * C), cpu_down, 2e-5, 0.25);
     expect_true("experts_mma_fits", k::experts_mma_fits(ty, ty, ty, 2304, 1152) && !k::experts_mma_fits(ty, k::kQ8_0, ty, 2304, 1152));
+    CU(cudaFree(y_got)); CU(cudaFree(y_ref)); CU(cudaFree(got)); CU(cudaFree(ref)); CU(cudaFree(limbs));
+    CU(cudaFree(sg)); CU(cudaFree(su)); CU(cudaFree(tokens)); CU(cudaFree(input));
+    CU(cudaFree(blobs)); CU(cudaFree(device_pool));
 }
 
 void test_q8_verify_tile() {
@@ -3269,7 +3294,9 @@ int main() {
     test_rdna3_small_dense();
     test_rdna3_dense_gemm();
     test_rdna3_expert_groups();
-    test_rdna3_expert_gemm();
+    test_rdna3_expert_gemm(k::kIQ4_NL, 96, "RDNA3 WMMA IQ4_NL expert GEMM");
+    test_rdna3_expert_gemm(k::kQ8_0, 96, "RDNA3 WMMA Q8_0 expert GEMM");
+    test_rdna3_expert_gemm(k::kNVFP4, 192, "RDNA3 WMMA NVFP4 expert GEMM");
 #endif
     test_attn_decode();
     test_mv_blocks();
@@ -3285,11 +3312,7 @@ int main() {
     test_cand_topk();
     test_token_path();
     test_expert_limbs();
-#ifndef STRATA_USE_HIP
     test_experts_mma();
-#else
-    std::puts("CUDA-only NVFP4 MMA tests excluded on gfx1100");
-#endif
     test_q8_verify_tile();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
