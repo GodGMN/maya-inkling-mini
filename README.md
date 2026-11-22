@@ -1,12 +1,10 @@
 # Inkling 2 Mini on AMD Radeon RX 7900 XTX
 
-On Prometheus’s RX 7900 XTX, `maya-ik2` decoded at **115.2 tok/s after a 512-token prompt** and **105.7 tok/s after 8,192 tokens**. The deployed llama.cpp service measured 64.0 and 62.0 tok/s on the same prompt IDs and ggml-org IQ4_NL weights. Maya used FP32 expert inputs and FP8 KV. The service used its production Q4_0 KV configuration. Each figure is a median of three greedy requests. [Decode measurements and commands](docs/HIP-PORT.md#fused-decode-projections)
-
-Maya read an uncached 8,192-token prompt at **3,559 tok/s**. Llama.cpp reached 1,488 tok/s. [Prefill measurements and commands](docs/HIP-PORT.md#cooperative-prefill-and-depth-dependent-decode-attention)
+On Prometheus’s RX 7900 XTX, `maya-ik2` decoded at **117.11 tok/s after 512 input tokens**, **107.47 after 8,192** and **93.70 after 32,768**, with 393,216 context positions reserved. It read an uncached 8,192-token prompt at **3,365.65 tok/s**. All measurements use the installed ggml-org IQ4_NL weights and FP8 KV. On contiguous archive text, decode measured 116.79 and 107.56 tok/s at 512 and 8,192. Each figure is a median of three greedy requests. [Measurements and commands](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
 
 On a Python rename that required returning 886 tokens, a 256-token verification window reached **693.6 tok/s**. A 512-token window copied a repetitive inventory at **996.6 tok/s**. All three repeats produced the requested text exactly. Both tasks used direct answers and proposals from the prompt itself. [Copy and edit commands](docs/HIP-PORT.md#larger-copy-and-edit-windows)
 
-The gfx1100 kernel suite passes. Maya answered **187 of 192** GSM8K questions correctly with a 4,096-token output limit. Every response finished. On the original 96-question run with a 1,024-token cap, Maya scored 90 and llama.cpp scored 93. [Quality checks and commands](docs/HIP-PORT.md#gsm8k)
+The gfx1100 kernel suite passed, including FP64 checks at 392,957 keys. This build answered **184/192** GSM8K questions correctly with a 4,096-token cap and **207/256** multiple-choice questions across eight MMLU subjects. One arithmetic response reached the cap. The earlier Radeon configuration scored 187/192 on the same arithmetic questions. [Quality checks and commands](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
 
 ```sh
 git clone --branch hip-port https://github.com/GodGMN/maya-inkling-mini.git

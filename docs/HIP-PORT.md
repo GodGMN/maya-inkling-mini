@@ -1,6 +1,55 @@
 # Inkling 2 Mini on gfx1100
 
-On Prometheus’s RX 7900 XTX, the Radeon server preset runs the installed ggml-org IQ4_NL model with all routed experts in VRAM. See the [decode measurements](#fused-decode-projections), [uncached prefill measurements](#cooperative-prefill-and-depth-dependent-decode-attention) and [long-context retrieval results](#exact-phrase-retrieval-at-long-context).
+On Prometheus’s RX 7900 XTX, the Radeon server runs the installed ggml-org IQ4_NL model with all routed experts in VRAM. [Current measurements](#full-model-measurements-at-393216-reserved-tokens) · [Packaged server](#run-the-packaged-image-on-prometheus) · [Long-context retrieval](#exact-phrase-retrieval-at-long-context)
+
+## Full-model measurements at 393,216 reserved tokens
+
+The RX 7900 XTX ran commit `9a0f164` with the installed ggml-org IQ4_NL GGUF, a 1,024-token prefill chunk and E4M3 KV. Every expert stayed on the card. The runner alternated prompt starts, checked that zero input tokens were reused and timed 128 decode steps after the first prediction. Each cell is the median of three requests. Startup is excluded.
+
+| Input tokens | Maya prefill, tok/s | Maya decode, tok/s |
+| ---: | ---: | ---: |
+| 32 | 438.36 | 119.18 |
+| 512 | 2,438.10 | 117.11 |
+| 2,048 | 3,155.62 | 114.18 |
+| 8,192 | 3,365.65 | 107.47 |
+| 32,768 | 2,953.14 | 93.70 |
+
+The table cycles the water-passage token IDs. Using contiguous archive text instead measured 116.79 and 107.56 tok/s decode at 512 and 8,192 inputs. On the water passage, temperature 0.7 and top-p 0.95 measured 115.73 and 106.40 tok/s.
+
+```sh
+# From the Prometheus build directory inside the ROCm container.
+radeon() {
+    python3 -c 'import json, os, sys
+cfg = json.load(open("src/docs/inkling2-mini/ik2-mini-gfx1100.json"))
+os.execvpe(sys.argv[1], sys.argv[1:], {**os.environ, **cfg["env"]})' "$@"
+}
+bench() {
+    radeon python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+        --ctx 393216 --chunk 1024 --gen 129 --repeats 3 "$@"
+}
+bench --tokens water.force --depths 32,512,2048,8192,32768
+bench --tokens water.force --depths 512,8192 --temperature 0.7 --top-p 0.95
+python3 src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl --depths 32768 >needle-32768.request
+python3 -c 'from pathlib import Path; ids=Path("needle-32768.request").read_text().splitlines()[0].split()[-1].split(","); Path("natural-8k.ids").write_text(",".join(ids[:8193]))'
+bench --tokens natural-8k.ids --depths 512,8192
+```
+
+On the first 192 GSM8K test questions, this build scored **184/192** with a 4,096-token generation cap. One response reached the cap. The earlier Radeon build scored 187/192. The current build answered **207/256** multiple-choice questions correctly across eight subjects, and all 256 answers were valid letters. With a shared 256-token archive, it answered 24/32 and reused the full prefix on all 32 questions. The question sets and preparation commands are in the [GSM8K checks](#gsm8k) and [multiple-choice checks](#direct-multiple-choice-answers).
+
+```sh
+for offset in 0 96; do
+    args="--model /weight.gguf --data gsm8k-test.jsonl --count 96 --offset $offset --max-tokens 4096"
+    oracle-env/bin/python src/tests/ik2_gsm8k.py $args >"gsm-$offset.requests"
+    radeon ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 8192 --chunk 1024 \
+        <"gsm-$offset.requests" >"gsm-$offset.log"
+    oracle-env/bin/python src/tests/ik2_gsm8k.py $args --score "gsm-$offset.log"
+done
+quiz() {
+    oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer "$@"
+}
+quiz | radeon ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 4096 --chunk 512 >mmlu.log
+quiz --score mmlu.log
+```
 
 ## Build on Prometheus without a GPU
 
