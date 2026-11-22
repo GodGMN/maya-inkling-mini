@@ -1197,6 +1197,7 @@ struct Work {
     uint16_t *kv_k16 = nullptr, *kv_v16 = nullptr;
     int kv_tmp_cap = 0;
     int* pos;
+    cudaEvent_t prefill_inputs_copied;
     float* rlog;
     int* route_d;       // contiguous [S] top (int) followed by [S] weights (float)
     // the experts
@@ -3107,7 +3108,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     ExpertCache* ECp = &dev_cache(g_cur);
 #define W (*Wp)
 #define EC (*ECp)
-    // the embedding rows, normed (pinned host staging, no stream sync needed)
+    // A headless chunk can return with its kernels queued. Its caller will refill the same
+    // pinned token positions and embeddings, so release those buffers once both copies finish.
+    cudaEvent_t input_copy = out_mode == OutMode::kNone ? W.prefill_inputs_copied : nullptr;
     {
         const size_t rb = (size_t) C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
         for (int t = 0; t < T; ++t)
@@ -3117,6 +3120,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         place_pictures(W.h, T, pos0, C, g_s);
         for (int t = 0; t < T; ++t) W.pos_h[t] = pos0 + t;
         CU(cudaMemcpyAsync(W.pos, W.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
+        if (input_copy) CU(cudaEventRecord(input_copy, g_s));
     }
     int nb = 0;
     const size_t TC = (size_t) T * C;
@@ -3687,6 +3691,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
     }
     run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
+    if (input_copy) CU(cudaEventSynchronize(input_copy));
 #undef W
 #undef EC
 }
@@ -5054,6 +5059,7 @@ int main(int argc, char** argv) {
     }
     CU(cudaHostAlloc(&W.x_h, (size_t) 8 * C * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.emb_h, Tm * C * 4, cudaHostAllocPortable));
+    CU(cudaEventCreateWithFlags(&W.prefill_inputs_copied, cudaEventDisableTiming));
     CU(cudaHostAlloc(&W.pos_h, (size_t) W.T_host * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.route_h, S_host * 8, cudaHostAllocPortable));
     W.argmax_d = work_alloc<int>(Tm);

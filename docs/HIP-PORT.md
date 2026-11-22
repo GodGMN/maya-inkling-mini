@@ -275,6 +275,8 @@ A 64×64 WMMA projection tile replaced the hipBLAS FP16 products in large prefil
 | 8,192 | 3,126.72 | 100.31 | 1,488.44 | 61.97 |
 | 32,768 | 2,652.21 | 87.07 | | |
 
+The 8,192- and 32,768-token rows below the single-chunk range were collected before the host input copy fix. A fast resident prefill could overwrite a pinned embedding or position buffer while the GPU had queued its copy. The 1,792-token prefix regression exposed the corruption. The fixed build waits for a transfer event before releasing those buffers and predicts identical continuations after a warm or cold replay. Reproduce with `python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 --model /weight.gguf --tokens water.force`.
+
 Medians in tok/s for three uncached requests per depth. Each request generates 129 tokens with 128 timed decode steps. Maya reserved 32,897 positions with FP8 KV. The service retained its deployed 393,216 positions with Q4_0 KV. On the first 32-token request the initial matrix-library setup took the prefill rate down to 17.5 tok/s. The other two measured 415.58 tok/s.
 
 ```sh
@@ -314,7 +316,7 @@ done
 
 ### Exact phrase retrieval at long context
 
-With `--ctx 393216 --chunk 1024`, the resident IQ4_NL engine returned the exact four-word phrase at 32,768 and 131,072 tokens, placed halfway through each uncached prompt. At 392,960 input tokens the engine finished prefill in 470.020 seconds and used all 200 generation tokens without reaching its final answer. That request scored incorrect. All 3,072 experts remained on the card.
+In the run before the host input copy fix, with `--ctx 393216 --chunk 1024`, the resident IQ4_NL engine returned the exact four-word phrase at 32,768 and 131,072 tokens, placed halfway through each uncached prompt. At 392,960 input tokens the engine finished prefill in 470.020 seconds and used all 200 generation tokens without reaching its final answer. That request scored incorrect. All 3,072 experts remained on the card.
 
 ```sh
 oracle-env/bin/python src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
