@@ -1261,7 +1261,8 @@ struct Work {
 };
 
 // --serve: SIGUSR1 asks the request running to stop (its client went away) at its next token or prompt chunk
-volatile std::sig_atomic_t g_cancel = 0;
+static_assert(std::atomic<std::sig_atomic_t>::is_always_lock_free);
+std::atomic<std::sig_atomic_t> g_cancel{0};
 // IK2_STATS=1: per request, how many tokens the prefill's experts each ran ([0] 1, [1] 2, [2] 3-7, [3] 8+)
 uint64_t g_cnt_hist[4] = {0, 0, 0, 0};
 // IK2_STATS: a request's experts by where they came from: used and already cached / used and prefetched for this
@@ -4158,7 +4159,7 @@ int verify_suffix(Model& M, const std::vector<int>& hist, int anchor, int remain
     for (int i = 0; i < n; ++i) {
         const int picked = sample ? sample(logits.data() + (size_t)i * M.c.n_vocab) : predicted[i];
         next.push_back(picked);
-        if (i + 1 == n || picked != hist[src + i + 1]) break;
+        if (g_cancel || i + 1 == n || picked != hist[src + i + 1]) break;
         ++stats.accepted;
         if (std::find(stops.begin(), stops.end(), picked) != stops.end()) break;
     }
@@ -5502,9 +5503,9 @@ int main(int argc, char** argv) {
                     continue;
                 }
             }
+            g_cancel = 0;
             busy = true;
             if (seed >= 0) rng.seed((uint64_t) seed);
-            g_cancel = 0;
             size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
             auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
             while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
@@ -5698,12 +5699,6 @@ int main(int argc, char** argv) {
                         verify_suffix(M, hist, tok, max_new - i - 1, stops, next, t_exp, suffix_stats, suffix_sample);
                     if (n) {
                         hist.push_back(tok);
-                        if (g_cancel) {
-                            if (n > 1) rollback(M, 1);
-                            last.clear();
-                            reason = "cancelled";
-                            break;
-                        }
                         for (int j = 0; j < n - 1; ++j) {
                             std::printf(serve_maya ? "T %d\n" : "@TOK %d\n", next[j]);
                             hist.push_back(next[j]);
@@ -5716,6 +5711,10 @@ int main(int argc, char** argv) {
                         else
                             pending_sample = next.back();
                         last.clear();
+                        if (g_cancel) {
+                            reason = "cancelled";
+                            break;
+                        }
                         if (n < 8) suffix_at = i + 16;
                         continue;
                     }

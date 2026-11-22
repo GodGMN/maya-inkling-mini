@@ -27,11 +27,42 @@ def generate(engine, prompt, length):
     return tokens, int(end[3])
 
 
+def cancel_and_resume(engine, request, control_ids):
+    fields = request.split()
+    if len(fields) != 7 or fields[0] != "GEN":
+        raise ValueError("expected a tokenized GEN request")
+    prompt = list(map(int, fields[-1].split(",")))
+    engine.stdin.write(request + "\n")
+    engine.stdin.flush()
+    emitted = []
+    for line in engine.stdout:
+        if line.startswith("@TOK "):
+            emitted.append(int(line.split()[1]))
+            if len(emitted) == 128:
+                engine.stdin.write("STOP\n")
+                engine.stdin.flush()
+        elif line.startswith("@END "):
+            if line.split()[1] != "cancelled" or len(emitted) < 128:
+                raise RuntimeError(f"copy request failed to cancel: {line.rstrip()}")
+            break
+    else:
+        raise RuntimeError("engine exited during cancellation")
+    branch = prompt + emitted + control_ids[:4]
+    cached, reused = generate(engine, branch, 8)
+    clear_token = next(t for t in control_ids if t != branch[0])
+    generate(engine, [clear_token], 2)
+    cold, reused_cold = generate(engine, branch, 8)
+    if reused < len(prompt) or reused_cold or cached != cold:
+        raise RuntimeError(f"cancelled copy: reused {reused}, cold {reused_cold}, outputs {cached} vs {cold}")
+    print(f"cancelled after {len(emitted)} tokens; reused {reused}; 8/8 predictions match the cold replay", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--engine", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--tokens", required=True, type=Path, help="comma-separated IDs of a reference passage")
+    ap.add_argument("--cancel-request", type=Path, help="also interrupt the first long copy request in this file")
     args = ap.parse_args()
     ids = [int(s) for s in args.tokens.read_text().strip().split(",")]
     distinct = list(dict.fromkeys(ids))
@@ -52,8 +83,10 @@ def main():
             cold, reused_cold = generate(engine, branch, 16)
             if reused != depth or reused_cold != 0 or cached != cold:
                 raise RuntimeError(f"prefix {depth}: cached {reused}, cold cached {reused_cold}, "
-                                   f"outputs equal {cached == cold}")
+                                   f"predictions {cached} vs {cold}")
             print(f"{depth} cached tokens, 16/16 predictions match the cold replay", flush=True)
+        if args.cancel_request:
+            cancel_and_resume(engine, args.cancel_request.read_text().splitlines()[0], ids)
         engine.stdin.write("QUIT\n")
         engine.stdin.close()
         if engine.wait():
