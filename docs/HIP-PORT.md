@@ -73,6 +73,34 @@ radeon env IK2_KV=fp8-global python3 src/tools/ik2_bench.py --engine ./build-ik2
     --depths 32,512,2048,8192,32768 --gen 129 --repeats 3
 ```
 
+### Agreement with the CPU reference
+
+The engine and `ref/inkling2.py` read the same IQ4_NL weights and the [same 256 held-out token IDs](#held-out-distribution-fixture). We compared all 200,058 vocabulary entries at each position. The prefill used four 64-token chunks. A separate graph-decode run started at 224 input tokens and consumed the final 32 known tokens. The two sets of positions overlap.
+
+| KV precision | Prefill top-1 | Mean prefill KL | Prefill perplexity on 255 labels | Decode top-1 | Mean decode KL |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| E4M3 | 250/256 | 0.002041 | 3.96780 | 30/32 | 0.002114 |
+| FP16 sliding, E4M3 global | 252/256 | 0.001504 | 3.98305 | 30/32 | 0.002062 |
+| FP16 | 256/256 | 0.000825 | 3.97048 | 32/32 | 0.000813 |
+
+The CPU reference's perplexity was 3.96770 on those 255 labels. With FP16 throughout, a separate 8,321-position reservation measured 118.74 tok/s decode after 512 inputs and 108.38 after 8,192. Reserving 393,216 positions would roughly double the global KV memory relative to E4M3.
+
+```sh
+# Create heldout-teacher.{all,prompt,force} and heldout-teacher-ref.npy using the fixture command.
+for kv in fp8 fp8-global f16; do
+    radeon env IK2_KV="$kv" IK2_PREFILL_LOGITS_OUT="$kv-pp.f32" ./build-ik2/maya-ik2 \
+        --model /weight.gguf --ctx 1024 --chunk 64 --tokens @heldout-teacher.all --gen 0
+    radeon env IK2_KV="$kv" IK2_GRAPH=1 IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="$kv-tg.f32" \
+        ./build-ik2/maya-ik2 --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
+    oracle-env/bin/python src/tools/ik2_compare_decode.py "$kv-pp.f32" --ref heldout-teacher-ref.npy \
+        --tokens heldout-teacher.all --vocab 200058 --prefill --prompt-length 256
+    oracle-env/bin/python src/tools/ik2_compare_decode.py "$kv-tg.f32" --ref heldout-teacher-ref.npy \
+        --tokens heldout-teacher.all --vocab 200058 --gen 33 --prompt-length 224
+done
+radeon env IK2_KV=f16 python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 \
+    --model /weight.gguf --chunk 1024 --tokens water.force --depths 512,8192 --gen 129 --repeats 3
+```
+
 ## Build on Prometheus without a GPU
 
 The source tree is under `~/ai/build/maya-ik2-hip/src`. The build container mounts its parent at `/work`. The following commands reproduce the environment from a synced source tree. The llama.cpp archive is the source revision pinned by Maya's top-level CMake file.
