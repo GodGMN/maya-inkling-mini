@@ -276,3 +276,36 @@ python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.ggu
 The gfx1100 device suite checks WMMA against FP64 on partial tiles and padded outputs. The attention tests cover E4M3 and FP16, sink and relative bias, ring wraparound, causal masking and multi-token block verification. Run `IK2_EXPERT_TILE_LDS=1 ./build-ik2/ik2_kernels_test` with the environment above. Two output rows sharing each Q8 input load slowed decode at every measured depth, so the engine keeps one row per wave.
 
 For long-context retrieval, `tests/ik2_retrieval.py` places a seeded four-word phrase among GSM8K distractor questions at an exact prompt depth. The score records the final content channel, the number of cached tokens and the stop reason. To reproduce the midpoint test, pass `--tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl --depths 32768,131072,392960`. Feed stdout to a resident server with `--ctx 393216 --chunk 1024`, then run the same Python command with `--score SERVER.log`.
+
+### Copy and edit requests without a drafter
+
+Maya can propose a continuation from the request's own tokens and check it against the target model. On Prometheus, a 64-token verification window copied an 81-box inventory at **271.15 tok/s** and made a single requested edit at **196.72 tok/s**. Plain decoding produced the same two final answers at 105.23 and 106.21 tok/s. Each figure is one uncached greedy request with a 3,072-token output limit. Timing excludes prefill and the first token. The edit took 1,586 generated tokens with verification and 1,601 without it, including the model's reasoning. These examples measure repeated text.
+
+| Verification window | Verbatim copy | Single edit | Exact final answers |
+| ---: | ---: | ---: | ---: |
+| Off | 105.23 | 106.21 | 2/2 |
+| 8 | 183.02 | 177.24 | 2/2 |
+| 64 | 271.15 | 196.72 | 2/2 |
+
+Use the preceding cooperative prefill environment with `IK2_EXPERT_TILE_LDS=1`. The GGUF and tokenizer are the same ones used for the throughput runs.
+
+```sh
+oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer >copy.requests
+for window in 0 8 64; do
+    IK2_SUFFIX=$window ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf \
+        --ctx 4096 --chunk 512 <copy.requests >"copy-$window.log"
+    oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer --score "copy-$window.log"
+done
+```
+
+### Exact phrase retrieval at long context
+
+With `--ctx 393216 --chunk 1024`, the resident IQ4_NL engine returned the exact four-word phrase at 32,768 and 131,072 tokens, placed halfway through each uncached prompt. At 392,960 input tokens the engine finished prefill in 470.020 seconds and used all 200 generation tokens without reaching its final answer. That request scored incorrect. All 3,072 experts remained on the card.
+
+```sh
+oracle-env/bin/python src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
+    --depths 32768,131072,392960 >retrieval.requests
+./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 <retrieval.requests >retrieval.log
+oracle-env/bin/python src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
+    --depths 32768,131072,392960 --score retrieval.log
+```

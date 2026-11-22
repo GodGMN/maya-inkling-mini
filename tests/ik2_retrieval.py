@@ -17,14 +17,14 @@ FINAL = "<|message_model|><|content_text|>"
 STOP = "<|content_model_end_sampling|>"
 
 
-def requests(tok, depths, percent, corpus):
+def requests(tok, depths, percent, corpus, direct_answer=False):
     template = Environment().from_string((ROOT / "tools/ik2/chat_template.jinja").read_text())
     content = ("Read these archive notes.\n@FILL@\n"
                "What is the archive verification phrase? Reply with the exact phrase.")
     prefix, suffix = template.render(messages=[{"role": "user", "content": content}], tools=[],
                                      add_generation_prompt=True, reasoning_effort="none").split("@FILL@")
     left = tok.encode(prefix, parse_special=True)
-    right = tok.encode(suffix, parse_special=True)
+    right = tok.encode(suffix + (FINAL if direct_answer else ""), parse_special=True)
     filler = tok.encode(corpus)
     if not filler:
         raise ValueError("empty distractor corpus")
@@ -62,6 +62,8 @@ def main():
     ap.add_argument("--depths", default="32768,131072,392960")
     ap.add_argument("--percent", type=int, default=50)
     ap.add_argument("--max-tokens", type=int, default=200)
+    ap.add_argument("--direct-answer", action="store_true",
+                    help="prefill the final text channel as serve/server.py does for explicit reasoning_effort=none")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--score", type=Path, help="stdout of maya-ik2 --serve-ik2")
     mode.add_argument("--llama-url", help="run the same token IDs through llama.cpp /completion")
@@ -78,7 +80,7 @@ def main():
             recorded = list(responses(f))
         if len(recorded) != len(depths):
             raise ValueError(f"expected {len(depths)} complete responses, got {len(recorded)}")
-    for index, (expected, prompt) in enumerate(requests(tok, depths, args.percent, corpus)):
+    for index, (expected, prompt) in enumerate(requests(tok, depths, args.percent, corpus, args.direct_answer)):
         if args.llama_url:
             body = dict(prompt=prompt, n_predict=args.max_tokens, temperature=0, seed=1, return_tokens=True,
                         cache_prompt=False, stream=False)
@@ -99,8 +101,10 @@ def main():
         if seen != len(prompt):
             raise ValueError(f"engine processed {seen} out of {len(prompt)} prompt tokens")
         text = tok.decode(ids)
+        if args.direct_answer:
+            text = FINAL + text
         answer = text.rsplit(FINAL, 1)[1].split("<|end_message|>")[0].strip() if FINAL in text else ""
-        print(json.dumps(dict(prompt=seen, percent=args.percent, expected=expected, content=answer,
+        print(json.dumps(dict(prompt=seen, percent=args.percent, direct_answer=args.direct_answer, expected=expected, content=answer,
                               found=expected in answer.lower(), exact=answer.lower().rstrip(".") == expected,
                               cached=cached, finish=reason, generated=len(ids), prefill_s=pp, decode_s=tg)), flush=True)
     if not args.score and not args.llama_url:
