@@ -132,6 +132,23 @@ docker run --rm --name maya-ik2-api --memory 9g --memory-swap 9g --device /dev/k
     hyperion/maya-ik2:gfx1100-9a0f164
 ```
 
+For the 393,216-position benchmark configuration, create a copy of the preset on the host. From `~/ai/build/maya-ik2-hip`, run the following command. For the mixed-precision profile, also set `cfg["env"]["IK2_KV"] = "fp8-global"` before writing the file.
+
+```sh
+python3 - <<'PYCFG'
+import json
+from pathlib import Path
+
+cfg = json.loads(Path("src/docs/inkling2-mini/ik2-mini-gfx1100.json").read_text())
+args = cfg["args"]
+args[args.index("--max-context") + 1] = "393216"
+args[args.index("--chunk") + 1] = "1024"
+Path("ik2-393216.json").write_text(json.dumps(cfg, indent=2) + "\n")
+PYCFG
+```
+
+Add `--mount "type=bind,src=$PWD/ik2-393216.json,dst=/opt/maya/ik2-mini-gfx1100.json,readonly"` before the image name in the Docker command above.
+
 To rebuild the image from the build directory, run `sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer hyperion/maya-ik2:local`. The script stages the executable and tokenizer, uses Buildx resource limits of four CPUs and 6 GiB, and loads the resulting image into the local Docker daemon. Prometheus used Buildx v0.36.1.
 
 ## CUDA and HIP differences in the initial scalar port
