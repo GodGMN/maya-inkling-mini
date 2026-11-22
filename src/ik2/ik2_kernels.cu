@@ -3710,11 +3710,25 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
         const size_t page = paged ? kv_page_base(slot, g, KD / 128) : 0;
         const size_t head_off = paged ? page + (slot % 16) * 128 : (size_t)slot * KD + (size_t)g * 128;
         const float4 k4 = v_load4(kc + head_off, lane);
-        float a = q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
-        float l = wsum(a) * qk_scale;
-        if (dist < extent) {
-            const float b = (lane < d_rel) ? r_lane * __ldg(proj + (size_t) dist * d_rel + lane) : 0.0f;
-            l += wsum(b);
+        float l;
+#ifdef STRATA_USE_HIP
+        if constexpr (sizeof(KV) == 1) {
+            // In the scalar E4M3 path, one ulp in two competing large scores can dominate a small difference of values.
+            double a = (double)q4.x * k4.x + (double)q4.y * k4.y + (double)q4.z * k4.z + (double)q4.w * k4.w;
+            a *= qk_scale;
+            if (dist < extent && lane < d_rel) a += (double)r_lane * __ldg(proj + (size_t)dist * d_rel + lane);
+#pragma unroll
+            for (int delta = 16; delta; delta /= 2) a += __shfl_xor(a, delta, 32);
+            l = (float)a;
+        } else
+#endif
+        {
+            const float a = q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+            l = wsum(a) * qk_scale;
+            if (dist < extent) {
+                const float b = (lane < d_rel) ? r_lane * __ldg(proj + (size_t)dist * d_rel + lane) : 0.0f;
+                l += wsum(b);
+            }
         }
         if (l > -INFINITY) {
             float4 v4;

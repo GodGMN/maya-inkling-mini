@@ -222,8 +222,7 @@ void test_conv() {
     cudaFree(dx), cudaFree(dw), cudaFree(dd), cudaFree(dy);
 }
 
-void test_attn_res() {
-    const int T = 9, C = 4608;
+void test_attn_res(int T, int C) {
     for (int n : {1, 2, 9})
         for (int nq : {1, 3}) {
             std::vector<std::vector<float>> st(n);
@@ -259,7 +258,7 @@ void test_attn_res() {
                 }
             }
             char name[64];
-            std::snprintf(name, sizeof name, "attn_res %d states, %d queries", n, nq);
+            std::snprintf(name, sizeof name, "attn_res C=%d %d states, %d queries", C, n, nq);
             expect(name, host(dout, want.size()), want, 1e-4, 1e-6);
             for (auto* p : ds) cudaFree(p);
             cudaFree(dq), cudaFree(dout);
@@ -801,6 +800,34 @@ void test_experts_mv() {
 }
 
 #ifdef STRATA_USE_HIP
+void test_rdna3_equal_attention_scores() {
+    constexpr int D = 128, nk = 65;
+    std::vector<uint8_t> keys(nk * D), values(nk * D);
+    for (int d = 0; d < D; ++d) {
+        keys[d] = (13 * d + 23) % 126;
+        keys[(nk - 1) * D + d] = (13 * ((7 * d) % D) + 23) % 126;
+        values[d] = 0x78;
+        values[(nk - 1) * D + d] = 0xf8;
+    }
+    // A constant query gives both permutations the same dot product. Their opposite values cancel exactly.
+    auto* q = dev(std::vector<float>(D, 1.234567f));
+    auto* k0 = dev(keys);
+    auto* v = dev(values);
+    auto* zero = dev(std::vector<float>(16, 0.f));
+    auto* pos = dev(std::vector<int>{nk - 1});
+    auto* scratch = dev_n<float>(2 * 130);
+    auto* y = dev_n<float>(D);
+    const float scale = 1.f / std::sqrt(128.f) / 16.f;
+    const std::vector<double> expected(D, 0.);
+    k::attn_decode_fp8(q, zero, zero, k0, v, 0, 1, 1, D, 0, nk, nk - 1, scale, 1.f / 32.f,
+                       zero, 16, 0, nk, scratch, y, 0);
+    expect("equal E4M3 scores in separate splits", host(y, D), expected, 0., 5e-6);
+    k::attn_decode_fp8_at(q, zero, zero, k0, v, 0, 1, 1, pos, 2, scale, 1.f / 32.f,
+                          zero, 16, 0, nk, scratch, y, 0);
+    expect("equal resident E4M3 scores in separate splits", host(y, D), expected, 0., 5e-6);
+    cudaFree(q); cudaFree(k0); cudaFree(v); cudaFree(zero); cudaFree(pos); cudaFree(scratch); cudaFree(y);
+}
+
 void test_rdna3_attention_output_projection() {
     constexpr int rows = 37, width = 3072;
     std::mt19937 gen(193);
@@ -2462,15 +2489,23 @@ void test_fp8_kv() {
         }
         expect(unit_kv ? "attn_decode_fp8 P=128 unit (nk=16640)" : "attn_decode_fp8 P=128 raw (nk=16640)",
                host(one, want.size()), want, 2e-4, unit_kv ? 1e-6 : 5e-6);
+#ifdef STRATA_USE_HIP
+        int* position = dev(std::vector<int>{qpos});
+        k::attn_decode_fp8_at(dq, dr, ds, dk, dv, 0, H, KV, position, 128, scale * k_inv, v_inv,
+                              dp, d_rel, 1024, w, scratch, one, 0);
+        expect(unit_kv ? "resident E4M3 attention, unit values" : "resident E4M3 attention, full range",
+               host(one, want.size()), want, 2e-4, unit_kv ? 1e-6 : 5e-6);
+        cudaFree(position);
+#endif
         for (uint8_t* p : {dk, dv}) cudaFree(p);
         for (float* p : {dq, dr, ds, dp, scratch, one}) cudaFree(p);
     }
 }
 
 void test_round6() {
-    // 1. attn_res_rms_f16: C=4608 (vectorized float4/576-thread) and odd C=517 (scalar fallback), with optional w / y32
-    for (int C : {4608, 517}) {
-        const int T = 7, n = 9;
+    // Fused attention residuals with optional weights and both output formats.
+    for (int C : {4608, 517, 2304}) {
+        const int T = C == 2304 ? 1 : 7, n = 9;
         for (int nq : {1, 3}) {
             std::vector<std::vector<float>> st(n);
             k::ResStates rs{};
@@ -3187,7 +3222,8 @@ int main() {
     test_rms();
     test_l2clip();
     test_conv();
-    test_attn_res();
+    test_attn_res(9, 4608);
+    test_attn_res(1, 2304);
     test_attn_probs();
     test_route(384);
 #ifdef STRATA_USE_HIP
@@ -3201,6 +3237,7 @@ int main() {
     test_iq4nl_gate_cancellation();
     test_rdna3_loop_gate();
     test_rdna3_attention_output_projection();
+    test_rdna3_equal_attention_scores();
     test_rdna3_small_dense();
     test_rdna3_dense_gemm();
     test_rdna3_expert_groups();

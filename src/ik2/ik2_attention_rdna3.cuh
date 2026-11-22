@@ -223,6 +223,23 @@ __global__ void rdna3_decode_split(const float* q, const float* r, const KV* kc,
             for (int step = lanes / 2; step; step /= 2) b += __shfl_xor(b, step, lanes);
             score += b;
         }
+        if constexpr (sizeof(KV) == 1) {
+            // At magnitude 16 the FP32 score spacing reaches 2^-19. Refine these scores before softmax.
+            if (fabsf(score) >= 16.f) {
+                double precise = 0;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) precise += (double)keys[i] * query[i];
+                precise *= scale;
+                if (pos - key < extent) {
+                    const float* bias = proj + (size_t)(pos - key) * dr;
+                    for (int j = tid % lanes; j < dr; j += lanes)
+                        precise += (double)r[h * dr + j] * bias[j];
+                }
+#pragma unroll
+                for (int step = lanes / 2; step; step /= 2) precise += __shfl_xor(precise, step, lanes);
+                score = (float)precise;
+            }
+        }
         const float next = fmaxf(maximum, score);
         const float beta = expf(score - next), alpha = expf(maximum - next);
         sum = sum * alpha + beta;

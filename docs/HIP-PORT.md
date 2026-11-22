@@ -618,3 +618,20 @@ oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/token
 IK2_SUFFIX=512 python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
     --tokens water.force --chunk 512 --cancel-after 750 --cancel-request long-copy.requests
 ```
+
+### Precision of split E4M3 attention
+
+Two keys can have exactly equal dot products and opposite values. In a gfx1100 regression test, permuting the entries of one key changed its FP32 reduction order. The scalar and resident kernels returned −0.0000153 and −0.0000305 on a channel whose exact result is zero. The scalar E4M3 path now forms the score in FP64. The eight-lane resident kernel refines a score when its magnitude reaches 16, where FP32 spacing reaches 2⁻¹⁹. Both kernels returned zero on all 128 channels of the device regression. The separate 16,640-key stress case also passed at its original tolerance.
+
+On 32 forced held-out steps, mean full-vocabulary KL was 0.002114 and top-1 agreement was 30/32. Before the score change the figures were 0.002220 and 30/32. With Q8 output projection enabled, median decode after 8,192 tokens was 108.11 tok/s on the corrected build and 108.61 on the prior build. This run used the short-context reservation and three 256-step repetitions.
+
+```sh
+# Export the Radeon preset environment, including IK2_DECODE_SUBWAVE=1 and IK2_GATE_TILE=256.
+./build-ik2/ik2_kernels_test
+IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT=attention.f32 ./build-ik2/maya-ik2 \
+    --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
+oracle-env/bin/python src/tools/ik2_compare_decode.py attention.f32 --ref heldout-teacher-ref.npy \
+    --tokens heldout-teacher.all --vocab 200058 --gen 33 --prompt-length 224
+python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    --tokens water.force --depths 32,512,8192 --gen 257 --repeats 3 --chunk 2048
+```
