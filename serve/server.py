@@ -6343,9 +6343,11 @@ def make_handler(svc: Service):
                             rec["reasoning_effort"]
                 # Hy4-flash alone: its two levels (the page offers these and no others)
                 levels = svc.template.thinking_levels() if getattr(svc.template, "hy4", False) else None
+                cache_slots = getattr(svc.engine, "info", {}).get("cache_slots")
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
+                                 **({"cache_slots": cache_slots} if cache_slots is not None else {}),
                                  "max_text_file": text_file_limit(svc.engine.max_context),
                                  "model_label": svc.model_label,   # (the model first: "GLM-5.3-Flash · Maya-S24")
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key), "defaults": rec,

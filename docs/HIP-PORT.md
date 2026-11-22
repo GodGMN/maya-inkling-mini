@@ -72,7 +72,7 @@ CPU and HIP mtmd and the incumbent llama.cpp server all identified the three lef
 | Green/blue | 0.498 s | 0.166 s | 1.129 s |
 | Setup screenshot | 14.058 s | 0.820 s | 2.131 s |
 
-The resident HIP encoder used 984 MiB above its 36 MiB device baseline after warming up at 1,024 image tokens. With 1,024-token prefill chunks, the engine passed at 360,448 positions. It could not keep every expert resident at 376,832 or 393,216. A 512-token chunk also failed at 393,216. **The packaged GPU-vision profile uses 256-token chunks and keeps all 393,216 positions.** The card reported 23.65 GiB used after the image requests. The CPU profile keeps 1,024-token chunks and leaves the GPU to the language model.
+The resident HIP encoder used 984 MiB above its 36 MiB device baseline after warming up at 1,024 image tokens. With 1,024-token prefill chunks, the engine passed at 360,448 positions. It could not keep every expert resident at 376,832 or 393,216. A 512-token chunk also failed at 393,216. **The packaged GPU-vision profile uses 256-token chunks and keeps all 393,216 positions.** The card reported 23.64 GiB used after the image requests. The CPU profile keeps 1,024-token chunks and leaves the GPU to the language model.
 
 Build the encoder in the same CPU-only build container as the CPU version. ROCm's static host objects need PIC on this distribution. The original link failed with `R_X86_64_32 ... can not be used when making a PIE object`. The HIP target now builds with `-fPIC`.
 
@@ -276,17 +276,26 @@ curl -NsS http://127.0.0.1:18085/v1/chat/completions -H 'Content-Type: applicati
 
 ## Run the packaged image on Prometheus
 
-The local image contains the HIP engine, Python server, Radeon preset and tokenizer. It reads the IQ4_NL weights from a read-only mount. Run this on Prometheus when the card is available exclusively for Maya.
+The service image includes the gfx1100 engine, the GGUF tokenizer, the Python server and both image encoders. Its default profile runs the encoder on four CPU threads, reserves 393,216 context positions, and uses medium reasoning effort when the client omits it. The resident HIP encoder is available in `ik2-mini-gfx1100-hip-vision.json`. Mount the directory containing `Inkling-2-Mini-IQ4_NL.gguf` and `mmproj-F16.gguf`.
+
+Run from the Prometheus build directory to package the existing binaries. Buildx uses at most four CPUs and 6 GiB of RAM.
 
 ```sh
-MODEL="$HOME/ai/models/inkling-2-mini/Inkling-2-Mini-IQ4_NL.gguf"
-docker run --rm --name maya-ik2-api --memory 9g --memory-swap 9g --device /dev/kfd --device /dev/dri \
-    -p 127.0.0.1:18085:8080 \
-    --mount "type=bind,src=$MODEL,dst=/opt/maya/models/Inkling-2-Mini-IQ4_NL.gguf,readonly" \
-    hyperion/maya-ik2:gfx1100-27a63d9
+sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer \
+    hyperion/maya-ik2:gfx1100-service-r1 vision-cpu/bin/maya-vision vision-hip/bin/maya-vision
+docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 \
+    --entrypoint python3 hyperion/maya-ik2:gfx1100-service-r1 -m unittest serve.test_inkling2_frontend
 ```
 
-To rebuild the image from the build directory, run `sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer hyperion/maya-ik2:local`. The script stages the executable and tokenizer, uses Buildx resource limits of four CPUs and 6 GiB, and loads the resulting image into the local Docker daemon. Prometheus used Buildx v0.36.1. The packaged chat template, parser and server passed all 18 Inkling frontend tests. Run `docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 --entrypoint python3 hyperion/maya-ik2:gfx1100-08aad41 -m unittest serve.test_inkling2_frontend`.
+The service uses Compose project `inkling-2-mini` and service key `llama` so the existing Prometheus controller can manage it. Install [the Compose file](../docker/compose.ik2-gfx1100.yml) as `~/ai/services/inkling-2-mini/docker-compose.yml` and run these commands from that directory. The model mount is read-only. The memory and swap limits are both 10 GiB.
+
+```sh
+docker compose config -q
+docker compose up -d --no-deps --pull never llama
+curl -fsS http://127.0.0.1:8085/health
+```
+
+For multiple serial conversations set `IK2_CACHE_SLOTS=2`, `3` or `4` in the Compose project's `.env` before recreating the container. The total context is divided evenly. Use the default of one slot for a conversation that grows to 300K. To switch the encoder, set `MAYA_IK2_PRESET=ik2-mini-gfx1100-hip-vision.json` or choose `ik2-mini-gfx1100-text.json` for text only.
 
 ## CUDA and HIP differences in the initial scalar port
 

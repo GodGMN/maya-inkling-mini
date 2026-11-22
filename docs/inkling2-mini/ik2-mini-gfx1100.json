@@ -31,5 +31,6 @@
     "IK2_Q8_TILE": "1"
   },
   "tokenizer": "ik2/tokenizer",
+  "reasoning_effort": "medium",
   "model_name": "inkling-2-mini"
 }

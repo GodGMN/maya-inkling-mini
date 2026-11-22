@@ -1,0 +1,20 @@
+name: inkling-2-mini
+services:
+  llama:
+    image: hyperion/maya-ik2:gfx1100-service-r1
+    container_name: inkling-2-mini
+    restart: unless-stopped
+    mem_limit: 10g
+    memswap_limit: 10g
+    healthcheck:
+      start_period: 900s
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/kfd:/dev/kfd
+    environment:
+      IK2_CACHE_SLOTS: "${IK2_CACHE_SLOTS:-1}"
+    volumes:
+      - "${INKLING_MODEL_DIR:-../../models/inkling-2-mini}:/opt/maya/models:ro"
+    ports:
+      - "8085:8080"
+    command: ["--config", "${MAYA_IK2_PRESET:-ik2-mini-gfx1100.json}", "--host", "0.0.0.0", "--port", "8080"]
