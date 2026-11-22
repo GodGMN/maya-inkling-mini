@@ -3114,9 +3114,16 @@ bool resident_wmma_prefill(const Config& c, const Layer& ly, int T, Work& w) {
     k::rdna3_expert_groups(w.route_d, (const float*)(w.route_d + S), S, c.K, c.E, ly.tab_sc[0], ly.tab_sc[1],
                            ly.tab_sc[2], tiles, w.gidx, w.inv, w.sg, w.su, w.wtr, g_s);
     gather_f16_16_kernel<<<S, 256, 0, g_s>>>(w.x16, w.gidx, S, C, input);
-    k::rdna3_expert_gemm(ly.ty[0], ly.tab_blob, 0, tiles, input, C, 2 * F, w.gu32, g_s);
-    k::swiglu_cap_f32(w.gu32, S, F, w.sg, w.su, c.gate_cap, c.up_cap, input, g_s);
-    k::rdna3_expert_gemm(ly.ty[2], ly.tab_blob, ly.eb[0] + ly.eb[1], tiles, input, F, C, output, g_s);
+    static const bool fused = getenv("IK2_PREFILL_SWIGLU") && atoi(getenv("IK2_PREFILL_SWIGLU"));
+    uint16_t* hidden = input;
+    if (fused && tiles.rows == 64) {
+        hidden = reinterpret_cast<uint16_t*>(w.gu32);
+        k::rdna3_expert_swiglu(ly.ty[0], ly.tab_blob, tiles, input, C, F, w.sg, w.su, c.gate_cap, c.up_cap, hidden, g_s);
+    } else {
+        k::rdna3_expert_gemm(ly.ty[0], ly.tab_blob, 0, tiles, input, C, 2 * F, w.gu32, g_s);
+        k::swiglu_cap_f32(w.gu32, S, F, w.sg, w.su, c.gate_cap, c.up_cap, input, g_s);
+    }
+    k::rdna3_expert_gemm(ly.ty[2], ly.tab_blob, ly.eb[0] + ly.eb[1], tiles, hidden, F, C, output, g_s);
     combine_prefill_groups<<<T, 256, 0, g_s>>>(output, w.inv, w.wtr, C, c.K, w.tmp);
     return true;
 }

@@ -153,10 +153,16 @@ __global__ void expert_wmma_gemm(const uint8_t* const* experts, size_t offset, c
 
 // A workgroup computes 64 tokens by 64 output channels. Each wave owns a 32x32 quadrant.
 // The extra eight halfs in each LDS row shift consecutive rows to different banks.
-template <int Type, int Depth>
+struct ExpertActivation {
+    const float *gate_scale, *up_scale;
+    float gate_cap, up_cap;
+    uint16_t* hidden;
+};
+
+template <int Type, int Depth, bool Activate = false>
 __global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts, size_t offset, const ExpertTile* tiles,
                            const uint16_t* input, int N, int K, int T, float* output, int ld,
-                           const int8_t* planar = nullptr, const uint16_t* scales = nullptr) {
+                           const int8_t* planar = nullptr, const uint16_t* scales = nullptr, ExpertActivation activation = {}) {
     constexpr int vectors = Depth / 8, pitch = vectors + 1;
     __shared__ uint4 a[64][pitch], b[64][pitch];
     const int tid = threadIdx.x, lane = tid & 31, l = lane & 15, wave = tid / 32;
@@ -169,7 +175,7 @@ __global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts,
         T = tile.end;
         quant = experts[tile.expert] + offset;
     }
-    const int col0 = blockIdx.x * 64;
+    const int col0 = blockIdx.x * (Activate ? 32 : 64);
     const int m0 = (wave / 2) * 32, n0 = (wave % 2) * 32;
     Float8 accum[2][2] = {};
     for (int k0 = 0; k0 < K; k0 += Depth) {
@@ -192,8 +198,10 @@ __global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts,
             for (int f = tid; f < 64 * (Depth / 16); f += 128) {
                 const int row = f / (Depth / 16), frag = f % (Depth / 16);
                 Half16 bv = {};
-                if (col0 + row < N) {
-                    const size_t base = (size_t)(col0 + row) * K + k0 + frag * 16;
+                const int channel = col0 + (Activate ? (row / 32) * 16 + row % 16 : row);
+                if (channel < N) {
+                    const int weight_row = channel + (Activate && (row & 16) ? N : 0);
+                    const size_t base = (size_t)weight_row * K + k0 + frag * 16;
                     if constexpr (Type == kPlanarQ8) {
                         const _Float16 scale = __builtin_bit_cast(_Float16, scales[base / 32]);
                         bv = planar_fragment(planar + base, scale);
@@ -222,27 +230,40 @@ __global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts,
         __syncthreads();
     }
 #pragma unroll
-    for (int m = 0; m < 2; ++m)
+    for (int m = 0; m < 2; ++m) {
 #pragma unroll
-        for (int n = 0; n < 2; ++n) {
-            const int col = col0 + n0 + n * 16 + l;
+        for (int i = 0; i < 8; ++i) {
+            const int row = row0 + m0 + m * 16 + 2 * i + (lane >> 4);
+            if (row >= T) continue;
+            if constexpr (Activate) {
+                const int col = col0 + (wave % 2) * 16 + l;
+                if (col < N) {
+                    const float g = accum[m][0][i] * activation.gate_scale[row];
+                    const float u = accum[m][1][i] * activation.up_scale[row];
+                    const float value = activation.gate_cap * tanhf(g / activation.gate_cap) * (1.f / (1.f + expf(-g))) *
+                                        activation.up_cap * tanhf(u / activation.up_cap);
+                    activation.hidden[(size_t)row * N + col] = __builtin_bit_cast(uint16_t, (_Float16)value);
+                }
+            } else {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int row = row0 + m0 + m * 16 + 2 * i + (lane >> 4);
-                if (row < T && col < N) output[(size_t)row * ld + col] = accum[m][n][i];
+                for (int n = 0; n < 2; ++n) {
+                    const int col = col0 + n0 + n * 16 + l;
+                    if (col < N) output[(size_t)row * ld + col] = accum[m][n][i];
+                }
             }
         }
+    }
 }
 
-template <int Type>
+template <int Type, bool Activate = false>
 void launch_tiled(dim3 grid, const uint16_t* dense, const uint8_t* const* experts, size_t offset,
                   const ExpertTile* tiles, const uint16_t* x, int N, int K, int T, float* y, int ld,
-                  cudaStream_t stream, const int8_t* planar = nullptr, const uint16_t* scales = nullptr) {
+                  cudaStream_t stream, const int8_t* planar = nullptr, const uint16_t* scales = nullptr, ExpertActivation activation = {}) {
     static const bool wide = getenv("IK2_WMMA_K") && atoi(getenv("IK2_WMMA_K")) == 64;
     if (wide && K % 64 == 0)
-        tiled_gemm<Type, 64><<<grid, 128, 0, stream>>>(dense, experts, offset, tiles, x, N, K, T, y, ld, planar, scales);
+        tiled_gemm<Type, 64, Activate><<<grid, 128, 0, stream>>>(dense, experts, offset, tiles, x, N, K, T, y, ld, planar, scales, activation);
     else
-        tiled_gemm<Type, 32><<<grid, 128, 0, stream>>>(dense, experts, offset, tiles, x, N, K, T, y, ld, planar, scales);
+        tiled_gemm<Type, 32, Activate><<<grid, 128, 0, stream>>>(dense, experts, offset, tiles, x, N, K, T, y, ld, planar, scales, activation);
 }
 
 __global__ void dense_q8_wmma(const int8_t* weights, const uint16_t* scales, int N, int K,
@@ -325,5 +346,20 @@ void rdna3_expert_gemm(int type, const uint8_t* const* experts, size_t offset, E
         std::fprintf(stderr, "rdna3_expert_gemm: unsupported expert type %d\n", type);
         std::abort();
     }
+}
+void rdna3_expert_swiglu(int type, const uint8_t* const* experts, ExpertTiles tiles, const uint16_t* input,
+                         int K, int F, const float* sg, const float* su, float gate_cap, float up_cap,
+                         uint16_t* hidden, cudaStream_t stream) {
+    const dim3 grid((F + 31) / 32, tiles.capacity);
+    const ExpertActivation act{sg, su, gate_cap, up_cap, hidden};
+    if (type == kIQ4_NL)
+        launch_tiled<kIQ4_NL, true>(grid, nullptr, experts, 0, tiles.data, input, F, K, 0, nullptr, 0, stream, nullptr, nullptr, act);
+    else if (type == kQ8_0)
+        launch_tiled<kQ8_0, true>(grid, nullptr, experts, 0, tiles.data, input, F, K, 0, nullptr, 0, stream, nullptr, nullptr, act);
+    else {
+        std::fprintf(stderr, "rdna3_expert_swiglu: unsupported expert type %d\n", type);
+        std::abort();
+    }
+    check_launch("rdna3_expert_swiglu");
 }
 }  // namespace ik2::k

@@ -452,6 +452,10 @@ void rdna3_expert_groups(const int* top, const float* weights, int slots, int K,
 /// Sorted half inputs and resident GGUF matrices [N, K] to float outputs. K % 32 == N % 16 == 0.
 void rdna3_expert_gemm(int type, const uint8_t* const* experts, size_t offset, ExpertTiles tiles,
                        const uint16_t* input, int K, int N, float* output, cudaStream_t stream);
+/// Tile gate and up projections together, apply per-row scales and write the capped FP16 activation.
+void rdna3_expert_swiglu(int type, const uint8_t* const* experts, ExpertTiles tiles, const uint16_t* input,
+                         int K, int F, const float* sg, const float* su, float gate_cap, float up_cap,
+                         uint16_t* hidden, cudaStream_t stream);
 #endif
 /// values a block / bytes a block (0: not one of the above).
 int block_values(int type);

@@ -523,3 +523,28 @@ docker run --rm --memory 1g --memory-swap 1g --cpus 1 \
 docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{json .Config.Cmd}}' inkling-2-mini
 docker logs inkling-2-mini 2>&1 | grep 'erasing old context checkpoint' | tail -1
 ```
+
+### Fused expert activation in prefill
+
+An 8,192-token natural prompt spent 809 ms of GPU work in IQ4_NL expert products and 44 ms in the separate SwiGLU kernel. With `IK2_PREFILL_SWIGLU=1`, a wave computes adjacent gate and up tiles and writes the scaled, capped FP16 activation. The device tests compare each stored half to the separate kernels and to an FP64 calculation for IQ4_NL and Q8_0. Across all 256 positions and 200,058 vocabulary entries of the held-out fixture, the fused and separate paths produced identical FP32 logits.
+
+| Input tokens | Separate prefill, tok/s | Fused prefill, tok/s |
+| ---: | ---: | ---: |
+| 2,048 | 3,419 | 3,501 |
+| 8,192 | 3,674 | 3,732 |
+| 32,768 | 3,167 | 3,214 |
+
+The table uses three uncached requests per depth, `--chunk 2048` and the installed IQ4_NL GGUF. At 512 tokens the fused run took 1.660, 0.294 and 0.210 seconds. The separate run took 1.664, 0.213 and 0.213 seconds.
+
+```sh
+# Export the cooperative prefill environment, IK2_DECODE_PROJ=1 and IK2_GATE_TILE=256.
+export IK2_WMMA_K=32
+for flag in 0 1; do
+    IK2_PREFILL_SWIGLU=$flag IK2_PREFILL_LOGITS_OUT="swiglu-$flag.f32" ./build-ik2/maya-ik2 \
+        --model /weight.gguf --ctx 1024 --chunk 64 --tokens @heldout-teacher.all --gen 0
+    IK2_PREFILL_SWIGLU=$flag python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+        --tokens water.force --depths 512,2048,8192,32768 --gen 129 --repeats 3 --chunk 2048
+done
+cmp swiglu-0.f32 swiglu-1.f32
+for k in 32 64; do IK2_WMMA_K=$k IK2_PREFILL_SWIGLU=1 ./build-ik2/ik2_kernels_test; done
+```

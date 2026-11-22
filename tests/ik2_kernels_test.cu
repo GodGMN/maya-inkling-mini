@@ -2919,6 +2919,7 @@ void test_rdna3_expert_gemm() {
         std::vector<const uint8_t*> blob(E);
         for (int e = 0; e < E; ++e) blob[e] = weights + 2 * e * matrix_bytes;
         auto** db = dev(blob);
+        std::vector<double> products[2];
         for (int matrix = 0; matrix < 2; ++matrix) {
             const size_t offset = matrix * matrix_bytes;
             std::vector<double> expected(T * N);
@@ -2942,7 +2943,40 @@ void test_rdna3_expert_gemm() {
                        host(dy, T * N), expected, 1e-4, 1e-3);
                 cudaFree(dt);
             }
+            products[matrix] = std::move(expected);
         }
+        std::vector<float> sg(T), su(T);
+        std::vector<double> expected(T * N);
+        for (int t = 0; t < T; ++t) {
+            sg[t] = ((t % 13) - 6) * 0.0125f;
+            su[t] = ((t % 9) - 4) * 0.015625f;
+            for (int n = 0; n < N; ++n) {
+                const int i = t * N + n;
+                const double g = products[0][i] * sg[t], u = products[1][i] * su[t];
+                expected[i] = 12. * std::tanh(g / 12.) / (1. + std::exp(-g)) * 19. * std::tanh(u / 19.);
+            }
+        }
+        std::vector<k::ExpertTile> ranges;
+        for (int e = 0; e < E; ++e)
+            for (int row = starts[e]; row < starts[e + 1]; row += 64)
+                ranges.push_back({e, row, std::min(row + 64, starts[e + 1])});
+        ranges.push_back({0, 0, 0});
+        auto* dt = dev(ranges);
+        const k::ExpertTiles tiles{dt, (int)ranges.size(), 64};
+        auto* dsg = dev(sg);
+        auto* dsu = dev(su);
+        auto* tmp = dev_n<float>(T * 2 * N);
+        auto* split = dev_n<uint16_t>(T * N);
+        auto* fused = dev_n<uint16_t>(T * N);
+        k::rdna3_expert_gemm(type, db, 0, tiles, dx, K, 2 * N, tmp, 0);
+        k::swiglu_cap_f32(tmp, T, N, dsg, dsu, 12.f, 19.f, split, 0);
+        k::rdna3_expert_swiglu(type, db, tiles, dx, K, N, dsg, dsu, 12.f, 19.f, fused, 0);
+        auto result = host(fused, T * N);
+        expect_true("WMMA fused expert SwiGLU matches separate projections and activation", result == host(split, T * N));
+        std::vector<float> floats(result.size());
+        std::transform(result.begin(), result.end(), floats.begin(), h2f_host);
+        expect("WMMA fused expert SwiGLU vs FP64", floats, expected, 5e-4, 2e-4);
+        cudaFree(dt); cudaFree(dsg); cudaFree(dsu); cudaFree(tmp); cudaFree(split); cudaFree(fused);
         cudaFree(db);
         cudaFree(weights);
     }
