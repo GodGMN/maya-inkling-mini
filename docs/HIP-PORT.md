@@ -735,3 +735,15 @@ for pair in (0, 1):
         print(pair, n, 1000 * median(times), "ms")
 PY
 ```
+
+For single-token WMMA, the E2M1 lookup now constructs the four FP16 values directly from their high bytes. Sixteen waves split the gate/up dot products, and four split each down projection. At model width, all 1,152 activated gate/up outputs and 2,304 down outputs passed the FP64 check with the same tolerances as the smaller case. The device suite passed at both K depths and with register tiles.
+
+With eight of 128 generated experts active and width 2,304, the median gate/up kernel time fell from 60.455 to 42.411 microseconds. The down projection went from 25.720 to 27.730 microseconds. Scalar gate/up and down measured 37.715 and 23.225 microseconds on the new binary. These are device-event times across 96 expert selections per repetition. They exclude routing and input conversion. The scalar default still wins for single-token NVFP4 on this fixture.
+
+```sh
+# From /work in the CPU build container. For the earlier comparison, link the same tool against the previous library.
+hipcc --offload-arch=gfx1100 -O3 -DSTRATA_USE_HIP=1 -Isrc/include/strata/hip_compat -Isrc/src/ik2 \
+    src/tools/ik2_nv_bench.hip -x none build-ik2/libik2_kernels.a -o ik2-nv-bench
+# In the GPU container.
+IK2_EXPERT_MMA=1 ./ik2-nv-bench
+```

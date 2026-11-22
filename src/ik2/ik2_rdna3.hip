@@ -58,11 +58,13 @@ __device__ _Float16 nv_scale(uint8_t x) {
     return x == 0x7f ? (_Float16)0 : __builtin_bit_cast(_Float16, uint16_t(((e + 7) << 10) | (m << 7)));
 }
 
-__device__ uint32_t nv_values(uint32_t codes) {
-    const uint32_t p = codes & 0x07070707u;
-    const uint32_t positive = __builtin_amdgcn_perm(0x0c080604u, 0x03020100u, p);
-    const uint32_t negative = __builtin_amdgcn_perm(0xf4f8fafcu, 0xfdfeff00u, p);
-    return __builtin_amdgcn_perm(negative, positive, ((codes >> 1) & 0x04040404u) | 0x03020100u);
+// Each E2M1 value times two fits in the high byte of an IEEE half. nv_scale supplies the other factor of 1/2.
+__device__ __forceinline__ uint2 nv_four_halves(uint32_t codes, _Float16 scale) {
+    const uint32_t magnitude = __builtin_amdgcn_perm(0x4a484644u, 0x42403c00u, codes & 0x07070707u);
+    const uint32_t high = magnitude | ((codes & 0x08080808u) << 4);
+    const Half2 lo = __builtin_bit_cast(Half2, __builtin_amdgcn_perm(0u, high, 0x01040004u));
+    const Half2 hi = __builtin_bit_cast(Half2, __builtin_amdgcn_perm(0u, high, 0x03040204u));
+    return make_uint2(__builtin_bit_cast(uint32_t, lo * scale), __builtin_bit_cast(uint32_t, hi * scale));
 }
 
 template <int Type>
@@ -85,7 +87,10 @@ __device__ Half16 expert_fragment(const uint8_t* blocks, size_t first) {
         uint32_t packed;
         if constexpr (Type == kNVFP4) {
             __builtin_memcpy(&packed, block + 4 + sub * 8 + (i % 2) * 4, 4);
-            packed = nv_values(packed >> ((i / 2) * 4));
+            const uint2 values = nv_four_halves(packed >> ((i / 2) * 4), scale);
+            out[i * 2] = values.x;
+            out[i * 2 + 1] = values.y;
+            continue;
         } else if constexpr (Type == kIQ4_NL) {
             __builtin_memcpy(&packed, block + 2 + i * 4, 4);
             packed = iq4_values(packed >> (sub * 4));
@@ -106,28 +111,26 @@ __device__ __forceinline__ Float8 matrix_product(Half16 a, Half16 b, Float8 sum)
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, sum);
 }
 
-// Sixteen output channels share one input. Two WMMA rows carry the high and low
-// FP16 limbs of that input. Four waves accumulate disjoint 64-weight blocks.
+template <bool Gate> constexpr int nv_token_waves = Gate ? 16 : 4;
+
+// Sixteen output channels share one input. Two WMMA rows carry its high and low FP16 limbs.
 template <bool Gate>
 __global__ void nv_token_wmma(const uint8_t* const* experts, size_t offset, const uint16_t* input,
                               int K, int N, const float* sg, const float* su, float gate_cap,
                               float up_cap, uint16_t* hidden, float* output) {
-    constexpr int splits = 4;
+    constexpr int splits = nv_token_waves<Gate>;
     __shared__ float partial[splits][Gate ? 2 : 1][16];
     const int lane = threadIdx.x & 31, col = lane & 15, split = threadIdx.x / 32;
     const int slot = blockIdx.y, row = blockIdx.x * 16 + col;
     const uint8_t* w = experts[slot] + expert_byte_offset<kNVFP4>((size_t)row * K) + (Gate ? 0 : offset);
     const uint16_t* x = input + (Gate ? (lane & 1) * K : (size_t)slot * K);
     Float8 first = {}, second = {};
-    for (int block = split * 64; block < K; block += splits * 64) {
-#pragma unroll
-        for (int j = 0; j < 64; j += 16) {
-            Half16 a;
-            __builtin_memcpy(&a, x + block + j, sizeof(a));
-            first = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, expert_fragment<kNVFP4>(w, block + j), first);
-            if constexpr (Gate)
-                second = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, expert_fragment<kNVFP4>(w + offset, block + j), second);
-        }
+    for (int k = split * 16; k < K; k += splits * 16) {
+        Half16 a;
+        __builtin_memcpy(&a, x + k, sizeof(a));
+        first = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, expert_fragment<kNVFP4>(w, k), first);
+        if constexpr (Gate)
+            second = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, expert_fragment<kNVFP4>(w + offset, k), second);
     }
     if constexpr (Gate) {
         const float g = first[0] + __shfl_xor(first[0], 16);
@@ -397,14 +400,14 @@ void experts_gate_up_swiglu_mma(const uint8_t* const* blob, int slots, size_t of
                                 int C, int F, const float* sg, const float* su, float gate_cap, float up_cap,
                                 uint16_t* hidden, cudaStream_t stream) {
     if (slots <= 0) return;
-    nv_token_wmma<true><<<dim3(F / 16, slots), 128, 0, stream>>>(blob, offset, x, C, F, sg, su, gate_cap, up_cap, hidden, nullptr);
+    nv_token_wmma<true><<<dim3(F / 16, slots), 32 * nv_token_waves<true>, 0, stream>>>(blob, offset, x, C, F, sg, su, gate_cap, up_cap, hidden, nullptr);
     check_launch("nv_token_wmma_gate_up");
 }
 
 void experts_down_mma(const uint8_t* const* blob, int slots, size_t offset, const uint16_t* hidden,
                       int C, int F, float* output, cudaStream_t stream) {
     if (slots <= 0) return;
-    nv_token_wmma<false><<<dim3(C / 16, slots), 128, 0, stream>>>(blob, offset, hidden, F, C, nullptr, nullptr, 0.f, 0.f, nullptr, output);
+    nv_token_wmma<false><<<dim3(C / 16, slots), 32 * nv_token_waves<false>, 0, stream>>>(blob, offset, hidden, F, C, nullptr, nullptr, 0.f, 0.f, nullptr, output);
     check_launch("nv_token_wmma_down");
 }
 

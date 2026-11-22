@@ -3171,13 +3171,18 @@ void test_expert_limbs() {
 
 // One token's NVFP4 experts through the tensor cores against the scalar kernels over the same blocks (every scale
 // byte, the subnormal ones and 0x7F with them): gate | up with the input as two FP16 limbs, down over the FP16 h.
-void test_experts_mma() {
-    constexpr int C = 256, F = 128, S = 5;
+void test_experts_mma(int C, int F, int S) {
     const int ty = k::kNVFP4;
     const size_t matrix_bytes = (size_t) C * F / k::block_values(ty) * k::block_bytes(ty);
     auto pool = rand_blocks(ty, (size_t) S * 3 * C * F);
-    for (size_t off = 0, i = 0; off < pool.size(); off += 36, ++i)   // a scale of each kind somewhere
-        if (i % 7 == 0) pool[off + i % 4] = (uint8_t) (i % 13 == 0 ? 0x7F : i % 8);
+    for (size_t off = 0, i = 0; off < pool.size(); off += 36, ++i) {
+        if (C == 2304) {
+            // Exercise repeated K splits at model width with scales spanning 1/8 through 1.
+            for (size_t j = 0; j < 4; ++j) pool[off + j] = uint8_t(32 + (pool[off + j] % 25));
+        } else if (i % 7 == 0) {
+            pool[off + i % 4] = uint8_t(i % 13 == 0 ? 0x7F : i % 8);
+        }
+    }
     auto* device_pool = dev(pool);
     std::vector<const uint8_t*> ptrs;
     for (int j = 0; j < S; ++j) ptrs.push_back(device_pool + 3 * j * matrix_bytes);
@@ -3312,8 +3317,11 @@ int main() {
     test_cand_topk();
     test_token_path();
     test_expert_limbs();
-    test_experts_mma();
+    test_experts_mma(256, 128, 5);
     test_q8_verify_tile();
+#ifdef STRATA_USE_HIP
+    test_experts_mma(2304, 1152, 1);
+#endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
