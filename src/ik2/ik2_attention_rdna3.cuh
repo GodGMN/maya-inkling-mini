@@ -108,33 +108,50 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
             __syncthreads();
         }
         float new_max = m;
+        // A whole tile before the relative extent and inside the window needs only the scaled QK score.
+        const int first_query = pos0 + token(0), last_query = pos0 + token(max(0, queries - 1));
+        if (key + 15 <= first_query - extent && last_query - key < window) {
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int distance = pos0 + query_l - (key + 2 * i + hi);
-            float v = -INFINITY;
-            if (l < queries && distance >= 0 && distance < window) {
-                v = dot[i] * qscale;
-                if (distance < extent) {
-                    if constexpr (Prefill) v += bias[query_row * extent + distance];
-                    else for (int j = 0; j < dr; ++j) v += r[(size_t)query_l * r_ld + head_l * dr + j] * proj[distance * dr + j];
-                }
+            for (int i = 0; i < 8; ++i) {
+                dot[i] *= qscale;
+                new_max = fmaxf(new_max, dot[i]);
             }
-            dot[i] = v;
-            new_max = fmaxf(new_max, v);
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int distance = pos0 + query_l - (key + 2 * i + hi);
+                float v = -INFINITY;
+                if (l < queries && distance >= 0 && distance < window) {
+                    v = dot[i] * qscale;
+                    if (distance < extent) {
+                        if constexpr (Prefill) v += bias[query_row * extent + distance];
+                        else for (int j = 0; j < dr; ++j) v += r[(size_t)query_l * r_ld + head_l * dr + j] * proj[distance * dr + j];
+                    }
+                }
+                dot[i] = v;
+                new_max = fmaxf(new_max, v);
+            }
         }
         new_max = fmaxf(new_max, __shfl_xor(new_max, 16, 32));
-        const float rescale = m == -INFINITY ? 0.0f : expf(m - new_max);
-        sum *= rescale;
+        if (__any(new_max != m)) {
+            const float rescale = m == -INFINITY ? 0.f : expf(m - new_max);
+            sum *= rescale;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float factor = __shfl(rescale, 2 * i + hi, 32);
+#pragma unroll
+                for (int d = 0; d < 8; ++d) out[d][i] *= factor;
+            }
+        }
         m = new_max;
         AttnHalf16 prob;
-        float row_scale[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const float v = dot[i] == -INFINITY ? 0.0f : expf(dot[i] - m);
+            const float v = dot[i] == -INFINITY ? 0.f : expf(dot[i] - m);
             sum += v;
-            prob[2 * i] = (_Float16)__shfl(v, l, 32);
-            prob[2 * i + 1] = (_Float16)__shfl(v, l + 16, 32);
-            row_scale[i] = __shfl(rescale, 2 * i + hi, 32);
+            const float peer = __shfl_xor(v, 16, 32);
+            prob[2 * i] = (_Float16)(hi ? peer : v);
+            prob[2 * i + 1] = (_Float16)(hi ? v : peer);
         }
 #pragma unroll
         for (int d = 0; d < 8; ++d) {
@@ -149,8 +166,6 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
 #pragma unroll
                 for (int t = 0; t < 16; ++t) value[t] = values[t][16 * d + l];
             } else value = columns[16 * d + l];
-#pragma unroll
-            for (int i = 0; i < 8; ++i) out[d][i] *= row_scale[i];
             out[d] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(prob, value, out[d]);
         }
         if constexpr (!Paged || StageKV) __syncthreads();
