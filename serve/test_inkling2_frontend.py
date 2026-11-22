@@ -73,10 +73,10 @@ class Scripted:
             yield t
 
 
-def service(*scripts):
+def service(*scripts, model_name="inkling-2-small"):
     tok = InkTok()
     eng = Scripted(tok, *scripts)
-    return Service(eng, tok, public()), eng, tok
+    return Service(eng, tok, public(), model_name=model_name), eng, tok
 
 
 def answer(svc, req):
@@ -227,12 +227,14 @@ class Serving(unittest.TestCase):
         self.assertEqual(got["calls"], [("get_weather", {"city": "Rome"})])
 
     def test_pictures_are_refused_in_plain_words(self):
-        svc, eng, _ = service("x")
-        msgs, tools, kw = openai_to_messages({"messages": [PICTURE]})
-        with self.assertRaises(ValueError) as e:
-            svc.prepare(msgs, tools, kw, 100)
-        self.assertIn("Inkling-2-Small on maya-ik2 reads text only", str(e.exception))
-        self.assertEqual(eng.prompts, [])
+        for name in ("inkling-2-small", "inkling-2-mini"):
+            with self.subTest(name=name):
+                svc, eng, _ = service("x", model_name=name)
+                msgs, tools, kw = openai_to_messages({"messages": [PICTURE]})
+                with self.assertRaises(ValueError) as e:
+                    svc.prepare(msgs, tools, kw, 100)
+                self.assertIn(f"{name} on maya-ik2 reads text only", str(e.exception))
+                self.assertEqual(eng.prompts, [])
 
     def test_logprobs_and_bias_are_refused(self):   # (an engine whose INFO names neither)
         svc, _, _ = service("x")
