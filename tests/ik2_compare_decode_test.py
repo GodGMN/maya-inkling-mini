@@ -11,6 +11,17 @@ SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "tools/ik2_compare_decode
 
 
 class DecodeComparison(unittest.TestCase):
+    def test_whole_prompt_includes_its_first_prediction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            raw, ref = root / "prompt.f32", root / "ref.npy"
+            np.log([[.1, .9], [.7, .3]]).astype("<f4").tofile(raw)
+            np.save(ref, np.log([[.9, .1], [.7, .3]]))
+            result = subprocess.check_output([sys.executable, str(SCRIPT), str(raw), "--ref", str(ref),
+                                              "--prefill", "--prompt-length", "2", "--vocab", "2"], text=True)
+            self.assertIn("top-1 1/2", result)
+            self.assertIn("input position 0 ", result)
+
     def test_forced_history(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
