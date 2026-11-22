@@ -314,6 +314,28 @@ for window in 0 8 64; do
 done
 ```
 
+The direct-answer HTTP template prefills the final content channel. With that same prompt ending, the Python task renames one function in `tests/ik2_compare_decode_test.py` and asks for the complete file. The inventory tasks use the same text as above. The table gives median decode tok/s over three uncached runs. Every final response matched the expected string, and every setting generated the same number of tokens for each task.
+
+| Verification window | Inventory copy, 582 tokens | Inventory edit, 583 tokens | Python rename, 886 tokens |
+| ---: | ---: | ---: | ---: |
+| Off | 108.40 | 108.36 | 107.83 |
+| 64 | 523.42 | 412.18 | 409.91 |
+| 128 | 750.65 | 482.59 | 445.84 |
+
+```sh
+# Use the preceding cooperative prefill environment with IK2_EXPERT_TILE_LDS=1.
+for task in inventory python; do
+    for window in 0 64 128; do
+        oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
+            --direct-answer --workload "$task" --repeats 3 >"copy-$task.requests"
+        IK2_SUFFIX=$window ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf \
+            --ctx 8192 --chunk 512 <"copy-$task.requests" >"copy-$task-$window.log"
+        oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
+            --direct-answer --workload "$task" --repeats 3 --score "copy-$task-$window.log"
+    done
+done
+```
+
 ### Exact phrase retrieval at long context
 
 In the run before the host input copy fix, with `--ctx 393216 --chunk 1024`, the resident IQ4_NL engine returned the exact four-word phrase at 32,768 and 131,072 tokens, placed halfway through each uncached prompt. At 392,960 input tokens the engine finished prefill in 470.020 seconds and used all 200 generation tokens without reaching its final answer. That request scored incorrect. All 3,072 experts remained on the card.
