@@ -10,7 +10,7 @@ Both Prometheus engines load the same `Inkling-2-Mini-IQ4_NL.gguf` text weights.
 
 ## Live service on Prometheus
 
-On 2026-11-22, `hyperion/maya-ik2:gfx1100-service-r1` replaced `hyperion/llama.cpp:server-rocm-inkling-1427-r2` on port 8085. The deployed image ID is `sha256:9f2df85e9fde0a5d4450c7f4cb87e4247bdb651d63ba5c4168d754dec9ed89d9`. Its native engine SHA-256 is `81cbe5f004ff5c0e64db8ead4fe13f1a7f410acbe26f5d01bdf6b33d9aa959b3`. Compose kept the controller's service name, port, device access, restart policy and 10 GiB memory and swap limits. The live health response reported one slot, 393,216 positions, images enabled and medium default reasoning effort.
+On 2026-11-22, `hyperion/maya-ik2:gfx1100-service-r1` replaced `hyperion/llama.cpp:server-rocm-inkling-1427-r2` on port 8085. The first Maya image ID was `sha256:9f2df85e9fde0a5d4450c7f4cb87e4247bdb651d63ba5c4168d754dec9ed89d9`. Its native engine SHA-256 is `81cbe5f004ff5c0e64db8ead4fe13f1a7f410acbe26f5d01bdf6b33d9aa959b3`. Compose kept the controller's service name, port, device access, restart policy and 10 GiB memory and swap limits. The live health response reported one slot, 393,216 positions, images enabled and medium default reasoning effort.
 
 The deployed image passed all 19 Inkling frontend tests. On the live port all four tool conversations returned Larch's VX-731 and Birch's PK-284, and all four image answers matched the incumbent. The CPU-encoded screenshot request took 13.965 seconds. The incumbent had its own 8,192-token reasoning budget. Maya's Inkling backend accepts a reasoning effort and a total output limit. Its separate thinking-budget endpoint reports `supported: false`.
 
@@ -407,15 +407,20 @@ curl -NsS http://127.0.0.1:18085/v1/chat/completions -H 'Content-Type: applicati
 
 ## Run the packaged image on Prometheus
 
-The service image includes the gfx1100 engine, the GGUF tokenizer, the Python server and both image encoders. Its default profile runs the encoder on four CPU threads, reserves 393,216 context positions, and uses medium reasoning effort when the client omits it. The resident HIP encoder is available in `ik2-mini-gfx1100-hip-vision.json`. Mount the directory containing `Inkling-2-Mini-IQ4_NL.gguf` and `mmproj-F16.gguf`.
+The image includes the gfx1100 engine, the tokenizer, the Python server and the CPU and HIP image encoders. The default HIP encoder keeps the original FP16 image weights in host RAM. The service reserves 393,216 context positions in total and defaults to medium reasoning effort. Mount the directory containing `Inkling-2-Mini-IQ4_NL.gguf` and `mmproj-F16.gguf`.
 
 Run from the Prometheus build directory to package the existing binaries. Buildx uses at most four CPUs and 6 GiB of RAM.
 
 ```sh
-sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer \
-    hyperion/maya-ik2:gfx1100-service-r1 vision-cpu/bin/maya-vision vision-hip/bin/maya-vision
+# Preserve the original resident HIP encoder, then rebuild mtmd with host weights.
+mkdir -p vision-resident
+cp -n vision-hip/bin/maya-vision vision-resident/maya-vision
+docker exec -w /work maya-ik2-hip-build cmake -S src/tools/vision -B vision-hip -DSTRATA_VISION_HOST_WEIGHTS=ON
+docker exec -w /work maya-ik2-hip-build cmake --build vision-hip --target maya-vision -j4
+sh src/docker/package-ik2-gfx1100.sh cache-slots-fork ik2-tokenizer/tokenizer \
+    hyperion/maya-ik2:gfx1100-service-r3 vision-cpu/bin/maya-vision vision-resident/maya-vision vision-hip/bin/maya-vision
 docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 \
-    --entrypoint python3 hyperion/maya-ik2:gfx1100-service-r1 -m unittest serve.test_inkling2_frontend
+    --entrypoint python3 hyperion/maya-ik2:gfx1100-service-r3 -m unittest serve.test_inkling2_frontend
 ```
 
 The service uses Compose project `inkling-2-mini` and service key `llama` so the existing Prometheus controller can manage it. Install [the Compose file](../docker/compose.ik2-gfx1100.yml) as `~/ai/services/inkling-2-mini/docker-compose.yml` and run these commands from that directory. The model mount is read-only. The memory and swap limits are both 10 GiB.
@@ -426,7 +431,7 @@ docker compose up -d --no-deps --pull never llama
 curl -fsS http://127.0.0.1:8085/health
 ```
 
-For multiple serial conversations set `IK2_CACHE_SLOTS=2`, `3` or `4` in the Compose project's `.env` before recreating the container. The total context is divided evenly. Use the default of one slot for a conversation that grows to 300K. To switch the encoder, set `MAYA_IK2_PRESET=ik2-mini-gfx1100-hip-vision.json` or choose `ik2-mini-gfx1100-text.json` for text only.
+For multiple serial conversations set `IK2_CACHE_SLOTS=2`, `3` or `4` in the Compose project's `.env` before recreating the container. The total context is divided evenly. Use the default of one slot for a conversation that grows to 300K. The default uses 1,024-token prefill chunks with one or two slots and 512 with three or four. To select CPU vision, set `MAYA_IK2_PRESET=ik2-mini-gfx1100.json`. Use `ik2-mini-gfx1100-text.json` for text only.
 
 ## CUDA and HIP differences in the initial scalar port
 

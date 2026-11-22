@@ -1,8 +1,8 @@
 #!/bin/sh
 # Package a built gfx1100 engine and a tokenizer exported from the target GGUF.
 set -eu
-if [ "$#" -lt 3 ] || [ "$#" -gt 5 ]; then
-    echo "usage: $0 MAYA_IK2 TOKENIZER_DIRECTORY IMAGE_TAG [CPU_VISION [HIP_VISION]]" >&2
+if [ "$#" -lt 3 ] || [ "$#" -gt 6 ]; then
+    echo "usage: $0 MAYA_IK2 TOKENIZER_DIRECTORY IMAGE_TAG [CPU_VISION [HIP_VISION [HIP_VISION_HOST_WEIGHTS]]]" >&2
     exit 2
 fi
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -19,9 +19,13 @@ mkdir "$context/vision"
 if [ "$#" -ge 4 ]; then
     test -x "$4"
     cp "$4" "$context/vision/maya-vision-cpu"
-    if [ "$#" -eq 5 ]; then
+    if [ "$#" -ge 5 ]; then
         test -x "$5"
         cp "$5" "$context/vision/maya-vision-hip"
+    fi
+    if [ "$#" -eq 6 ]; then
+        test -x "$6"
+        cp "$6" "$context/vision/maya-vision-hip-host"
     fi
     python3 - "$context" <<'PYCONFIG'
 import json
@@ -35,10 +39,16 @@ cfg = json.loads(default.read_text())
 cfg["vision"] = dict(exe="vision/maya-vision-cpu", model=cfg["args"][1], mmproj="models/mmproj-F16.gguf",
                      threads=4, max_tokens=1024, gpu=False, resident=True)
 default.write_text(json.dumps(cfg, indent=2) + "\n")
-if (directory / "vision/maya-vision-hip").exists():
-    cfg["vision"].update(exe="vision/maya-vision-hip", gpu=True)
-    cfg["args"][cfg["args"].index("--chunk") + 1] = "256"
-    (directory / "ik2-mini-gfx1100-hip-vision.json").write_text(json.dumps(cfg, indent=2) + "\n")
+
+def gpu_preset(exe, name, chunk):
+    if (directory / exe).is_file():
+        cfg["vision"].update(exe=exe, gpu=True)
+        cfg["args"][cfg["args"].index("--chunk") + 1] = str(chunk)
+        (directory / name).write_text(json.dumps(cfg, indent=2) + "\n")
+
+gpu_preset("vision/maya-vision-hip", "ik2-mini-gfx1100-hip-vision.json", 256)
+gpu_preset("vision/maya-vision-hip-host", "ik2-mini-gfx1100-hip-host-vision.json", 1024)
+gpu_preset("vision/maya-vision-hip-host", "ik2-mini-gfx1100-hip-host-vision-512.json", 512)
 PYCONFIG
 fi
 cp -R "$root/serve" "$root/tools" "$context/"
