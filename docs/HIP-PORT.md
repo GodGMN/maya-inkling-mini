@@ -27,6 +27,30 @@ cp service.json.pre-maya-1429 service.json
 docker compose up -d --no-deps --pull never llama
 ```
 
+### Keygen Bench
+
+The live service ran the FastTracker II composition benchmark from the same source revision (`f86fa76a3de035078d09b8460ac553336aa4a413`), over the same public Chat Completions route and model alias as the prior llama.cpp run. Both used `xhigh` and a 16,384-token output limit. The native tool-readiness pilot passed before three independent attempts were reserved. The sandbox, visualizer, listener and trusted FT2 renderer were already installed on the controller host. The offline prerequisite check initially lacked the pinned Debian image manifest. Pulling its digest reused the existing base layer.
+
+| Attempt | Maya listener score | Prior llama.cpp score | Maya wall time | Maya audio length | Largest Maya prompt | Public transport retries |
+|---:|---:|---|---:|---:|---:|---:|
+| 1 | 61.2 | 29.0 (recovered XM) | 24m 52s | 29.99 s | 126,504 | 1 |
+| 2 | 69.8 | 68.6 | 29m 02s | 25.60 s | 151,115 | 1 |
+| 3 | Running | HTTP 524, no XM | | | | |
+
+Run from the pinned Keygen checkout on the controller host. The saved provider config names `https://prometheus.gimeno.dev/v1` and `inkling-2-mini-26.4b-iq4-nl`. Supply the controller credential through `KEYGEN_CONTRIB_API_KEY`. The work and bundle paths must be new for each run.
+
+```sh
+state="$HOME/.local/share/keygen-bench-inkling"
+stamp=20261122T142933Z
+work="$state/maya-hip-1429-$stamp"
+export KEYGEN_LISTENER_PYTHON="$state/listener-venv/bin/python" KEYGEN_FT2_ANALYSIS="$state/ft2-analysis"
+export HF_HUB_OFFLINE=1 LITELLM_LOCAL_MODEL_COST_MAP=True
+"$state/venv/bin/python" benchmark/contrib/cli.py doctor --config "$state/prometheus.json" --infrastructure-only --no-input
+"$state/venv/bin/python" -u benchmark/contrib/cli.py run --config "$state/prometheus.json" \
+    --work "$work" --out "$state/maya-hip-1429-bundle-$stamp" --yes --no-input
+"$state/venv/bin/python" benchmark/score.py profile --out "$work" --workers 1
+```
+
 ## Growing conversations
 
 The full-context image reserves 393,216 positions with a 1,024-token prefill chunk. The web client now sends Inkling's earlier reasoning back. API clients should retain the complete assistant message, including reasoning and tool calls, and preserve tool IDs when sending results. Changing the system prompt, tools, their order, or the reasoning level can change tokens near the beginning of the rendered history. A rewritten history starts a new prefix.
@@ -75,6 +99,8 @@ All 18 follow-ups across the three settings reused every previously processed to
 | 2 | 196,608 | 196,314 | 0.279 to 0.327 | 129.967 to 129.974 | 23.24 |
 | 3 | 131,072 | 24,538 | 0.136 to 0.181 | 8.011 to 8.023 | 23.40 |
 | 4 | 98,304 | 97,962 | 0.194 to 0.307 | 46.122 to 46.177 | 23.56 |
+
+The 196K two-slot run used `202ace2`. The three- and four-slot runs used the deployed binary, which also passed the two-slot fork test below. `GET /health` reports the configured cache count and per-conversation context. The decoding queue admits one request at a time.
 
 For two, three and four slots the engine allocated 3,235.7, 2,211.7 and 1,699.7 MiB per cache plus a shared 4 MiB exchange buffer. Each conversation needs its own sliding-window cache even though the global context budget is divided among the slots. The highest anonymous RAM readings in those runs were 1.96, 1.82 and 2.04 GiB.
 
