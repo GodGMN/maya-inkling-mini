@@ -311,10 +311,19 @@ struct MvAlt {
     const float* x = nullptr;
     int r0 = 0, n = 0;
 };
+// Small FP16 projections that can run beside a planar Q8 attention projection.
+struct MvF16Job {
+    const uint16_t* weights = nullptr;
+    const float* input = nullptr;
+    float* output = nullptr;
+    int rows = 0;
+};
+struct MvF16Jobs { MvF16Job job[3] = {}; };
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
              cudaStream_t s);
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
-                 const MvConv& c1, cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{});
+                 const MvConv& c1, cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{},
+                 const MvF16Jobs& side = MvF16Jobs{});
 void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out, cudaStream_t s);
 /// y [N] = W [N][K] . x [K] for a small dense matrix kept in FP16 (the sinks, a full layer's dynamic taps, the
 /// router): F32 sums, a warp a row.

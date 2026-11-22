@@ -2370,18 +2370,31 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
         }
         // the projections, straight over the blocks
         float *q_p, *k_p, *v_p, *r_p, *gate_p, *kd_p = nullptr, *vd_p = nullptr;
-        // (k's and v's short convs ride their products' launches - mv1c - and the sinks the clips' launch below)
+        const uint16_t* sink_after_projection = Ly.sink16;
+        k::MvF16Jobs side{};
+#ifdef STRATA_USE_HIP
+        static const bool fuse_projections = getenv("IK2_DECODE_PROJ") && atoi(getenv("IK2_DECODE_PROJ"));
+        if (fuse_projections && C == 2304 && (Ly.sliding ? Ly.wqkvrg.q8 : Ly.wqrg.q8)) {
+            side.job[0] = {Ly.sink16, W.xq, W.sink, c.H};
+            sink_after_projection = nullptr;
+            if (!Ly.sliding) {
+                side.job[1] = {Ly.sc_k_dyn16, W.xk, W.dyn, c.KV * 4};
+                side.job[2] = {Ly.sc_v_dyn16, W.xv, W.dyn + c.KV * 4, c.KV * 4};
+            }
+        }
+#endif
         if (Ly.sliding) {
             const Mat& m = Ly.wqkvrg;   // q | k | v | r | gate
             q_p = W.qkv, k_p = q_p + HD, v_p = k_p + KD, r_p = v_p + KD, gate_p = r_p + HR;
-            if (!sep) {
-                mv1c(m, W.xq, W.qkv, k::MvConv{HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
-                     k::MvConv{HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv});
-            } else if (m.q8) {   // (q, k and v each with its input: k's and v's rows take theirs, one launch)
+            if (m.q8) {
+                const k::MvAlt key = sep ? k::MvAlt{W.xk, HD, KD} : k::MvAlt{};
+                const k::MvAlt value = sep ? k::MvAlt{W.xv, HD + KD, KD} : k::MvAlt{};
                 k::mv_q8p_conv(m.q8, m.q8d, m.N, m.K, W.xq, W.qkv,
-                               k::MvConv{HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
-                               k::MvConv{HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv}, g_s,
-                               k::MvAlt{W.xk, HD, KD}, k::MvAlt{W.xv, HD + KD, KD});
+                               {HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
+                               {HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv}, g_s, key, value, side);
+            } else if (!sep) {
+                mv1c(m, W.xq, W.qkv, {HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
+                     {HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv});
             } else {
                 mv1(mat_rows(m, 0, HD), W.xq, W.qkv);
                 mv1c(mat_rows(m, HD, KD), W.xk, k_p, k::MvConv{0, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv});
@@ -2391,11 +2404,15 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
             }
         } else {
             const Mat& m = Ly.wqrg;     // q | r | gate
-            mv1(m, W.xq, W.qkv);
             q_p = W.qkv, r_p = q_p + HD, gate_p = r_p + HR;
             k_p = W.kk, v_p = W.vv, kd_p = W.dyn, vd_p = W.dyn + (size_t) c.KV * 4;
-            k::mv_f16(Ly.sc_k_dyn16, c.KV * 4, C, W.xk, kd_p, g_s);
-            k::mv_f16(Ly.sc_v_dyn16, c.KV * 4, C, W.xv, vd_p, g_s);
+            if (side.job[0].rows) {
+                k::mv_q8p_conv(m.q8, m.q8d, m.N, m.K, W.xq, W.qkv, {}, {}, g_s, {}, {}, side);
+            } else {
+                mv1(m, W.xq, W.qkv);
+                k::mv_f16(Ly.sc_k_dyn16, c.KV * 4, C, W.xk, kd_p, g_s);
+                k::mv_f16(Ly.sc_v_dyn16, c.KV * 4, C, W.xv, vd_p, g_s);
+            }
             mv1c(Ly.wk, W.xk, k_p, k::MvConv{0, KD, Ly.h_k, Ly.sc_k, kd_p, c.KV, nullptr, W.kconv});
             mv1c(Ly.wv, W.xv, v_p, k::MvConv{0, KD, Ly.h_v, Ly.sc_v, vd_p, c.KV, nullptr, W.vconv});
         }
@@ -2419,7 +2436,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
         if (Ly.kc8) {
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.fp8_layout(),
-                                 k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
+                                 k_scale, v_scale, q16, g_s, sink_after_projection, W.xq, C, W.sink);
             if (mma)
                 k::attn_decode_mma_fp8(q16, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.fp8_layout(), c.H, c.KV, W.pos, 0, ns,
                                        qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
@@ -2431,7 +2448,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
         } else {
             k::prep_qkv_r_f16_at(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16,
-                                 g_s, Ly.sink16, W.xq, C, W.sink);
+                                 g_s, sink_after_projection, W.xq, C, W.sink);
             if (mma)
                 k::attn_decode_mma_f16(q16, r_p, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos, 0, ns, qk_scale,
                                        Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s);

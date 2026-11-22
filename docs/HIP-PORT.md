@@ -381,3 +381,24 @@ IK2_PREFILL_LOGITS_OUT=teacher-pages.f32 ./build-ik2/maya-ik2 --model /weight.gg
 oracle-env/bin/python src/tools/ik2_compare_decode.py teacher-pages.f32 --ref heldout-teacher-ref.npy \
     --tokens heldout-teacher.all --vocab 200058 --prefill --prompt-length 256
 ```
+
+### Fused decode projections
+
+The Radeon preset computes the FP16 attention sink and dynamic convolution taps alongside their Q8 projection. For short prompts this removes 16 launches per generated token. Across 32 forced steps the two paths produced byte-identical full-vocabulary logits. With the installed IQ4_NL GGUF, three 256-step greedy measurements gave the following medians in tok/s.
+
+| Input tokens | Separate projections | Fused projections |
+| ---: | ---: | ---: |
+| 32 | 111.06 | 117.06 |
+| 512 | 109.35 | 115.16 |
+| 8,192 | 100.95 | 105.74 |
+
+```sh
+# Export the cooperative prefill environment above.
+for flag in 0 1; do
+    IK2_DECODE_PROJ=$flag python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+        --tokens water.force --gen 257 --depths 32,512,8192 --repeats 3 --chunk 2048
+    IK2_DECODE_PROJ=$flag IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="projection-$flag.f32" ./build-ik2/maya-ik2 --model /weight.gguf \
+        --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 32
+done
+cmp projection-0.f32 projection-1.f32
+```

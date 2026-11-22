@@ -3874,10 +3874,9 @@ __global__ void mv_f16_kernel(const uint16_t* __restrict__ W, int N, int K, cons
 
 #ifdef STRATA_USE_HIP
 // Keep the original 32-lane accumulation order while giving each row its own workgroup.
-__global__ void rdna3_mv_f16_exact(const uint16_t* weights, const float* x, float* y) {
+__device__ __forceinline__ float rdna3_f16_dot_2304(const uint16_t* weights, const float* x, int lane) {
     constexpr int K = 2304, batch = 8;
-    const int lane = threadIdx.x;
-    const auto* w = weights + (size_t)blockIdx.x * K + lane;
+    const auto* w = weights + lane;
     float acc = 0;
     for (int base = 0; base < K; base += 32 * batch) {
         float a[batch], b[batch];
@@ -3889,8 +3888,11 @@ __global__ void rdna3_mv_f16_exact(const uint16_t* weights, const float* x, floa
 #pragma unroll
         for (int i = 0; i < batch; ++i) acc = fmaf(a[i], b[i], acc);
     }
-    acc = wsum(acc);
-    if (!lane) y[blockIdx.x] = acc;
+    return wsum(acc);
+}
+__global__ void rdna3_mv_f16_exact(const uint16_t* weights, const float* x, float* y) {
+    const float sum = rdna3_f16_dot_2304(weights + (size_t)blockIdx.x * 2304, x, threadIdx.x);
+    if (!threadIdx.x) y[blockIdx.x] = sum;
 }
 
 // A small routing or dynamic-convolution matrix has too few rows to fill the card with four rows per block.
@@ -3990,11 +3992,10 @@ __global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int 
 }
 #endif
 
-template <int WARPS, int StaticK = 0>
-__global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int runtime_k,
-                              const float* __restrict__ x, float* y, MvConv c0, MvConv c1, MvAlt a0, MvAlt a1) {
+template <int StaticK>
+__device__ __forceinline__ void mv_q8p_row(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int runtime_k,
+                              const float* __restrict__ x, float* y, MvConv c0, MvConv c1, MvAlt a0, MvAlt a1, int row, int lane) {
     const int K = StaticK ? StaticK : runtime_k;
-    const int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= N) return;
     const uint32_t* qr = (const uint32_t*) (q + (size_t) row * K);
     const uint16_t* dr = d + (size_t) row * (K >> 5);
@@ -4014,6 +4015,31 @@ __global__ void mv_q8p_kernel(const int8_t* __restrict__ q, const uint16_t* __re
     acc = wsum(acc);
     if (lane == 0 && !mv_conv_row(c0, row, acc) && !mv_conv_row(c1, row, acc)) y[row] = acc;
 }
+template <int WARPS, int StaticK = 0>
+__global__ void mv_q8p_kernel(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y,
+                              MvConv c0, MvConv c1, MvAlt a0, MvAlt a1) {
+    mv_q8p_row<StaticK>(q, d, N, K, x, y, c0, c1, a0, a1,
+                        blockIdx.x * WARPS + (threadIdx.x >> 5), threadIdx.x & 31);
+}
+
+#ifdef STRATA_USE_HIP
+__global__ void rdna3_attention_projections(const int8_t* q, const uint16_t* d, int N, const float* x, float* y,
+                                           MvConv c0, MvConv c1, MvAlt a0, MvAlt a1, MvF16Jobs side) {
+    int row = blockIdx.x * 4 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        const MvF16Job& job = side.job[i];
+        if (row < job.rows) {
+            const float sum = rdna3_f16_dot_2304(job.weights + (size_t)row * 2304, job.input, lane);
+            if (!lane) job.output[row] = sum;
+            return;
+        }
+        row -= job.rows;
+    }
+    mv_q8p_row<2304>(q, d, N, 2304, x, y, c0, c1, a0, a1, row, lane);
+}
+#endif
 __global__ void decode_q8p_f16_kernel(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, size_t n,
                                       uint16_t* __restrict__ out) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -6194,11 +6220,23 @@ void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x
 
 #endif
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
-                 const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1) {
+                 const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1, const MvF16Jobs& side) {
     if (N <= 0) return;
     if (K % 128 || ((uintptr_t) q & 3) || (((uintptr_t) x | (uintptr_t) a0.x | (uintptr_t) a1.x) & 15)) {
         std::fprintf(stderr, "ik2::k::mv_q8p: K %d, or q / x not aligned\n", K);
         std::abort();
+    }
+    const int extras = side.job[0].rows + side.job[1].rows + side.job[2].rows;
+    if (extras) {
+#ifdef STRATA_USE_HIP
+        if (K == 2304) {
+            rdna3_attention_projections<<<(extras + N + 3) / 4, 128, 0, s>>>(q, d, N, x, y, c0, c1, a0, a1, side);
+            check("attention projections");
+            return;
+        }
+#endif
+        for (const MvF16Job& job : side.job)
+            if (job.rows) mv_f16(job.weights, job.rows, K, job.input, job.output, s);
     }
     static const bool specialize = getenv("IK2_Q8_UNROLL") && atoi(getenv("IK2_Q8_UNROLL"));
     if (specialize && K == 2304)

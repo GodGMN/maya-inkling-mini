@@ -1245,6 +1245,31 @@ void test_token_path() {
         for (int r = 0; r < Nf; ++r)
             for (int i = 0; i < K; ++i) wantf[r] += (double) h2f_host(wf[(size_t) r * K + i]) * x[i];
         expect("mv_f16", host(dyf, Nf), wantf, 2e-4, 1e-3);
+#ifdef STRATA_USE_HIP
+        // Side projections include two different inputs and a row count not divisible by four.
+        if (K == 2304) {
+            k::MvF16Jobs side{};
+            float* first = dev_n<float>(7), *second = dev_n<float>(12), *third = dev_n<float>(21);
+            side.job[0] = {dwf, dx, first, 7};
+            side.job[1] = {dwf + 7 * K, dxa, second, 12};
+            side.job[2] = {dwf + 19 * K, dxb, third, 21};
+            k::mv_q8p_conv(dq, dd, N, K, dx, dy, {}, {}, 0, {}, {}, side);
+            const std::vector<float> inputs[] = {x, xa, xb};
+            int base = 0;
+            for (int j = 0; j < 3; ++j) {
+                std::vector<double> reference(side.job[j].rows);
+                for (int r = 0; r < side.job[j].rows; ++r)
+                    for (int i = 0; i < K; ++i)
+                        reference[r] += (double)h2f_host(wf[(size_t)(base + r) * K + i]) * inputs[j][i];
+                expect("attention side projection", host(side.job[j].output, reference.size()), reference, 2e-4, 1e-3);
+                base += side.job[j].rows;
+            }
+            std::vector<double> main_rows(N);
+            for (int r = 0; r < N; ++r) main_rows[r] = dot(r, x);
+            expect("attention main projection after side rows", host(dy, N), main_rows, 2e-4, 2e-3);
+            cudaFree(first); cudaFree(second); cudaFree(third);
+        }
+#endif
         // the sinks in the clips' launch: mv_f16's values to the bit
         {
             const int H = 24, KV = 8, D = 128, d_rel = 16;
