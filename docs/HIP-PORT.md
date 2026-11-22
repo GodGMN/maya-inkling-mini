@@ -367,6 +367,25 @@ cmake -S . -B build-cuda -G Ninja -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECT
 cmake --build build-cuda --target maya-ik2 ik2_kernels_test -j4
 ```
 
+### Held-out distribution fixture
+
+Use the first 256 tokenizer IDs from GSM8K test questions and solutions 192 through 199, numbered from zero. The first 224 IDs form the decode prompt and the remaining 32 are forced in order. The arithmetic evaluation above used questions 0 through 191.
+
+```sh
+PYTHONPATH=src/tools oracle-env/bin/python - <<'PYDATA'
+import json
+from pathlib import Path
+from strata_tokenizer import Tokenizer
+rows = [json.loads(line) for line in Path("gsm8k-test.jsonl").read_text().splitlines()]
+text = "\n\n".join(r["question"] + "\n" + r["answer"] for r in rows[192:200])
+ids = Tokenizer.from_dir("ik2-tokenizer/tokenizer").encode(text)[:256]
+for name, seq in [("all", ids), ("prompt", ids[:224]), ("force", ids[224:])]:
+    Path("heldout-teacher." + name).write_text(",".join(map(str, seq)))
+PYDATA
+OPENBLAS_NUM_THREADS=1 oracle-env/bin/python src/ref/inkling2.py /weight.gguf \
+    --tokens "$(cat heldout-teacher.all)" --logprobs-out heldout-teacher-ref.npy
+```
+
 ### Global E4M3 pages
 
 `IK2_PAGED_KV=1` groups 16 positions per KV head and transposes V inside each page. Sliding attention retains its ring. A 131,072-token midpoint retrieval with the direct page reader returned the exact same four-word phrase as the token-major layout. The 128-step decode measured 65.07 tok/s with pages and 59.76 with token-major KV. Cold prefill took 101.342 and 78.134 seconds respectively. These are single runs with `--ctx 393216 --chunk 1024` and `--decode-steps 128` in the retrieval command above.
@@ -401,4 +420,40 @@ for flag in 0 1; do
         --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
 done
 cmp projection-0.f32 projection-1.f32
+```
+
+
+### Direct multiple-choice answers
+
+On 256 questions from eight MMLU subjects, the paged E4M3 engine with the cancellation fix answered **207 correctly**. Every response supplied a valid letter. The first 32 test examples from each subject were selected before running either engine. Each chat requested one letter in the final content channel, with greedy decoding and an eight-token limit. The scorer accepts the letter with optional parentheses or a final period. [Pinned CAIS dataset](https://huggingface.co/datasets/cais/mmlu/tree/c30699e8356da336a370243923dbaf21066bb9fe)
+
+Prepare the small JSONL with PyArrow. This command downloads the eight evaluation splits.
+
+```sh
+python3 - <<'PYDATA'
+import json
+from urllib.request import urlopen
+import pyarrow as pa
+import pyarrow.parquet as pq
+subjects = ("astronomy", "college_mathematics", "conceptual_physics", "high_school_european_history",
+            "machine_learning", "philosophy", "professional_psychology", "world_religions")
+revision = "c30699e8356da336a370243923dbaf21066bb9fe"
+with open("mmlu256.jsonl", "w") as out:
+    for subject in subjects:
+        url = f"https://huggingface.co/datasets/cais/mmlu/resolve/{revision}/{subject}/test-00000-of-00001.parquet"
+        with urlopen(url) as response:
+            rows = pq.read_table(pa.BufferReader(response.read())).slice(0, 32).to_pylist()
+        for i, r in enumerate(rows):
+            print(json.dumps(dict(subject=subject, index=i, question=r["question"], choices=r["choices"], answer=r["answer"])), file=out)
+PYDATA
+```
+
+Use the cooperative prefill environment with fused projections and paged KV. Both engines receive the same token IDs.
+
+```sh
+oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer >mmlu.requests
+IK2_DECODE_PROJ=1 IK2_PAGED_KV=1 ./build-ik2/maya-ik2 --model /weight.gguf --serve-ik2 --ctx 4096 --chunk 512 \
+    <mmlu.requests >mmlu-maya.log
+oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer --score mmlu-maya.log
+oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer --llama-url http://127.0.0.1:8085
 ```
