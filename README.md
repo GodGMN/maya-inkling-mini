@@ -1,8 +1,10 @@
 # Inkling 2 Mini on AMD Radeon RX 7900 XTX
 
-On an RX 7900 XTX, `maya-ik2` with the ggml-org IQ4_NL weights and FP8 KV measured **91.6–91.7 tok/s greedy decode after a 512-token prompt** and **87.55 tok/s after 2,048 tokens**. Each rate covers 128 decode steps, with all experts in VRAM. Uncached prefill measured 889–890 and 819–825 tok/s at those depths. The port uses ROCm 7.2.1 and native RDNA3 WMMA for grouped expert prefill.
+On Prometheus's RX 7900 XTX, `maya-ik2` decoded at **101.3 tok/s after a 512-token prompt** and **92.7 tok/s after 8,192 tokens**. The deployed llama.cpp service measured 64.0 and 62.0 tok/s on the same prompts and ggml-org IQ4_NL weights. Each median covers three greedy requests with 128 timed decode steps. Maya used FP32 expert inputs and FP8 KV. The service used its production Q4_0 KV configuration.
 
-The gfx1100 kernel suite passes. With WMMA attention enabled, forced decode matched the float64 reference's top token on all 96 positions across three short passages. After a 114-token prompt it matched on 11 of 13 positions. The build guide includes the switches, input IDs and timing command.
+Maya's uncached prefill at 8K measured 949 tok/s with 128-token chunks. Llama.cpp reached 1,488 tok/s with its production batch settings. The [hardware results and commands](docs/HIP-PORT.md#fp32-expert-decode-and-packed-e4m3-reads) cover both phases.
+
+The gfx1100 kernel suite passes. In a 96-question greedy GSM8K run, Maya returned 90 correct final answers with a 1,024-token output limit. The full-vocabulary checks include short passages and a 114-token prompt. [Quality checks](docs/HIP-PORT.md#rdna3-expert-and-attention-kernels)
 
 ```sh
 git clone --branch hip-port https://github.com/GodGMN/maya-inkling-mini.git
