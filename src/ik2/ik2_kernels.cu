@@ -113,8 +113,12 @@ __host__ __device__ __forceinline__ uint16_t e4m3fn_to_f16(uint8_t q) {
 #if defined(__CUDA_ARCH__)
         return sign | (uint16_t) (__byte_perm(0x1E1C1800u, 0x23222120u, mag << 4) & 0xFF00u);
 #else
+#if defined(__HIP_DEVICE_COMPILE__)
+        return sign | (uint16_t)((__builtin_amdgcn_perm(0x23222120u, 0x1e1c1800u, mag) & 0xffu) << 8);
+#else
         static constexpr uint16_t kSub[8] = {0x0000u, 0x1800u, 0x1C00u, 0x1E00u, 0x2000u, 0x2100u, 0x2200u, 0x2300u};
         return sign | kSub[mag];
+#endif
 #endif
     }
     return sign | (uint16_t) ((mag << 7) + 0x2000u);
@@ -124,6 +128,15 @@ __device__ __forceinline__ uint32_t e4m3fnx2_to_h2_u32(uint16_t p2) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     const __half2 h2 = __half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) p2, __NV_E4M3));
     return (uint32_t) __half_as_ushort(__low2half(h2)) | ((uint32_t) __half_as_ushort(__high2half(h2)) << 16);
+#elif defined(__HIP_DEVICE_COMPILE__)
+    const uint32_t bytes = __builtin_amdgcn_perm(0, p2, 0x04010400u);
+    const uint32_t raw = ((bytes & 0x007f007fu) << 7) | ((bytes & 0x00800080u) << 8);
+    // E4M3's exponent bias is eight below FP16's. Scaling normalizes its subnormals too.
+    using Half2 = _Float16 __attribute__((ext_vector_type(2)));
+    const Half2 scaled = __builtin_bit_cast(Half2, raw) * (_Float16)256;
+    const uint32_t nan_lo = (p2 & 0x7fu) == 0x7fu ? 0x00007fffu : 0;
+    const uint32_t nan_hi = (p2 & 0x7f00u) == 0x7f00u ? 0x7fff0000u : 0;
+    return __builtin_bit_cast(uint32_t, scaled) | nan_lo | nan_hi;
 #else
     return (uint32_t) e4m3fn_to_f16((uint8_t) (p2 & 0xFFu)) |
            ((uint32_t) e4m3fn_to_f16((uint8_t) (p2 >> 8)) << 16);
@@ -2213,6 +2226,9 @@ __device__ __forceinline__ uint32_t iq4nl_lut4(uint32_t w, bool hi) {
     return (lo & ~m) | (hv & m);
 #endif
 }
+#ifdef STRATA_USE_HIP
+#include "ik2_iq4_rdna3.cuh"
+#endif
 // block b (136 bytes, 4-aligned), sub-block ib
 __device__ __forceinline__ float iq4xs_sub_dot(const uint8_t* b, int ib, const float4 (&xv)[8]) {
     const uint32_t h = __ldg((const uint32_t*) b), sl = __ldg((const uint32_t*) (b + 4));
@@ -3788,6 +3804,28 @@ __global__ void mv_f16_kernel(const uint16_t* __restrict__ W, int N, int K, cons
     a = wsum(a);
     if (lane == 0) y[row] = a;
 }
+
+#ifdef STRATA_USE_HIP
+// A small routing or dynamic-convolution matrix has too few rows to fill the card with four rows per block.
+__global__ void rdna3_mv_f16_row(const uint16_t* weights, int K, const float* input, float* output) {
+    constexpr int threads = 128;
+    const int row = blockIdx.x, tid = threadIdx.x, lane = tid & 31;
+    const auto* w = reinterpret_cast<const uint2*>(weights + (size_t)row * K);
+    const auto* x = reinterpret_cast<const float4*>(input);
+    float sum = 0;
+    for (int i = tid; i < K / 4; i += threads) {
+        const uint2 halves = w[i];
+        const float2 lo = u32_to_f2(halves.x), hi = u32_to_f2(halves.y);
+        const float4 v = x[i];
+        sum += lo.x * v.x + lo.y * v.y + hi.x * v.z + hi.y * v.w;
+    }
+    sum = wsum(sum);
+    __shared__ float part[threads / 32];
+    if (lane == 0) part[tid / 32] = sum;
+    __syncthreads();
+    if (tid == 0) output[row] = (part[0] + part[1]) + (part[2] + part[3]);
+}
+#endif
 
 // a product's row through its short conv (conv4_fused_kernel's arithmetic for one token): false if the row has none
 __device__ __forceinline__ bool mv_conv_row(const MvConv& cv, int row, float x_new) {
@@ -5806,6 +5844,15 @@ void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_dow
                   float* y, cudaStream_t s) {
 
     if (S <= 0) return;
+#ifdef STRATA_USE_HIP
+    static const bool direct = getenv("IK2_IQ4_MV") && atoi(getenv("IK2_IQ4_MV"));
+    if (direct && ty_down == kIQ4_NL && C % 2 == 0 && ((uintptr_t)h & 7) == 0) {
+        rdna3_iq4_token<false, 2><<<dim3((C + 7) / 8, S), 128, 0, s>>>(
+            blob, off_down, nullptr, nullptr, h, F, C, nullptr, nullptr, 0, 0, nullptr, y);
+        check("rdna3_iq4_down");
+        return;
+    }
+#endif
     if (S <= 4) launch_experts_down<4, 2>(blob, S, ty_down, off_down, h, C, F, y, s);
     else launch_experts_down<4, 4>(blob, S, ty_down, off_down, h, C, F, y, s);
     check("experts_down");
@@ -5871,6 +5918,15 @@ void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, i
                             uint16_t* h, cudaStream_t s) {
 
     if (S <= 0) return;
+#ifdef STRATA_USE_HIP
+    static const bool direct = getenv("IK2_IQ4_MV") && atoi(getenv("IK2_IQ4_MV"));
+    if (direct && ty_gate == kIQ4_NL && ty_up == kIQ4_NL && F % 2 == 0 && ((uintptr_t)x & 15) == 0) {
+        rdna3_iq4_token<true, 2><<<dim3((F + 7) / 8, S), 128, 0, s>>>(
+            blob, eb0, tok, x, nullptr, C, F, sg, su, gcap, ucap, h, nullptr);
+        check("rdna3_iq4_gate_up");
+        return;
+    }
+#endif
     if (S <= 8) launch_experts_gate_up_swiglu<4, 2>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
     else launch_experts_gate_up_swiglu<4, 4>(blob, tok, S, ty_gate, ty_up, eb0, x, C, F, sg, su, gcap, ucap, h, s);
     check("experts_gate_up_swiglu");
@@ -6067,6 +6123,14 @@ void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out,
 
 void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStream_t s) {
     if (N <= 0) return;
+#ifdef STRATA_USE_HIP
+    static const bool wide = getenv("IK2_F16_MV") && atoi(getenv("IK2_F16_MV"));
+    if (wide && (N == 32 || N == 128) && K % 4 == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)x & 15) == 0) {
+        rdna3_mv_f16_row<<<N, 128, 0, s>>>(W, K, x, y);
+        check("rdna3_mv_f16_row");
+        return;
+    }
+#endif
     mv_f16_kernel<4><<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(W, N, K, x, y);
     check("mv_f16");
 }

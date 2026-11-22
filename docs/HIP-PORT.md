@@ -145,3 +145,26 @@ The four full-vocabulary checks below used the same WMMA attention and integer-d
 For the library check, repeat “The town library keeps its reading room open on Saturdays. Visitors can borrow a book for three weeks and renew it online. ” four times and append “A visitor borrows a book on Saturday.” Force the continuation “ When is the book due? It is due three weeks later.” Starting from the benchmark environment above, enable `IK2_FLASH=1 IK2_ATTN_MMA=1`. Run the CLI with `--tokens @long.prompt --gen 14 --ctx 1024 --chunk 128`, `IK2_FORCE=long.force`, and `IK2_LOGITS_OUT=all-flash-long.f32`. Compare using `python3 tools/ik2_compare_decode.py all-flash-long.f32 --ref long-ref.npy --prompt-length 114 --gen 14 --vocab 200058`. The two top-1 changes were at positions 114 and 119. These are distribution checks on four passages.
 
 The Loom bundle uses the original Unsloth quant and an external drafter on Strix Halo. Its report identifies speculative acceptance separately for each context. Here the weights are ggml-org IQ4_NL and the decoder predicts one token per step. The Loom code identifies two relevant operations for the port, grouping routed experts for WMMA and accumulating relative-position attention with an explicit sink. [Loom measurement report](https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom/blob/a78779814f545e254cffa9b346e85f236d54ea7c/REPORT.md)
+
+### FP32 expert decode and packed E4M3 reads
+
+The IQ4_NL decode kernel reads eight GGUF blocks per wave and reuses each FP32 activation across gate and up rows. It also reads the FP16 down input directly from registers after conversion. The 32- and 128-row FP16 projections use four waves per output row. For attention, a pair of E4M3 bytes is expanded to FP16 in two lanes. Scaling the packed FP16 result by 256 preserves E4M3 subnormals. The WMMA prefill kernel stages Q and transposes V in LDS. The device suite checks the packed conversions, signed zero, small dense products, fused SwiGLU, down projections, and both attention formats against numerical references.
+
+The following rates are medians over three uncached prompts, 128 timed greedy decode steps each. A single resident process served all four depths. The scalar attention columns use the same packed KV conversion and FP32 expert inputs. The experiment changed one expert or attention switch per comparison.
+
+| Prompt tokens | Direct IQ4 + scalar attention | Previous IQ4 + scalar attention | Direct IQ4 + WMMA attention | Direct IQ4 uncached prefill |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 105.52 | 101.27 | 99.07 | 323.23 |
+| 512 | 101.27 | 97.19 | 88.52 | 1,003.92 |
+| 2,048 | 97.12 | 93.23 | 84.04 | 973.85 |
+| 8,192 | 92.69 | 89.20 | 80.30 | 949.03 |
+
+All throughput columns are in tokens per second. Run the following from `/work` with `water.force` as above. Set `IK2_IQ4_MV=0` for the previous expert kernel or `IK2_ATTN_MMA=1` for WMMA decode attention.
+
+```sh
+export IK2_HOST=mmap IK2_KV=fp8 IK2_GATE_BF16=1 IK2_GATE_TILE=64 IK2_Q8_UNROLL=1
+export IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1 IK2_FLASH=1 IK2_Q8_TILE=1
+export IK2_EXPERT_LIMB=0 IK2_IQ4_MV=1 IK2_F16_MV=1 IK2_ATTN_MMA=0
+python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    --tokens water.force --depths 32,512,2048,8192 --gen 129 --repeats 3 --chunk 128
+```

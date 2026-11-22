@@ -758,6 +758,26 @@ void test_experts_mv() {
         expect(name, host(dgu, want_gu.size()), want_gu, 2e-4, 2e-3);
         std::snprintf(name, sizeof name, "experts_down %s", cs.name);
         expect(name, host(dy, want_y.size()), want_y, 2e-4, 2e-3);
+        if (cs.tg == k::kIQ4_NL && cs.tu == k::kIQ4_NL) {
+            auto sg = fvec(S), su = fvec(S);
+            auto *dg = dev(sg), *du = dev(su);
+            auto* hidden = dev_n<uint16_t>((size_t)S * F);
+            k::experts_gate_up_swiglu(dblob, dtok, S, cs.tg, cs.tu, eb0, dx, C, F, dg, du, 12.f, 19.f, hidden, 0);
+            const auto halves = host(hidden, (size_t)S * F);
+            std::vector<float> got(halves.size());
+            std::vector<double> expected(got.size());
+            for (int i = 0; i < S; ++i) {
+                for (int j = 0; j < F; ++j) {
+                    const double g = want_gu[(size_t)i * 2 * F + j] * sg[i];
+                    const double u = want_gu[(size_t)i * 2 * F + F + j] * su[i];
+                    expected[(size_t)i * F + j] = 12. * std::tanh(g / 12.) / (1. + std::exp(-g)) *
+                                                   19. * std::tanh(u / 19.);
+                    got[(size_t)i * F + j] = h2f_host(halves[(size_t)i * F + j]);
+                }
+            }
+            expect("IQ4_NL fused SwiGLU vs FP64", got, expected, 1e-3, 1e-4);
+            cudaFree(hidden); cudaFree(dg); cudaFree(du);
+        }
         // S = 1 path (<4, 2> launch config)
         k::experts_gate_up(dblob, dtok, 1, cs.tg, cs.tu, eb0, dx, C, F, dgu, 0);
         k::experts_down(dblob, 1, cs.td, eb0 + eb1, dh, C, F, dy, 0);
@@ -2547,6 +2567,25 @@ void test_round6() {
 }  // namespace
 
 #ifdef STRATA_USE_HIP
+void test_rdna3_small_dense() {
+    constexpr int K = 2304, N = 128;
+    const auto x = fvec(K);
+    std::vector<uint16_t> weights(N * K);
+    for (auto& w : weights) w = f2h_host(frand());
+    auto* dx = dev(x);
+    auto* dw = dev(weights);
+    auto* dy = dev_n<float>(N);
+    std::vector<double> ref(N);
+    for (int r = 0; r < N; ++r)
+        for (int c = 0; c < K; ++c) ref[r] += h2f_host(weights[r * K + c]) * (double)x[c];
+    for (int rows : {32, 128}) {
+        k::mv_f16(dw, rows, K, dx, dy, 0);
+        expect("RDNA3 small dense matvec", host(dy, rows), std::vector<double>(ref.begin(), ref.begin() + rows),
+               2e-4, 1e-3);
+    }
+    cudaFree(dy); cudaFree(dw); cudaFree(dx);
+}
+
 void test_rdna3_expert_groups() {
     constexpr int E = 64, K = 4;
     const auto gs = fvec(E), us = fvec(E), ds = fvec(E);
@@ -2828,6 +2867,7 @@ int main() {
     test_iq_ref();
     test_experts_mv();
 #ifdef STRATA_USE_HIP
+    test_rdna3_small_dense();
     test_rdna3_expert_groups();
     test_rdna3_expert_gemm();
 #endif

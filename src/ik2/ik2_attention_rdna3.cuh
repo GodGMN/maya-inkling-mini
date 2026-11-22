@@ -4,9 +4,21 @@ using AttnHalf16 = _Float16 __attribute__((ext_vector_type(16)));
 using AttnFloat8 = float __attribute__((ext_vector_type(8)));
 
 template <class KV>
-__device__ __forceinline__ _Float16 cache_half(KV x) {
-    if constexpr (sizeof(KV) == 1) return __builtin_bit_cast(_Float16, e4m3fn_to_f16(x));
-    else return __builtin_bit_cast(_Float16, x);
+__device__ __forceinline__ AttnHalf16 cache_fragment(const KV* ptr) {
+    AttnHalf16 out;
+    if constexpr (sizeof(KV) == 2) {
+        __builtin_memcpy(&out, ptr, sizeof(out));
+    } else {
+        using BytePairs = uint16_t __attribute__((ext_vector_type(8)));
+        using HalfPairs = uint32_t __attribute__((ext_vector_type(8)));
+        BytePairs bytes;
+        HalfPairs halves;
+        __builtin_memcpy(&bytes, ptr, sizeof(bytes));
+#pragma unroll
+        for (int i = 0; i < 8; ++i) halves[i] = e4m3fnx2_to_h2_u32(bytes[i]);
+        out = __builtin_bit_cast(AttnHalf16, halves);
+    }
+    return out;
 }
 
 template <bool Prefill, class KV>
@@ -24,12 +36,16 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
     const int start = max(0, pos0 + (Prefill ? tile : 0) + 1 - window);
     const size_t query_row = (size_t)query_l * H + head_l;
     const int kd = Hkv * 128;
-    AttnHalf16 query[8] = {};
-    if (l < queries) {
+    __shared__ AttnHalf16 query[16][8];
+    __shared__ _Float16 values[16][136];
 #pragma unroll
-        for (int d = 0; d < 8; ++d)
-            __builtin_memcpy(query + d, q + (size_t)query_l * q_ld + head_l * 128 + d * 16, sizeof(AttnHalf16));
+    for (int d = hi; d < 8; d += 2) {
+        AttnHalf16 fragment = {};
+        if (l < queries)
+            __builtin_memcpy(&fragment, q + (size_t)query_l * q_ld + head_l * 128 + d * 16, sizeof(fragment));
+        query[l][d] = fragment;
     }
+    __syncthreads();
     float m = -INFINITY, sum = 0;
     AttnFloat8 out[8] = {};
     for (int key = start + 16 * split; key < end; key += 16 * splits) {
@@ -39,12 +55,16 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
 #pragma unroll
         for (int d = 0; d < 8; ++d) {
             AttnHalf16 k = {};
-            if (key_l < end) {
-#pragma unroll
-                for (int i = 0; i < 16; ++i) k[i] = cache_half(kc[off + d * 16 + i]);
-            }
-            dot = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(k, query[d], dot);
+            if (key_l < end) k = cache_fragment(kc + off + d * 16);
+            dot = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(k, query[l][d], dot);
         }
+#pragma unroll
+        for (int d = hi; d < 8; d += 2) {
+            AttnHalf16 v = {};
+            if (key_l < end) v = cache_fragment(vc + off + d * 16);
+            __builtin_memcpy(&values[l][d * 16], &v, sizeof(v));
+        }
+        __syncthreads();
         float new_max = m;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
@@ -78,15 +98,12 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
         for (int d = 0; d < 8; ++d) {
             AttnHalf16 value;
 #pragma unroll
-            for (int t = 0; t < 16; ++t) {
-                const int kp = key + t;
-                const size_t row = (size_t)(ring ? kp % ring : kp) * kd + kv_head * 128;
-                value[t] = kp < end ? cache_half(vc[row + 16 * d + l]) : (_Float16)0;
-            }
+            for (int t = 0; t < 16; ++t) value[t] = values[t][16 * d + l];
 #pragma unroll
             for (int i = 0; i < 8; ++i) out[d][i] *= row_scale[i];
             out[d] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(prob, value, out[d]);
         }
+        __syncthreads();
     }
     sum += __shfl_xor(sum, 16, 32);
     if (lane < queries) {
