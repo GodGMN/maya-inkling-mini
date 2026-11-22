@@ -51,6 +51,28 @@ quiz | radeon ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 4096 -
 quiz --score mmlu.log
 ```
 
+### Sliding-window KV precision
+
+`IK2_KV=fp8-global` keeps the sliding layers' keys and values in FP16 and the global layers' cache in E4M3. At 393,216 reserved positions, the engine reported 6.31 GiB of KV in this mode and 6.16 GiB with E4M3 throughout. All 3,072 expert slots remained on the card in both runs.
+
+| Input tokens | Mixed KV prefill, tok/s | Mixed KV decode, tok/s |
+| ---: | ---: | ---: |
+| 32 | 432.43 | 119.40 |
+| 512 | 2,023.72 | 117.65 |
+| 2,048 | 2,824.83 | 115.11 |
+| 8,192 | 3,258.55 | 107.20 |
+| 32,768 | 2,956.60 | 94.67 |
+
+On the same 192 GSM8K questions the mixed cache answered **188/192** correctly. All responses finished within the 4,096-token limit. The four changed scores were all gains. On MMLU the mixed cache scored **206/256** with all letters valid. Two answers changed from wrong to right and three from right to wrong. The all-E4M3 preset had the higher measured prefill rate at 512 and 2,048 tokens.
+
+Run the throughput command below. To repeat the quality comparison, use `radeon env IK2_KV=fp8-global ./build-ik2/maya-ik2` for both engine invocations in the preceding GSM8K and MMLU commands.
+
+```sh
+radeon env IK2_KV=fp8-global python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 \
+    --model /weight.gguf --ctx 393216 --chunk 1024 --tokens water.force \
+    --depths 32,512,2048,8192,32768 --gen 129 --repeats 3
+```
+
 ## Build on Prometheus without a GPU
 
 The source tree is under `~/ai/build/maya-ik2-hip/src`. The build container mounts its parent at `/work`. The following commands reproduce the environment from a synced source tree. The llama.cpp archive is the source revision pinned by Maya's top-level CMake file.
