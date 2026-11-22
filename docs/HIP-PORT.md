@@ -2,6 +2,12 @@
 
 On Prometheus’s RX 7900 XTX, the Radeon server runs the installed ggml-org IQ4_NL model with all routed experts in VRAM. [Current measurements](#full-model-measurements-at-393216-reserved-tokens) · [Packaged server](#run-the-packaged-image-on-prometheus) · [Long-context retrieval](#exact-phrase-retrieval-at-long-context)
 
+### Which GPUs and models can run it?
+
+`maya-ik2` implements the Inkling 2 Mini architecture. Its HIP executable contains code for AMD target `gfx1100`, with 32-lane waves and RDNA3 matrix instructions. Prometheus's 24 GiB RX 7900 XTX is the card tested here. The 20 GiB RX 7900 XT and 16 GiB RX 7900 GRE share the target, but neither fits the measured 23.64 GiB full-context image configuration. A smaller configuration needs its own fit and correctness tests. The RX 7800 XT uses `gfx1101` and needs a separately supported build. The NVIDIA CUDA build has its own kernels. [AMD GPU specifications](https://rocm.docs.amd.com/en/docs-7.2.3/reference/gpu-arch-specs.html)
+
+Both Prometheus engines load the same `Inkling-2-Mini-IQ4_NL.gguf` text weights. Maya stores attention keys and values from previously read tokens in E4M3, an 8-bit floating-point format. The previous llama.cpp service stored its keys and values in Q4_0. On the 7900 XTX, Maya unpacks E4M3 in software for attention. The separate image encoder loads the same `mmproj-F16.gguf` with either backend. These settings can change the numerical results even with identical text weights.
+
 ## Live service on Prometheus
 
 On 2026-11-22, `hyperion/maya-ik2:gfx1100-service-r1` replaced `hyperion/llama.cpp:server-rocm-inkling-1427-r2` on port 8085. The deployed image ID is `sha256:9f2df85e9fde0a5d4450c7f4cb87e4247bdb651d63ba5c4168d754dec9ed89d9`. Its native engine SHA-256 is `81cbe5f004ff5c0e64db8ead4fe13f1a7f410acbe26f5d01bdf6b33d9aa959b3`. Compose kept the controller's service name, port, device access, restart policy and 10 GiB memory and swap limits. The live health response reported one slot, 393,216 positions, images enabled and medium default reasoning effort.
@@ -41,7 +47,7 @@ Run from the pinned Keygen checkout on the controller host. The saved provider c
 
 ```sh
 state="$HOME/.local/share/keygen-bench-inkling"
-stamp=20261122T142933Z
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
 work="$state/maya-hip-1429-$stamp"
 export KEYGEN_LISTENER_PYTHON="$state/listener-venv/bin/python" KEYGEN_FT2_ANALYSIS="$state/ft2-analysis"
 export HF_HUB_OFFLINE=1 LITELLM_LOCAL_MODEL_COST_MAP=True
@@ -61,7 +67,7 @@ On build `27a63d9`, every append reused the preceding input and every generated 
 
 An identical request retried after generation behaves differently from a new conversation turn. During the live Keygen run, a 27,812-token request reached its 16,384-token output cap in 178 seconds. The public controller sent the identical input hash a second time. The repeated request restored 25,736 tokens and reread 2,076. The native engine saves convolution and sliding KV at prompt boundaries. After it has decoded past the prompt, replaying that exact prompt needs the preceding checkpoint to regenerate its next-token logits. The following chat turn resumed normally and reused 31,035 of 31,035 available tokens. Compare `attempt-1/transport.jsonl` with `docker logs --since 2026-11-22T14:33:00Z inkling-2-mini` on Prometheus.
 
-Two more turns in that attempt illustrate a template limitation. The client retained the returned reasoning, content and tool calls. Rendering assistant turn 19 with the packaged tokenizer produced 8,071 tokens from an 8,055-token generation. Turn 44 rendered in 7,925 tokens from a 7,926-token generation. A structured API message carries the text and parsed arguments but loses the original token boundaries and JSON spelling. The engine rolled back to the prior prompt boundary in these cases. Of 77 follow-ups, 74 reused every preceding token. The two re-renderings and the identical retry above account for all three misses. Reproduce the counts from the private run with `python3 tools/ik2_keygen_cache.py --tokenizer TOKENIZER_DIR "$WORK/attempt-1/trajectory.json"`. The audit emits counts only.
+Two more turns in that attempt illustrate a template limitation. The client retained the returned reasoning, content and tool calls. Rendering assistant turn 19 with the packaged tokenizer produced 8,071 tokens from an 8,055-token generation. Turn 44 rendered in 7,925 tokens from a 7,926-token generation. A structured API message carries the text and parsed arguments but loses the original token boundaries and JSON spelling. The engine rolled back to the prior prompt boundary in these cases. Of 77 follow-ups, 74 reused every preceding token. The two re-renderings and the identical retry above account for all three misses. Reproduce the counts from the private run with `python3 tools/ik2_keygen_cache.py --tokenizer TOKENIZER_DIR "$work/attempt-1/trajectory.json"`. The audit emits counts only.
 
 A separate medium-effort chat added 17 and 26, then removed four. The first reply contained 415 characters of reasoning. Feeding back the complete message reused 174 of 174 available tokens. Omitting `reasoning_content` reused the 52-token prompt checkpoint. Both variants answered 39. See `retained-reasoning.jsonl` in the Prometheus build directory, reproduced with `python3 ik-reason-history.py` there.
 
