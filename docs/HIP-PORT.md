@@ -207,6 +207,20 @@ python3 src/tests/ik2_image_answers.py http://127.0.0.1:8085
 
 Comparing all 80,640 embedding values for each color-swap fixture gave CPU/HIP cosine similarities of 0.999370 and 0.999403. Pairing each CPU image with the opposite GPU image gave 0.913765 and 0.912137.
 
+### Image latency on port 8085
+
+The three screenshot fixtures are 1,480 × 900 pixels and have different image hashes. On a fresh one-slot service (`gfx1100-service-r2`) with a resident HIP encoder, the first screenshot returned 39% in 1.394 s. The next two returned 43% in 0.903 s and 55% in 0.807 s. The CPU service took 13.813 and 13.928 s on the latter two. Its 0.323 s reply to the first used an image embedding retained from the earlier run. Text-prefix cache hits were zero in all six requests.
+
+Reducing the prefill chunk to 256 had a cost for text. In the same HTTP test with 8,207 actual prompt tokens, median cold prefill fell from 3,251.3 tok/s with CPU vision to 1,804.5 with resident HIP vision. Decode measured 109.1 and 107.8 tok/s, respectively. The prompt corpus, chat template, GGUF, generation cap and context reservation were identical. Each median covers three requests with zero cached tokens after a warm-up.
+
+```sh
+python3 src/tests/ik2_image_answers.py http://127.0.0.1:8085 --screenshots
+python3 src/tools/strata/bench_http.py --url http://127.0.0.1:8085 --api openai \
+    --tokenizer ik2-tokenizer/tokenizer --ctx 641,8321 --prompt-lens 8192 --gen 129 --runs 3 --warmup 1
+```
+
+An OpenBLAS CPU experiment encoded the same three images in 27.993, 27.719 and 27.880 s with four threads. The original CPU kernel took 13.855, 13.873 and 14.135 s. These are encoder times before any language-model work. The services keep the original CPU encoder. Run `bash ik-vision-blas-check.sh` in the Prometheus build directory.
+
 ## Full-model measurements at 393,216 reserved tokens
 
 The RX 7900 XTX ran commit `9a0f164` with the installed ggml-org IQ4_NL GGUF, a 1,024-token prefill chunk and E4M3 KV. Every expert stayed on the card. The runner alternated prompt starts, checked that zero input tokens were reused and timed 128 decode steps after the first prediction. Each cell is the median of three requests. Startup is excluded.
