@@ -269,19 +269,19 @@ A 64×64 WMMA projection tile replaced the hipBLAS FP16 products in large prefil
 
 | Prompt | Maya prefill | Maya decode | Deployed llama.cpp prefill | Deployed llama.cpp decode |
 | ---: | ---: | ---: | ---: | ---: |
-| 32 | 415.58 | 110.54 | 247.14 | 64.14 |
-| 512 | 2,612.24 | 109.12 | 1,304.86 | 63.96 |
-| 2,048 | 3,205.01 | 107.02 | 1,511.03 | 62.89 |
-| 8,192 | 3,126.72 | 100.31 | 1,488.44 | 61.97 |
-| 32,768 | 2,652.21 | 87.07 | | |
+| 32 | 376.47 | 111.21 | 247.14 | 64.14 |
+| 512 | 2,370.37 | 109.50 | 1,304.86 | 63.96 |
+| 2,048 | 3,362.89 | 107.29 | 1,511.03 | 62.89 |
+| 8,192 | 3,558.64 | 100.63 | 1,488.44 | 61.97 |
+| 32,768 | 3,010.93 | 87.67 | | |
 
-The 8,192- and 32,768-token rows below the single-chunk range were collected before the host input copy fix. A fast resident prefill could overwrite a pinned embedding or position buffer while the GPU had queued its copy. The 1,792-token prefix regression exposed the corruption. The fixed build waits for a transfer event before releasing those buffers and predicts identical continuations after a warm or cold replay. Reproduce with `python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 --model /weight.gguf --tokens water.force`.
+All five rows use the fixed asynchronous input transfer. A fast resident prefill could previously overwrite pinned embeddings or positions while their copy was pending. Reproduce the warm vs cold continuation check with `python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 --model /weight.gguf --tokens water.force`.
 
-Medians in tok/s for three uncached requests per depth. Each request generates 129 tokens with 128 timed decode steps. Maya reserved 32,897 positions with FP8 KV. The service retained its deployed 393,216 positions with Q4_0 KV. On the first 32-token request the initial matrix-library setup took the prefill rate down to 17.5 tok/s. The other two measured 415.58 tok/s.
+Medians in tok/s for three uncached requests per depth. Each request generates 129 tokens with 128 timed decode steps. Maya reserved 32,897 positions with FP8 KV. The service retained its deployed 393,216 positions with Q4_0 KV. On the first 32-token request the initial matrix-library setup took the prefill rate down to 18.52 tok/s. The other two measured 376.47 tok/s.
 
 ```sh
 export IK2_HOST=mmap IK2_KV=fp8 IK2_GATE_BF16=1 IK2_GATE_TILE=64 IK2_Q8_UNROLL=1
-export IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1 IK2_PREFILL_TILE=64 IK2_EXPERT_TILE_LDS=0
+export IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1 IK2_PREFILL_TILE=64 IK2_EXPERT_TILE_LDS=1 IK2_SHARED_COMBINE=1
 export IK2_F16_MV=2 IK2_IQ4_MV=1 IK2_Q8_MV=1 IK2_Q8_TILE=1 IK2_EXPERT_LIMB=0
 export IK2_PREFILL_DENSE=1 IK2_DENSE_WMMA=1 IK2_FLASH=1 IK2_FLASH_WAVES=4
 export IK2_ATTN_MMA=3 IK2_DECODE_SUBWAVE=1 IK2_ATTN_STAGED=1 IK2_RESIDENT_ONLY=1
@@ -356,3 +356,13 @@ With the pinned-input fix, Maya again returned the exact midpoint phrase on the 
 | 131,072 | falcon meadow lantern glacier | 78.134 s | 80 | 59.76 tok/s |
 
 These are single runs with token-major E4M3. The longer prompt fully recovered its 131,072-token prefix for the fixed-length request. To reproduce, add `--decode-steps 128` to both Python commands above and use `--depths 32768,131072`. Set `IK2_EXPERT_TILE_LDS=1` and `IK2_SHARED_COMBINE=1` with the cooperative prefill environment.
+
+
+### CUDA build check
+
+CUDA 12.8 compiled and linked the engine and its device tests for sm_86 with the following commands. The host used for compilation has no NVIDIA GPU.
+
+```sh
+cmake -S . -B build-cuda -G Ninja -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=ON
+cmake --build build-cuda --target maya-ik2 ik2_kernels_test -j4
+```

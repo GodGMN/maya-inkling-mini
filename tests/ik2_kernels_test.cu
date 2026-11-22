@@ -1410,6 +1410,10 @@ void test_attn_decode_mma() {
         {12, 4, 0, 1 << 30, 64, 0, 1, "first token"},
         {12, 4, 9, 1 << 30, 64, 0, 3, "10 keys, 3 blocks"},
         {24, 8, 2499, 1 << 30, 1024, 0, 5, "2500 keys, 3 heads a K/V head"},
+#ifdef STRATA_USE_HIP
+        {12, 4, 9, 1 << 30, 64, 0, 129, "10 keys, many empty splits"},
+        {6, 2, 1067, 512, 128, 640, 257, "ring with 257 splits"},
+#endif
         {8, 1, 1000, 1 << 30, 200, 0, 2, "1001 keys, 8 heads a K/V head"},
         {4, 4, 333, 1 << 30, 64, 0, 7, "334 keys, 1 head a K/V head"},
         {12, 2, 2000, 256, 256, 400, 2, "ring 400, window 256, 6 heads"},

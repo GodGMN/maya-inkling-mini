@@ -1,8 +1,8 @@
 # Inkling 2 Mini on AMD Radeon RX 7900 XTX
 
-On Prometheus's RX 7900 XTX, `maya-ik2` decoded at **109.1 tok/s after a 512-token prompt** and **107.0 tok/s after 2,048 tokens**. The deployed llama.cpp service measured 64.0 and 62.9 tok/s on the same token IDs and ggml-org IQ4_NL weights. Each median covers three greedy requests with 128 timed decode steps. Maya used FP32 expert inputs and FP8 KV. The service used its production Q4_0 KV configuration.
+On Prometheus's RX 7900 XTX, `maya-ik2` decoded at **109.5 tok/s after a 512-token prompt** and **107.3 tok/s after 2,048 tokens**. The deployed llama.cpp service measured 64.0 and 62.9 tok/s on the same token IDs and ggml-org IQ4_NL weights. Each median covers three greedy requests with 128 timed decode steps. Maya used FP32 expert inputs and FP8 KV. The service used its production Q4_0 KV configuration.
 
-Maya read an uncached 2,048-token prompt at **3,205 tok/s**. Llama.cpp reached 1,511 tok/s. The 8K and larger prompt results are being remeasured after a fix for the transfer of input tokens to the GPU. [Hardware results and commands](docs/HIP-PORT.md#cooperative-prefill-and-depth-dependent-decode-attention)
+After an uncached 8,192-token prompt, Maya measured **3,559 tok/s prefill and 100.6 tok/s decode**. Llama.cpp measured 1,488 and 62.0 tok/s. [Hardware results and commands](docs/HIP-PORT.md#cooperative-prefill-and-depth-dependent-decode-attention)
 
 For a rename in an 886-output-token Python file, verifying proposed tokens from the prompt reached **445.8 tok/s**, up from **107.8 tok/s** with plain decode. Copying a repetitive inventory reached **750.7 tok/s**. All three repeats produced the requested text exactly. Both tasks used direct answers and the target model alone. [Copy and edit commands](docs/HIP-PORT.md#copy-and-edit-requests-without-a-drafter)
 

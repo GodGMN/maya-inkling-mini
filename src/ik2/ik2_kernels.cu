@@ -3689,6 +3689,55 @@ __global__ void attn_combine_kernel(const float* sink, const float* part, int H,
     if (out16) out16[index] = f2h(value);
 }
 
+#ifdef STRATA_USE_HIP
+// Compute one exponential per split. Each feature then combines the same partials in the scalar kernel's order.
+__global__ void rdna3_combine_splits(const float* sink, const float* partials, int splits, float inv,
+                                     float* out, const float* gate, uint16_t* out16) {
+    const int head = blockIdx.x, tid = threadIdx.x;
+    const float* data = partials + (size_t)head * splits * 130;
+    __shared__ float wave_max[4];
+    extern __shared__ float2 weights[];
+    const float sk = sink[head];
+    float m = sk;
+    for (int p = tid; p < splits; p += 128) m = fmaxf(m, data[p * 130]);
+#pragma unroll
+    for (int d = 16; d; d /= 2) m = fmaxf(m, __shfl_xor(m, d, 32));
+    if (!(tid & 31)) wave_max[tid / 32] = m;
+    __syncthreads();
+    m = fmaxf(fmaxf(wave_max[0], wave_max[1]), fmaxf(wave_max[2], wave_max[3]));
+    for (int p = tid; p < splits; p += 128) {
+        const float mp = data[p * 130];
+        weights[p] = make_float2(mp == -INFINITY ? 0.f : expf(mp - m), data[p * 130 + 1]);
+    }
+    __syncthreads();
+    float sum = expf(sk - m), y = 0.f;
+    for (int p = 0; p < splits; ++p) {
+        const float2 w = weights[p];
+        if (w.x) {
+            sum += w.y * w.x;
+            y += data[p * 130 + 2 + tid] * w.x;
+        }
+    }
+    const int index = head * 128 + tid;
+    float value = (y / sum) * inv;
+    if (gate) value *= 1.f / (1.f + expf(-gate[index]));
+    out[index] = value;
+    if (out16) out16[index] = f2h(value);
+}
+#endif
+
+void combine_token_splits(const float* sink, const float* partials, int heads, int splits, float inv, float* out,
+                          const float* gate, uint16_t* out16, cudaStream_t stream) {
+#ifdef STRATA_USE_HIP
+    static const bool shared = getenv("IK2_SHARED_COMBINE") && atoi(getenv("IK2_SHARED_COMBINE"));
+    if (shared && splits >= 16 && splits <= 1024) {
+        rdna3_combine_splits<<<heads, 128, splits * sizeof(float2), stream>>>(sink, partials, splits, inv, out, gate, out16);
+        return;
+    }
+#endif
+    attn_combine_kernel<<<heads, 128, 0, stream>>>(sink, partials, heads, splits, inv, out, gate, out16);
+}
+
 template <int WARPS, int ROWS>
 __global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_t rb, const float* x, float* y) {
     extern __shared__ float xs[];
@@ -6233,7 +6282,7 @@ void attn_decode_f16_at(const float* q, const float* r, const float* sink, const
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
                         int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s, const float* gate, uint16_t* out16) {
     split_token_attention(q, r, kc, vc, kv_cap, H, Hkv, pos, P, qk_scale, proj, d_rel, extent, window, scratch, s);
-    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, out, gate, out16);
+    combine_token_splits(sink, scratch, H, P, 1.0f, out, gate, out16, s);
     check("attn_decode_f16_at (combine)");
 }
 void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
@@ -6241,7 +6290,7 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
                         const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
                         cudaStream_t s, const float* gate, uint16_t* out16) {
     split_token_attention(q, r, kc, vc, kv_cap, H, Hkv, pos, P, qk_scale, proj, d_rel, extent, window, scratch, s);
-    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, v_inv_scale, out, gate, out16);
+    combine_token_splits(sink, scratch, H, P, v_inv_scale, out, gate, out16, s);
     check("attn_decode_fp8_at (combine)");
 }
 
@@ -6284,7 +6333,7 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
         rdna3_attn_part<false><<<dim3(Hkv, n_split), 32, 0, s>>>(q16, r, kc, vc, kv_cap, H, Hkv, pos, qpos,
                                                       qk_scale, proj, d_rel, extent, window, scratch, 1, H * 128, nullptr);
     check("rdna3_attn_part");
-    attn_combine_kernel<<<H, 128, 0, s>>>(sink, scratch, H, n_split, v_inv, out, gate, out16);
+    combine_token_splits(sink, scratch, H, n_split, v_inv, out, gate, out16, s);
     check("rdna3 attention combine");
 #else
     if (H % Hkv || H / Hkv > 8 || n_split < 1 || (kv_cap > 0 && kv_cap < 16)) {
