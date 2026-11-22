@@ -548,3 +548,20 @@ done
 cmp swiglu-0.f32 swiglu-1.f32
 for k in 32 64; do IK2_WMMA_K=$k IK2_PREFILL_SWIGLU=1 ./build-ik2/ik2_kernels_test; done
 ```
+
+### Q8 attention output projection
+
+The 3,072-input Q8 projection handles eight output rows per workgroup. It reads the original quantized weights and accumulates each row in the same order. A 37-row device test covers the partially filled last workgroup against FP64. For 32 held-out decode steps, the full-vocabulary FP32 logits matched the prior build byte for byte.
+
+With the loop-gate optimization enabled, the median of three 256-step requests changed from 117.38 to 118.14 tok/s at 512 tokens and from 107.61 to 108.61 tok/s at 8,192 tokens. The command uses the same input IDs on each build.
+
+```sh
+# Run on the parent of the projection commit, then on the commit itself.
+export IK2_GATE_TILE=256 IK2_Q8_UNROLL=1 IK2_DECODE_PROJ=1
+python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    --tokens water.force --depths 32,512,8192 --gen 257 --repeats 3 --chunk 2048
+IK2_Q8_UNROLL=1 ./build-ik2/ik2_kernels_test
+IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT=projection.f32 ./build-ik2/maya-ik2 \
+    --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
+sha256sum projection.f32
+```

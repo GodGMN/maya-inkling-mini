@@ -4088,7 +4088,7 @@ __global__ void q8_mma_tile(const int8_t* q, const uint16_t* scales, int N, int 
 }
 #endif
 
-template <int StaticK>
+template <int StaticK, int Unroll = 4>
 __device__ __forceinline__ void mv_q8p_row(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, int N, int runtime_k,
                               const float* __restrict__ x, float* y, MvConv c0, MvConv c1, MvAlt a0, MvAlt a1, int row, int lane) {
     const int K = StaticK ? StaticK : runtime_k;
@@ -4100,7 +4100,7 @@ __device__ __forceinline__ void mv_q8p_row(const int8_t* __restrict__ q, const u
                                         : (unsigned) (row - a1.r0) < (unsigned) a1.n ? a1.x
                                                                                      : x);
     float acc = 0.0f;
-#pragma unroll 4
+#pragma unroll Unroll
     for (int it = 0, n_it = K >> 7; it < n_it; ++it) {
         const uint32_t w = __ldg(qr + it * 32 + lane);
         const float4 xv = __ldg(x4 + it * 32 + lane);
@@ -4111,10 +4111,10 @@ __device__ __forceinline__ void mv_q8p_row(const int8_t* __restrict__ q, const u
     acc = wsum(acc);
     if (lane == 0 && !mv_conv_row(c0, row, acc) && !mv_conv_row(c1, row, acc)) y[row] = acc;
 }
-template <int WARPS, int StaticK = 0>
+template <int WARPS, int StaticK = 0, int Unroll = 4>
 __global__ void mv_q8p_kernel(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y,
                               MvConv c0, MvConv c1, MvAlt a0, MvAlt a1) {
-    mv_q8p_row<StaticK>(q, d, N, K, x, y, c0, c1, a0, a1,
+    mv_q8p_row<StaticK, Unroll>(q, d, N, K, x, y, c0, c1, a0, a1,
                         blockIdx.x * WARPS + (threadIdx.x >> 5), threadIdx.x & 31);
 }
 
@@ -6359,9 +6359,13 @@ void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* 
     static const bool specialize = getenv("IK2_Q8_UNROLL") && atoi(getenv("IK2_Q8_UNROLL"));
     if (specialize && K == 2304)
         mv_q8p_kernel<4, 2304><<<(unsigned)((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1);
-    else if (specialize && K == 3072)
+    else if (specialize && K == 3072) {
+#ifdef STRATA_USE_HIP
+        mv_q8p_kernel<8, 3072, 8><<<(unsigned)((N + 7) / 8), 256, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1);
+#else
         mv_q8p_kernel<4, 3072><<<(unsigned)((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1);
-    else
+#endif
+    } else
         mv_q8p_kernel<4><<<(unsigned)((N + 3) / 4), 128, 0, s>>>(q, d, N, K, x, y, c0, c1, a0, a1);
     check("mv_q8p");
 }

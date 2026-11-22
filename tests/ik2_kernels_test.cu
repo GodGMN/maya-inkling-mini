@@ -801,6 +801,29 @@ void test_experts_mv() {
 }
 
 #ifdef STRATA_USE_HIP
+void test_rdna3_attention_output_projection() {
+    constexpr int rows = 37, width = 3072;
+    std::mt19937 gen(193);
+    std::uniform_real_distribution<float> random(-1.f, 1.f);
+    std::vector<float> x(width);
+    std::vector<int8_t> q(rows * width);
+    std::vector<uint16_t> d(rows * (width / 32));
+    for (float& v : x) v = random(gen);
+    for (int8_t& v : q) v = (int)(gen() % 256) - 128;
+    for (uint16_t& v : d) v = f2h_host(random(gen) / 32);
+    auto* dx = dev(x);
+    auto* dq = dev(q);
+    auto* dd = dev(d);
+    auto* dy = dev_n<float>(rows);
+    k::mv_q8p(dq, dd, rows, width, dx, dy, 0);
+    std::vector<double> expected(rows);
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < width; ++c)
+            expected[r] += (double)h2f_host(d[(r * width + c) / 32]) * q[r * width + c] * x[c];
+    expect("RDNA3 3072-wide Q8 projection vs FP64", host(dy, rows), expected, 2e-5, 2e-5);
+    cudaFree(dx); cudaFree(dq); cudaFree(dd); cudaFree(dy);
+}
+
 void test_rdna3_loop_gate() {
     constexpr int C = 2304, R = 64, jobs = 3;
     std::mt19937 gen(714);
@@ -3177,6 +3200,7 @@ int main() {
 #ifdef STRATA_USE_HIP
     test_iq4nl_gate_cancellation();
     test_rdna3_loop_gate();
+    test_rdna3_attention_output_projection();
     test_rdna3_small_dense();
     test_rdna3_dense_gemm();
     test_rdna3_expert_groups();
