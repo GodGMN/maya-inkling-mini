@@ -2685,8 +2685,8 @@ __device__ __forceinline__ float linear_limb_dot(const uint8_t* row, int sub, co
     for (int j = 0; j < 4; ++j) {
         uint32_t four = (uint32_t)q[2 * j] | ((uint32_t)q[2 * j + 1] << 16);
         if constexpr (Type == kIQ4_NL) four = iq4nl_lut4(four, sub & 1);
-        hi = __dp4a(four, x.high[j], hi);
-        lo = __dp4a(four, x.low[j], lo);
+        hi = __dp4a(static_cast<int>(four), x.high[j], hi);
+        lo = __dp4a(static_cast<int>(four), x.low[j], lo);
     }
     return float(128 * hi + lo) * x.scale * h2f(*(const uint16_t*)block);
 }
