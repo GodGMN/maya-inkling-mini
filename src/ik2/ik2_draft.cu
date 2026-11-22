@@ -532,6 +532,16 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     std::memcpy(out, d->h_out, proposals * sizeof(int));
 }
 
+std::vector<CacheSpan> cache_spans(const Drafter* d) {
+    std::vector<CacheSpan> spans = {{d->f_rnn, 1, d->C * sizeof(float)}};
+    for (const auto& l : d->L) {
+        const size_t stride = d->KV * 128 * (l.kc16 ? sizeof(uint16_t) : sizeof(float));
+        spans.push_back({l.kc16 ? (void*)l.kc16 : (void*)l.kc, (size_t)l.cap, stride});
+        spans.push_back({l.vc16 ? (void*)l.vc16 : (void*)l.vc, (size_t)l.cap, stride});
+    }
+    return spans;
+}
+
 size_t bytes(const Drafter* d) { return d->vram; }
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d) { d->head_q8 = q8, d->head_q8d = q8d; }
 

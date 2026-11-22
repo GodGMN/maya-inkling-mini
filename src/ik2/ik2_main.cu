@@ -393,6 +393,57 @@ T* dalloc(size_t n) {
     return p;
 }
 
+// Captured graphs point at the active cache. Exchange its live rows with another
+// slot between requests, leaving every recorded device address valid.
+struct SlotStorage {
+    struct Region {
+        uint8_t* active;
+        size_t rows, stride, page;
+        size_t bytes(size_t length) const {
+            return std::min(rows, (length + page - 1) / page * page) * stride;
+        }
+    };
+    std::vector<Region> regions;
+    std::vector<uint8_t*> parked;
+    uint8_t* scratch = nullptr;
+    static constexpr size_t tile = 4 << 20;
+
+    void add(void* ptr, size_t rows, size_t stride, size_t page = 1) {
+        regions.push_back({static_cast<uint8_t*>(ptr), (rows + page - 1) / page * page, stride, page});
+    }
+    void allocate(int slots) {
+        size_t bytes = 0;
+        for (const Region& r : regions) bytes += r.rows * r.stride;
+        parked.resize(slots);
+        for (int i = 1; i < slots; ++i) parked[i] = dalloc<uint8_t>(bytes);
+        scratch = dalloc<uint8_t>(tile);
+        std::fprintf(stderr, "conversation slots: %d, %.1f MiB per cache, %.1f MiB for exchanges\n",
+                     slots, bytes / 1048576., tile / 1048576.);
+    }
+    void exchange(int from, int to, size_t outgoing, size_t incoming) {
+        uint8_t* stored = parked[to];
+        auto copy = [](uint8_t* dst, const uint8_t* src, size_t n) {
+            CU(cudaMemcpyAsync(dst, src, n, cudaMemcpyDeviceToDevice, g_s));
+        };
+        for (const Region& r : regions) {
+            const size_t a = r.bytes(outgoing), b = r.bytes(incoming), both = std::min(a, b);
+            for (size_t i = 0; i < both; i += tile) {
+                const size_t n = std::min(tile, both - i);
+                copy(scratch, r.active + i, n);
+                copy(r.active + i, stored + i, n);
+                copy(stored + i, scratch, n);
+            }
+            if (a > b) copy(stored + b, r.active + b, a - b);
+            if (b > a) copy(r.active + a, stored + a, b - a);
+            // A fresh conversation has zero convolution history. KV rows are written before use.
+            if (!incoming && r.rows == 1) CU(cudaMemsetAsync(r.active, 0, r.stride, g_s));
+            stored += r.rows * r.stride;
+        }
+        CU(cudaStreamSynchronize(g_s));
+        std::swap(parked[from], parked[to]);
+    }
+};
+
 // Y [T][N] (ldy) = X [T][K] FP16 . W [N][K]^T FP16, F32 sums
 void gemm16(const uint16_t* W, int N, int Kd, const uint16_t* X, int T, float* Y, int ldy, float beta = 0.0f) {
 #ifdef STRATA_USE_HIP
@@ -4246,6 +4297,7 @@ void embed_row(Model& M, int t, float* raw, float* out) {
 int main(int argc, char** argv) {
     std::string model, toks, dump, draft_path;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
+    int cache_slots = getenv("IK2_CACHE_SLOTS") ? std::atoi(getenv("IK2_CACHE_SLOTS")) : 1;
     bool serve = false, serve_maya = true;   // (--serve: Maya's engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (Maya's protocol)
     double cache_gb = 60;
@@ -4268,6 +4320,7 @@ int main(int argc, char** argv) {
         else if (a == "--gen") gen = std::atoi(next().c_str());
         else if (a == "--chunk") chunk = std::atoi(next().c_str());
         else if (a == "--ctx" || a == "--max-context") ctx = std::atoi(next().c_str());   // (--max-context: serve/server.py's name)
+        else if (a == "--cache-slots") cache_slots = std::atoi(next().c_str());
         else if (a == "--cache-gb") cache_gb = std::atof(next().c_str());
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--gpus") n_gpu = std::atoi(next().c_str());
@@ -4320,6 +4373,9 @@ int main(int argc, char** argv) {
     if (model.empty() || (toks.empty() && !serve))
         die("usage: maya-ik2 --model FIRST.gguf (--tokens 1,2,3 [--gen N] | --serve) [--chunk 2048] [--ctx N] ...");
     if (chunk < 1 || ctx < 1) die("--chunk and --ctx must be positive");
+    if (cache_slots < 1 || cache_slots > ctx) die("--cache-slots must be between 1 and the total context size");
+    if (cache_slots > 1 && (!serve || n_gpu != 1)) die("multiple cache slots require a single-GPU server");
+    ctx /= cache_slots;
     std::vector<int> prompt;
     for (const char* p = toks.c_str(); *p;) {
         prompt.push_back(std::atoi(p));
@@ -4519,6 +4575,7 @@ int main(int argc, char** argv) {
             if (!g_kv_managed || c.sliding[l])
                 kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (fp8_kv(c.sliding[l]) ? 1 : 2) * 2;
         }
+        kv_b *= (size_t)cache_slots;
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
         // With resident-only loading the actual post-workspace budget decides how many experts fit.
@@ -5041,6 +5098,21 @@ int main(int argc, char** argv) {
     } else
         suffix_window = 0;
 
+    SlotStorage slot_storage;
+    if (cache_slots > 1) {
+        for (const Visit& v : M.V) {
+            const size_t page = M.L[v.l].paged_kv ? 16 : 1;
+            const size_t row = KD * (v.kc8 ? 1 : sizeof(uint16_t));
+            slot_storage.add(v.kc8 ? (void*)v.kc8 : (void*)v.kc, v.kv_cap, row, page);
+            slot_storage.add(v.vc8 ? (void*)v.vc8 : (void*)v.vc, v.kv_cap, row, page);
+            for (auto* h : {v.h_k, v.h_v}) slot_storage.add(h, 1, 3 * KD * sizeof(float));
+            for (auto* h : {v.h_attn, v.h_mlp}) slot_storage.add(h, 1, 3 * C * sizeof(float));
+        }
+        if (drafter)
+            for (const auto& span : ik2::draft::cache_spans(drafter))
+                slot_storage.add(span.ptr, span.rows, span.row_bytes);
+        slot_storage.allocate(cache_slots);
+    }
     // the work buffers and the expert cache, a set a GPU
     for (int d = 0; d < n_gpu; ++d) {
     use_dev(d);
@@ -5362,9 +5434,6 @@ int main(int argc, char** argv) {
         // --serve: requests on stdin, a line each - "GEN max_new temperature top_p seed stop,stop ids,ids,..." - and
         // the answer on stdout as "@TOK id" lines then "@END reason prompt_tokens cached_tokens prompt_s gen_s".  The
         // tokens whose state the model holds are kept: a request that starts with them runs only what follows.
-        std::vector<int> hist;
-        std::vector<uint64_t> hist_sig;   // a picture row's hash at its position (shorter than hist: the rest are tokens)
-        std::vector<float> last;
         double t_exp = 0;
         // Snapshots of every short conv's history (plus sliding-layer KV windows in host RAM) at the end of a
         // request's prompt (before its generation): an agent's next turn usually agrees with the last one up to
@@ -5376,8 +5445,29 @@ int main(int argc, char** argv) {
             std::vector<std::vector<uint8_t>> kv_k, kv_v;
         };
         const size_t kv_elem_b = fp8_kv(true) ? 1 : 2;
-        std::vector<Snap> snaps(8);
-        for (auto& sn : snaps) {
+        struct Conversation {
+            std::vector<int> hist;
+            std::vector<uint64_t> hist_sig;
+            std::vector<float> last;
+            std::vector<Snap> snaps;
+            int snap_next = 0;
+            uint64_t used = 0;
+
+            int checkpoint(size_t shared, size_t length) const {
+                int best = -1;
+                for (size_t i = 0; i < snaps.size(); ++i) {
+                    const auto pos = snaps[i].pos;
+                    if (pos >= 0 && (size_t)pos <= shared && (size_t)pos < length &&
+                        (best < 0 || pos > snaps[best].pos)) best = (int)i;
+                }
+                return best;
+            }
+        };
+        std::vector<Conversation> conversations(cache_slots);
+        int active_slot = 0;
+        uint64_t request_order = 0;
+        for (auto& convo : conversations) convo.snaps.resize(std::max(1, 8 / cache_slots));
+        for (auto& convo : conversations) for (auto& sn : convo.snaps) {
             sn.kv_k.resize(M.V.size());
             sn.kv_v.resize(M.V.size());
             for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
@@ -5387,7 +5477,6 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < 4; ++i) sn.h.push_back(dalloc<float>(3 * cc[i]));
             }
         }
-        int snap_next = 0;
         auto snap_copy = [&](Snap& sn, bool save) {
             const size_t cc[4] = {KD, KD, C, C};
             const cudaMemcpyKind kv_dir = save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
@@ -5429,8 +5518,8 @@ int main(int argc, char** argv) {
             }
             for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
         };
-        auto reset = [&]() {
-            for (auto& sn : snaps) sn.pos = -1;
+        auto reset = [&](Conversation& slot) {
+            for (auto& sn : slot.snaps) sn.pos = -1;
             for (int vis = 0; vis < (int) M.V.size(); ++vis) {
                 Layer& Ly = bind_visit(M, vis);
                 use_dev(Ly.dev);
@@ -5439,9 +5528,9 @@ int main(int argc, char** argv) {
                 CU(cudaMemset(Ly.h_attn, 0, 3 * C * 4));
                 CU(cudaMemset(Ly.h_mlp, 0, 3 * C * 4));
             }
-            hist.clear();
-            hist_sig.clear();
-            last.clear();
+            slot.hist.clear();
+            slot.hist_sig.clear();
+            slot.last.clear();
         };
         auto parse_ints = [](const std::string& t) {
             std::vector<int> v;
@@ -5468,7 +5557,7 @@ int main(int argc, char** argv) {
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
         if (serve_maya) {
-            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d\n", kv_format_name(), ctx, n_gpu);
+            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d cache_slots=%d\n", kv_format_name(), ctx, n_gpu, cache_slots);
             std::printf("READY %d stop\n", ctx);
         } else {
             std::printf("@READY ctx %d\n", ctx);
@@ -5584,22 +5673,47 @@ int main(int argc, char** argv) {
             g_cancel = 0;
             busy = true;
             if (seed >= 0) rng.seed((uint64_t) seed);
-            size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
-            auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
-            while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
+            size_t L = 0, best_reusable = 0;
+            int selected = active_slot, restore = -1;
+            for (int i = 0; i < cache_slots; ++i) {
+                const auto& candidate = conversations[i];
+                size_t shared = 0;
+                while (shared < candidate.hist.size() && shared < ids.size() && candidate.hist[shared] == ids[shared] &&
+                       (shared < candidate.hist_sig.size() ? candidate.hist_sig[shared] : 0) == sig[shared])
+                    ++shared;
+                const bool can_append = shared == candidate.hist.size() &&
+                                        (shared < ids.size() || !candidate.last.empty());
+                const int checkpoint = can_append ? -1 : candidate.checkpoint(shared, ids.size());
+                const size_t reusable = can_append ? shared : checkpoint < 0 ? 0 : candidate.snaps[checkpoint].pos;
+                const bool preferred = reusable ? candidate.used > conversations[selected].used
+                                                : candidate.used < conversations[selected].used;
+                if (i == 0 || reusable > best_reusable || (reusable == best_reusable && preferred)) {
+                    restore = checkpoint;
+                    selected = i;
+                    L = shared;
+                    best_reusable = reusable;
+                }
+            }
+            if (selected != active_slot) {
+                slot_storage.exchange(active_slot, selected, conversations[active_slot].hist.size(),
+                                      conversations[selected].hist.size());
+                active_slot = selected;
+            }
+            auto& slot = conversations[active_slot];
+            slot.used = ++request_order;
+            auto& hist = slot.hist;
+            auto& hist_sig = slot.hist_sig;
+            auto& last = slot.last;
+            auto& snaps = slot.snaps;
+            auto& snap_next = slot.snap_next;
             if (L < hist.size() || L == ids.size()) {
                 // back to the latest snapshot at or before L that leaves a token to run (one past it is dropped:
                 // its position's state follows from a prefix the request does not share)
-                int best = -1;
-                for (int i = 0; i < (int) snaps.size(); ++i)
-                    if (snaps[i].pos >= 0 && snaps[i].pos <= (int) L && snaps[i].pos < (int) ids.size() &&
-                        (best < 0 || snaps[i].pos > snaps[best].pos))
-                        best = i;
                 if (L == hist.size() && L == ids.size() && !last.empty()) {
                     // (the same tokens again: the last logits answer)
-                } else if (best >= 0) {
-                    const int sp = snaps[best].pos;
-                    snap_copy(snaps[best], false);
+                } else if (restore >= 0) {
+                    const int sp = snaps[restore].pos;
+                    snap_copy(snaps[restore], false);
                     for (auto& sn : snaps)
                         if (sn.pos > sp) sn.pos = -1;
                     hist.resize(sp);
@@ -5607,7 +5721,7 @@ int main(int argc, char** argv) {
                     last.clear();
                     L = sp;
                 } else {
-                    reset(), L = 0;
+                    reset(slot), L = 0;
                 }
             }
             const int cached = (int) L;
@@ -5668,7 +5782,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (cancelled) {
-                reset();
+                reset(slot);
                 if (serve_maya) std::printf("DONE 0 %zu %.1f 0 cancel 0 0 %d\n", ids.size(), (now() - t0) * 1e3, cached);
                 else std::printf("@END cancelled %zu %d %.3f %.3f\n", ids.size(), cached, now() - t0, 0.0);
                 std::fflush(stdout);

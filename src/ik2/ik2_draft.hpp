@@ -45,6 +45,12 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 /// The base logits through the target's head kept as planar Q8_0 (int8 [n_rows][C], FP16 scales [n_rows][C / 32]):
 /// propose's lm_f16 is not read then (the FP16 copy is fold()'s only).
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);
+/// Device state carried from one request to the next. Proposal workspaces are shared.
+struct CacheSpan {
+    void* ptr;
+    size_t rows, row_bytes;
+};
+std::vector<CacheSpan> cache_spans(const Drafter* d);
 /// VRAM it holds, bytes.
 size_t bytes(const Drafter* d);
 
