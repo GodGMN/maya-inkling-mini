@@ -86,7 +86,8 @@ class Config:
     """every number the forward uses, from the GGUF's inkling2.* keys (PR #32187's names, then master's)"""
 
     def __init__(self, md):
-        a = "inkling2."
+        self.physical_layers = md.get("general.architecture") == "inkling2_loop"
+        a = "inkling2_loop." if self.physical_layers else "inkling2."
 
         def g(*keys):
             for k in keys:
@@ -121,14 +122,22 @@ class Config:
         self.n_vocab = g("unpadded_vocab_size", "vocab_size_unpadded")
         assert md.get(a + "value_norm", True) and md.get(a + "attn_res_normalize_values", True)
         # the loop: the core's layers [core0, core1) run n_pass times; block_count counts the visits
-        self.n_pass = md.get(a + "num_loops", 1)
-        self.core0, self.core1 = (g("loop.core_start"), g("loop.core_end")) if self.n_pass > 1 else (0, 0)
+        self.n_pass = g("loop.count") if self.physical_layers else md.get(a + "num_loops", 1)
+        if md.get(a + "loop.varying", False):
+            raise ValueError("varying loop weights are unsupported")
+        self.core0, self.core1 = (g("loop.core_start", "loop.start"), g("loop.core_end", "loop.end")) if self.n_pass > 1 else (0, 0)
         n_core = self.core1 - self.core0
+        if self.physical_layers:
+            self.n_visits += (self.n_pass - 1) * n_core
         self.n_layers = self.n_visits - (self.n_pass - 1) * n_core
         if self.n_pass > 1:
             assert self.core0 > 0 and self.core0 % self.block == 0 and n_core % self.block == 0, (self.core0, self.core1)
         # the pattern is a visit's; a layer's is its first visit's (the same in every pass)
         pat = [bool(x) for x in g("attention.sliding_window_pattern")]
+        if self.physical_layers:
+            assert len(pat) == self.n_layers
+            self.sliding = pat
+            return
         assert len(pat) == self.n_visits
         self.sliding = [pat[L if L < self.core1 else L + (self.n_pass - 1) * n_core] for L in range(self.n_layers)]
 
@@ -212,6 +221,8 @@ class Ref:
 
     def control(self, L, x, msg, module):
         """the loop's message gate of a core layer's input: module attn (q's), k, v or mlp"""
+        if self.c.physical_layers:
+            module = {"attn": "q", "mlp": "ffn"}.get(module, module) + "_ctrl"
         b = f"blk.{L}.loop_{module}_"
         g = torch.cat([self.rms(x, eps=RES_EPS), self.rms(msg, eps=RES_EPS)], -1) @ self.w(b + "down.weight").T
         forget = torch.tanh(g @ self.w(b + "forget.weight").T)
@@ -353,7 +364,9 @@ class Ref:
                     h, blocks = pre_h, pre_blocks
                 for L in range(c.core0, c.core1):
                     msgs = None
-                    if p > 0:
+                    if p > 0 and c.physical_layers:
+                        msgs = self.attn_res(bank, last, self.w(f"blk.{L}.loop_msg_query.weight"))
+                    elif p > 0:
                         i = L - c.core0
                         m_q, m_mlp = self.attn_res(bank, last, self.w("loop_res_query.weight")[2 * i:2 * i + 2])
                         m_k, m_v = self.attn_res(bank, last, self.w("loop_kv_res_query.weight")[2 * i:2 * i + 2])

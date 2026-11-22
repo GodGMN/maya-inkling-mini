@@ -82,3 +82,24 @@ python3 tools/ik2_compare_decode.py graph-1.f32 --ref ref.npy --prompt-length 2 
 ```
 
 Run throughput measurements separately with logit export disabled, since exporting the full vocabulary adds a device-to-host copy per step.
+
+## Prometheus GPU validation
+
+The installed ggml-org IQ4_NL GGUF can be mounted read-only at `/weight.gguf`. It stores 24 physical layers under `inkling2_loop`. The three passes over layers 6–17 produce 48 visits. Each core layer stores its four message queries in q, k, v, FFN order. Twenty layers use IQ4_NL experts and four use Q8_0. Both the engine and CPU oracle read this layout directly.
+
+The gfx1100 run of `build-ik2/ik2_kernels_test` passed, including the new IQ4_NL comparisons. HIP FP contraction across statements changed the MoE convolution sum. The kernel target now contracts only within a source expression. KV unpacking preserves the E4M3 sign bit through rescaling, including negative zero. The tests exercise scalar and packed reads at inverse scales 0.5, 1 and 2. The CUDA-only MMA and flash tests are excluded from this build.
+
+The five-token prompt below is “The capital of France is”. On the three forced positions the scalar graph and eager logits agreed exactly by the comparator. The float64 reference and FP8-KV engine picked the same top token at all three positions, with mean KL 0.00443123 and max KL 0.00697867. This short check exercises the loop wiring and token alignment.
+
+```sh
+cd /work
+export IK2_HOST=mmap IK2_KV=fp8 IK2_GATE_BF16=1 IK2_GATE_TILE=64 IK2_Q8_UNROLL=1 IK2_BATCH_PREFILL=1
+printf '%s\n' '152717,11,149880' > paris-force.csv
+for graph in 0 1; do
+  IK2_GRAPH=$graph IK2_FORCE=paris-force.csv IK2_LOGITS_OUT=paris-$graph.f32 \
+    build-ik2/maya-ik2 --model /weight.gguf --ctx 1024 --chunk 128 --tokens 371,151451,149879,151194,149884 --gen 4
+done
+oracle-env/bin/python src/ref/inkling2.py /weight.gguf --tokens 371,151451,149879,151194,149884,152717,11,149880 --logprobs-out paris-ref.npy
+oracle-env/bin/python src/tools/ik2_compare_decode.py paris-1.f32 --baseline paris-0.f32 --prompt-length 5 --gen 4 --vocab 200058
+oracle-env/bin/python src/tools/ik2_compare_decode.py paris-0.f32 --ref paris-ref.npy --prompt-length 5 --gen 4 --vocab 200058
+```

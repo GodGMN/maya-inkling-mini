@@ -543,9 +543,9 @@ double nvfp4_def(const uint8_t* blocks, size_t v) {
 }
 
 void test_decode() {
-    const int types[] = {k::kNVFP4, k::kQ8_0, k::kQ5_K, k::kQ6_K, k::kIQ3_XXS, k::kIQ4_XS};
-    const char* names[] = {"NVFP4", "Q8_0", "Q5_K", "Q6_K", "IQ3_XXS", "IQ4_XS"};
-    for (int ti = 0; ti < 6; ++ti) {
+    const int types[] = {k::kNVFP4, k::kQ8_0, k::kQ5_K, k::kQ6_K, k::kIQ3_XXS, k::kIQ4_XS, k::kIQ4_NL};
+    const char* names[] = {"NVFP4", "Q8_0", "Q5_K", "Q6_K", "IQ3_XXS", "IQ4_XS", "IQ4_NL"};
+    for (int ti = 0; ti < (int) (sizeof types / sizeof types[0]); ++ti) {
         const int type = types[ti], bv = k::block_values(type);
         const size_t bb = k::block_bytes(type), nblk = 777, n = nblk * bv;
         std::vector<uint8_t> raw(nblk * bb);
@@ -558,7 +558,7 @@ void test_decode() {
                 h = (uint16_t) ((h & 0x83FF) | ((uint16_t) (8 + (h >> 10) % 8) << 10));
                 p[0] = (uint8_t) h, p[1] = (uint8_t) (h >> 8);
             };
-            if (type == k::kQ8_0) fix(0);
+            if (type == k::kQ8_0 || type == k::kIQ4_NL) fix(0);
             if (type == k::kQ5_K) fix(0), fix(2);
             if (type == k::kQ6_K) fix(208);
         if (type == k::kIQ3_XXS || type == k::kIQ4_XS) fix(0);
@@ -606,7 +606,7 @@ std::vector<uint8_t> rand_blocks(int type, size_t n_values) {
             h = (uint16_t) ((h & 0x83FF) | ((uint16_t) (8 + (h >> 10) % 8) << 10));
             p[0] = (uint8_t) h, p[1] = (uint8_t) (h >> 8);
         };
-        if (type == k::kQ8_0) fix(0);
+        if (type == k::kQ8_0 || type == k::kIQ4_NL) fix(0);
         if (type == k::kQ5_K) fix(0), fix(2);
         if (type == k::kQ6_K) fix(208);
         if (type == k::kIQ3_XXS || type == k::kIQ4_XS) fix(0);
@@ -665,13 +665,24 @@ void ggml_iq4_xs(const uint8_t* x, float* y, size_t k) {
     }
 }
 void test_iq_ref() {
-    for (int type : {k::kIQ3_XXS, k::kIQ4_XS}) {
+    for (int type : {k::kIQ3_XXS, k::kIQ4_XS, k::kIQ4_NL}) {
         const size_t n = 256 * 333;
         auto raw = rand_blocks(type, n);
         std::vector<float> want(n), got(n);
-        (type == k::kIQ3_XXS ? ggml_iq3_xxs : ggml_iq4_xs)(raw.data(), want.data(), n);
+        if (type == k::kIQ4_NL) {
+            for (size_t row = 0; row < n / 32; ++row) {
+                const auto* block = raw.data() + 18 * row;
+                const float scale = h2f_host(block[0] | (block[1] << 8));
+                for (int i = 0; i < 16; ++i) {
+                    want[32 * row + i] = scale * g_iq4nl[block[2 + i] & 15];
+                    want[32 * row + i + 16] = scale * g_iq4nl[block[2 + i] >> 4];
+                }
+            }
+        } else {
+            (type == k::kIQ3_XXS ? ggml_iq3_xxs : ggml_iq4_xs)(raw.data(), want.data(), n);
+        }
         k::decode_host(type, raw.data(), n, got.data());
-        expect(type == k::kIQ3_XXS ? "decode_host IQ3_XXS = ggml" : "decode_host IQ4_XS = ggml", got,
+        expect(type == k::kIQ3_XXS ? "decode_host IQ3_XXS = ggml" : type == k::kIQ4_XS ? "decode_host IQ4_XS = ggml" : "decode_host IQ4_NL = ggml", got,
                std::vector<double>(want.begin(), want.end()), 0.0, 0.0);
     }
 }
@@ -686,7 +697,8 @@ void test_experts_mv() {
                           {k::kQ5_K, k::kQ5_K, k::kQ6_K, "Q5_K / Q6_K"},
                           {k::kQ8_0, k::kNVFP4, k::kQ6_K, "mixed"},
                           {k::kIQ3_XXS, k::kIQ3_XXS, k::kNVFP4, "IQ3_XXS / NVFP4"},
-                          {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K, "IQ4_XS / Q6_K"}};
+                          {k::kIQ4_XS, k::kIQ4_XS, k::kQ6_K, "IQ4_XS / Q6_K"},
+                          {k::kIQ4_NL, k::kIQ4_NL, k::kIQ4_NL, "IQ4_NL"}};
     for (const Case& cs : cases) {
         const int E = 3;
         auto g = rand_blocks(cs.tg, (size_t) E * F * C), u = rand_blocks(cs.tu, (size_t) E * F * C),
@@ -1875,19 +1887,24 @@ void test_fp8_kv() {
         for (int i = 0; i < 256; ++i) all_b[i] = (uint8_t) i;
         uint8_t* db = dev(all_b);
         uint16_t *dk16 = dev_n<uint16_t>(256), *dv16 = dev_n<uint16_t>(256);
-        k::unpack_kv_fp8_to_f16(db, db, 0, 0, 1, 256, 1.0f, 1.0f, dk16, dv16, 0);
-        const auto hk = host(dk16, 256), hv = host(dv16, 256);
-        bool finite_exact = true, nan_ok = true;
-        for (int b = 0; b < 256; ++b) {
-            if ((b & 0x7F) == 0x7F) {
-                nan_ok &= ((hk[b] & 0x7FFF) > 0x7C00) && ((hv[b] & 0x7FFF) > 0x7C00);
-            } else {
-                const uint16_t want_bits = f2h_host(e4m3fn_to_f32_host((uint8_t) b));
-                finite_exact &= (hk[b] == want_bits) && (hv[b] == want_bits);
+        for (int width : {255, 256}) for (float scale : {0.5f, 1.0f, 2.0f}) {
+            k::unpack_kv_fp8_to_f16(db, db, 0, 0, 1, width, scale, scale, dk16, dv16, 0);
+            const auto hk = host(dk16, 256), hv = host(dv16, 256);
+            bool finite_exact = true, nan_ok = true;
+            for (int b = 0; b < width; ++b) {
+                if ((b & 0x7F) == 0x7F) {
+                    nan_ok &= ((hk[b] & 0x7FFF) > 0x7C00) && ((hv[b] & 0x7FFF) > 0x7C00);
+                } else {
+                    const uint16_t want_bits = f2h_host(scale * e4m3fn_to_f32_host((uint8_t) b));
+                    if (hk[b] != want_bits || hv[b] != want_bits) {
+                        std::fprintf(stderr, "E4M3 byte %02x (width %d, scale %g): K=%04x V=%04x expected %04x\n", b, width, scale, hk[b], hv[b], want_bits);
+                        finite_exact = false;
+                    }
+                }
             }
+            expect_true("e4m3fn_to_f16: finite bytes bit-exact", finite_exact);
+            expect_true("e4m3fn_to_f16: 0x7F/0xFF NaN", nan_ok);
         }
-        expect_true("e4m3fn_to_f16: all 254 finite bytes bit-exact", finite_exact);
-        expect_true("e4m3fn_to_f16: 0x7F/0xFF NaN", nan_ok);
         cudaFree(db), cudaFree(dk16), cudaFree(dv16);
     }
 

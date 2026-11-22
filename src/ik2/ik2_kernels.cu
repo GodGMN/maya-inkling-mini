@@ -2051,6 +2051,11 @@ __host__ __device__ inline float decode_value(int type, const uint8_t* blocks, s
         const float w = (float) ((g >> (8 * (j & 3))) & 0xFFu);
         return db * w * ((signs >> j) & 1u ? -1.0f : 1.0f);
     }
+    if (type == kIQ4_NL) {
+        const uint8_t* b = blocks + (v / 32) * 18;
+        const uint8_t q = b[2 + (v & 15)];
+        return half_bits_to_float((uint16_t) (b[0] | (b[1] << 8))) * iq4nl_at((v & 16) ? q >> 4 : q & 15);
+    }
     if (type == kIQ4_XS) {   // d, scales_h, scales_l [4], qs [128]
         const uint8_t* b = blocks + (v / 256) * 136;
         const int i = (int) (v % 256), ib = i / 32, j = i % 32;
@@ -3667,6 +3672,29 @@ __global__ void attn_decode_kernel(const float* q, const float* r, const float* 
     out[(size_t) h * 128 + tid] = (o / den) * v_inv_scale;
 }
 
+__device__ __forceinline__ uint32_t unpack_scaled_pair(uint16_t bytes, float scale) {
+    if (scale == 1.0f) return e4m3fnx2_to_h2_u32(bytes);
+    const float2 v = e4m3fnx2_to_f2(bytes);
+    const uint32_t result = f2_to_u32(v.x * scale, v.y * scale);
+#if defined(__HIP_PLATFORM_AMD__)
+    // A packed conversion on gfx1100 can canonicalize -0. Preserve the product's two sign bits.
+    const uint32_t signs = ((uint32_t) (bytes & 0x8000u) << 16) | ((uint32_t) (bytes & 0x80u) << 8);
+    return (result & 0x7fff7fffu) | (signs ^ ((float_to_bits(scale) >> 31) * 0x80008000u));
+#else
+    return result;
+#endif
+}
+
+__device__ __forceinline__ uint16_t unpack_scaled_byte(uint8_t byte, float scale) {
+    if (scale == 1.0f) return e4m3fn_to_f16(byte);
+    const uint16_t result = f2h(e4m3fn_to_f32(byte) * scale);
+#if defined(__HIP_PLATFORM_AMD__)
+    return (result & 0x7fffu) | (((uint16_t)byte << 8 ^ (float_to_bits(scale) >> 16)) & 0x8000u);
+#else
+    return result;
+#endif
+}
+
 __global__ void unpack_kv_fp8_to_f16_vec4_kernel(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk,
                                                  int KD, float k_inv_scale, float v_inv_scale, uint16_t* k_out16,
                                                  uint16_t* v_out16) {
@@ -3679,17 +3707,13 @@ __global__ void unpack_kv_fp8_to_f16_vec4_kernel(const uint8_t* kc, const uint8_
         const size_t dst_off = (size_t) j * KD;
         if (k_out16) {
             const uint32_t k4 = __ldg((const uint32_t*) (kc + src_off) + d4);
-            const float2 f0 = e4m3fnx2_to_f2((uint16_t) (k4 & 0xFFFFu));
-            const float2 f1 = e4m3fnx2_to_f2((uint16_t) (k4 >> 16));
-            ((uint2*) (k_out16 + dst_off))[d4] = make_uint2(f2_to_u32(f0.x * k_inv_scale, f0.y * k_inv_scale),
-                                                            f2_to_u32(f1.x * k_inv_scale, f1.y * k_inv_scale));
+            ((uint2*) (k_out16 + dst_off))[d4] = make_uint2(unpack_scaled_pair((uint16_t) k4, k_inv_scale),
+                                                           unpack_scaled_pair((uint16_t) (k4 >> 16), k_inv_scale));
         }
         if (v_out16) {
             const uint32_t v4 = __ldg((const uint32_t*) (vc + src_off) + d4);
-            const float2 f0 = e4m3fnx2_to_f2((uint16_t) (v4 & 0xFFFFu));
-            const float2 f1 = e4m3fnx2_to_f2((uint16_t) (v4 >> 16));
-            ((uint2*) (v_out16 + dst_off))[d4] = make_uint2(f2_to_u32(f0.x * v_inv_scale, f0.y * v_inv_scale),
-                                                            f2_to_u32(f1.x * v_inv_scale, f1.y * v_inv_scale));
+            ((uint2*) (v_out16 + dst_off))[d4] = make_uint2(unpack_scaled_pair((uint16_t) v4, v_inv_scale),
+                                                           unpack_scaled_pair((uint16_t) (v4 >> 16), v_inv_scale));
         }
     }
 }
@@ -3704,8 +3728,8 @@ __global__ void unpack_kv_fp8_to_f16_kernel(const uint8_t* kc, const uint8_t* vc
         const int d = (int) (idx % (size_t) KD);
         const int slot = kv_cap > 0 ? (k0 + j) % kv_cap : (k0 + j);
         const size_t src = (size_t) slot * KD + d;
-        if (k_out16) k_out16[idx] = f2h(e4m3fn_to_f32(kc[src]) * k_inv_scale);
-        if (v_out16) v_out16[idx] = f2h(e4m3fn_to_f32(vc[src]) * v_inv_scale);
+        if (k_out16) k_out16[idx] = unpack_scaled_byte(kc[src], k_inv_scale);
+        if (v_out16) v_out16[idx] = unpack_scaled_byte(vc[src], v_inv_scale);
     }
 }
 
@@ -5604,12 +5628,12 @@ void argmax_gemv_f16(const uint16_t* W, int ld, const float* x, const float* bas
 }
 
 int block_values(int type) {
-    return type == kNVFP4 ? 64 : type == kQ8_0 ? 32
+    return type == kNVFP4 ? 64 : (type == kQ8_0 || type == kIQ4_NL) ? 32
          : type == kQ5_K || type == kQ6_K || type == kIQ3_XXS || type == kIQ4_XS ? 256 : 0;
 }
 size_t block_bytes(int type) {
     return type == kNVFP4 ? 36 : type == kQ8_0 ? 34 : type == kQ5_K ? 176 : type == kQ6_K ? 210
-         : type == kIQ3_XXS ? 98 : type == kIQ4_XS ? 136 : 0;
+         : type == kIQ4_NL ? 18 : type == kIQ3_XXS ? 98 : type == kIQ4_XS ? 136 : 0;
 }
 
 template <int WARPS, int ROWS>

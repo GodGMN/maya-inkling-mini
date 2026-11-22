@@ -4163,7 +4163,9 @@ int main(int argc, char** argv) {
     Shards S(model);
     Model M;
     Config& c = M.c;
-    const std::string a = "inkling2.";
+    const auto* arch = S.get("general.architecture");
+    const bool physical_layers = arch && arch->s == "inkling2_loop";
+    const std::string a = physical_layers ? "inkling2_loop." : "inkling2.";
     // a key under PR #32187's name, else under llama.cpp master's; a value master writes a visit (an array of equal
     // values) read as one
     auto key = [&](const char* k1, const char* k2 = nullptr) -> double {
@@ -4172,7 +4174,7 @@ int main(int argc, char** argv) {
         if (!v) die(std::string("no key ") + a + k1);
         return v->items.empty() ? v->num() : v->items[0].num();
     };
-    c.n_visit = (int) key("block_count");
+    const int block_count = (int) key("block_count");
     c.C = (int) key("embedding_length");
     c.H = (int) key("attention.head_count");
     c.KV = (int) key("attention.head_count_kv");
@@ -4195,20 +4197,26 @@ int main(int argc, char** argv) {
     c.gate_cap = (float) key("mlp_gate_softcap", "activation.situ_beta");
     c.up_cap = (float) key("mlp_up_softcap", "activation.situ_linear_beta");
     c.logit_cap = (float) key("final_logit_softcapping");
-    // the loop (Inkling-2-Mini): block_count counts the layer visits, the core's layers once a pass
-    if (S.get(a + "num_loops")) c.n_pass = (int) key("num_loops");
+    // inkling2 counts visits; inkling2_loop counts the physical layers once.
+    if (physical_layers) c.n_pass = (int) key("loop.count");
+    else if (S.get(a + "num_loops")) c.n_pass = (int) key("num_loops");
+    if (c.n_pass < 1) die("loop count must be positive");
     if (c.n_pass > 1) {
-        c.core0 = (int) key("loop.core_start"), c.core1 = (int) key("loop.core_end"), c.rank = (int) key("loop.gate_rank");
+        c.core0 = (int) key("loop.core_start", "loop.start"), c.core1 = (int) key("loop.core_end", "loop.end"), c.rank = (int) key("loop.gate_rank");
         if (c.core0 <= 0 || c.core1 <= c.core0 || c.core0 % c.block || (c.core1 - c.core0) % c.block || c.rank <= 0)
             die("the looped core must start after the first block and span whole blocks");
     }
     const int n_core = c.core1 - c.core0;
-    c.n_layer = c.n_visit - (c.n_pass - 1) * n_core;
+    const int extra_visits = (c.n_pass - 1) * n_core;
+    c.n_layer = physical_layers ? block_count : block_count - extra_visits;
+    c.n_visit = c.n_layer + extra_visits;
+    if (c.core1 > c.n_layer || (physical_layers && S.get(a + "loop.varying") && key("loop.varying")))
+        die("unsupported loop configuration");
     {   // the pattern is a visit's; a layer's is its first visit's (the same in every pass)
         const auto* sp = S.get(a + "attention.sliding_window_pattern");
-        if (!sp || (int) sp->items.size() != c.n_visit) die("sliding_window_pattern");
+        if (!sp || (int) sp->items.size() != block_count) die("sliding_window_pattern");
         for (int l = 0; l < c.n_layer; ++l)
-            c.sliding.push_back(sp->items[l < c.core1 ? l : l + (c.n_pass - 1) * n_core].u != 0);
+            c.sliding.push_back(sp->items[physical_layers || l < c.core1 ? l : l + extra_visits].u != 0);
     }
     // (a row of an expert is whole blocks of its type: checked per tensor below; 64 covers NVFP4 and Q8_0)
     if (c.D != 128 || c.H % c.KV || c.C % 64 || c.F % 64) die("unexpected shapes");
@@ -4404,7 +4412,7 @@ int main(int argc, char** argv) {
     M.embd_norm = load_f32(S, "token_embd_norm.weight", C);   // (on GPU 0, where the embedding rows go)
     std::vector<float> lp_q, lp_kv;   // a looped core's message queries, [2 n_core][C] each
     std::vector<float> lp_all;
-    if (c.n_pass > 1) {
+    if (c.n_pass > 1 && !physical_layers) {
         lp_q = host_f32(S, "loop_res_query.weight", (size_t) 2 * n_core * C);
         lp_kv = host_f32(S, "loop_kv_res_query.weight", (size_t) 2 * n_core * C);
     }
@@ -4530,7 +4538,9 @@ int main(int argc, char** argv) {
             exp_jobs.push_back({l, n, pr.second});
         }
         if (c.n_pass > 1 && l >= c.core0 && l < c.core1) {   // the core: its later passes' message gates and queries
-            static const char* mod[4] = {"attn", "k", "v", "mlp"};
+            static const char* const legacy[4] = {"attn", "k", "v", "mlp"};
+            static const char* const per_layer[4] = {"q_ctrl", "k_ctrl", "v_ctrl", "ffn_ctrl"};
+            const auto& mod = physical_layers ? per_layer : legacy;
             for (int m = 0; m < 4; ++m) {
                 const std::string p = b + "loop_" + mod[m] + "_";
                 const bool compact = g_fast_want && getenv("IK2_GATE_BF16") && atoi(getenv("IK2_GATE_BF16"));
@@ -4549,10 +4559,14 @@ int main(int argc, char** argv) {
             // loop_res_query: rows 2 i (q's) and 2 i + 1 (the MoE's) of core layer i; loop_kv_res_query: k's and v's
             const size_t i = (size_t) (l - c.core0);
             std::vector<float> q(4 * C);
-            std::memcpy(q.data(), lp_q.data() + 2 * i * C, C * 4);
-            std::memcpy(q.data() + C, lp_kv.data() + 2 * i * C, C * 4);
-            std::memcpy(q.data() + 2 * C, lp_kv.data() + (2 * i + 1) * C, C * 4);
-            std::memcpy(q.data() + 3 * C, lp_q.data() + (2 * i + 1) * C, C * 4);
+            if (physical_layers) {
+                q = host_f32(S, b + "loop_msg_query.weight", 4 * C);
+            } else {
+                std::memcpy(q.data(), lp_q.data() + 2 * i * C, C * 4);
+                std::memcpy(q.data() + C, lp_kv.data() + 2 * i * C, C * 4);
+                std::memcpy(q.data() + 2 * C, lp_kv.data() + (2 * i + 1) * C, C * 4);
+                std::memcpy(q.data() + 3 * C, lp_q.data() + (2 * i + 1) * C, C * 4);
+            }
             Ly.lp_query = dev_f32(q);
             lp_all.insert(lp_all.end(), q.begin(), q.end());
             if (l == c.core1 - 1) M.lp_query_all = dev_f32(lp_all);
