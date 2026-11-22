@@ -565,3 +565,26 @@ IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT=projection.f32 ./build-ik2/maya-i
     --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
 sha256sum projection.f32
 ```
+
+### Quality checks with background text
+
+The multiple-choice runner can place the same archive before each question. It sends one warm-up request and checks how much of the prefix each later request actually reused. With 256 archive tokens, the Radeon engine answered 24 of 32 questions correctly and returned a valid letter every time. Each question reused all 256 tokens. The sample contains indices 0 through 3 from each of the eight subjects in the 256-question fixture above.
+
+A separate inventory task places three shipment records at 5%, 50% and 95% of the input. The prompt asks for the two deliveries minus the damaged boxes. At 32,768 tokens the direct-answer run returned 1,008. The expected answer was 986. This task checks whether the model can retrieve and combine the records.
+
+```sh
+# Use the Radeon preset environment and the MMLU and GSM8K data above.
+python3 -c 'import json; print("".join(s for s in open("mmlu256.jsonl") if json.loads(s)["index"] < 4), end="")' >mmlu32.jsonl
+quiz() {
+    oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu32.jsonl \
+        --tokenizer ik2-tokenizer/tokenizer --prefix-tokens 256 --background gsm8k-test.jsonl "$@"
+}
+quiz | ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 4096 --chunk 512 >quiz.log
+quiz --min-cached 256 --score quiz.log
+ledger() {
+    oracle-env/bin/python src/tests/ik2_retrieval.py --data gsm8k-test.jsonl \
+        --tokenizer ik2-tokenizer/tokenizer --depths 32768 --inventory --direct-answer --max-tokens 32 "$@"
+}
+ledger | IK2_PAGED_KV=1 ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 >ledger.log
+ledger --score ledger.log
+```

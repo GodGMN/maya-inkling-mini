@@ -17,10 +17,14 @@ FINAL = "<|message_model|><|content_text|>"
 STOP = "<|content_model_end_sampling|>"
 
 
-def requests(tok, depths, percent, corpus, direct_answer=False):
+def requests(tok, depths, percent, corpus, direct_answer=False, inventory=False):
     template = Environment().from_string((ROOT / "tools/ik2/chat_template.jinja").read_text())
     content = ("Read these archive notes.\n@FILL@\n"
                "What is the archive verification phrase? Reply with the exact phrase.")
+    if inventory:
+        content = ("Read the archive notes and the three records for the Larch consignment.\n@FILL@\n"
+                   "Add the north and south shipments and subtract the damaged boxes. "
+                   "How many Larch boxes remain? Reply with the integer only.")
     prefix, suffix = template.render(messages=[{"role": "user", "content": content}], tools=[],
                                      add_generation_prompt=True, reasoning_effort="none").split("@FILL@")
     left = tok.encode(prefix, parse_special=True)
@@ -30,16 +34,31 @@ def requests(tok, depths, percent, corpus, direct_answer=False):
         raise ValueError("empty distractor corpus")
     for depth in depths:
         seed = depth if percent == 50 else depth * 101 + percent
-        expected = " ".join(random.Random(seed).sample(WORDS, 4))
-        if expected in corpus.lower():
-            raise ValueError("generated phrase already appears in the distractors")
-        marker = tok.encode("\nArchive register: the archive verification phrase is " + expected + ".\n")
-        n = depth - len(left) - len(right) - len(marker)
+        if inventory:
+            rng = random.Random(1429)
+            north, south, damaged = rng.randrange(200, 900), rng.randrange(200, 900), rng.randrange(20, 90)
+            expected = str(north + south - damaged)
+            positions = (5, 50, 95)
+            markers = [tok.encode(f"\nLarch consignment record: {event}.\n") for event in
+                       (f"the north shipment delivered {north} boxes", f"the south shipment delivered {south} boxes",
+                        f"{damaged} boxes were damaged and discarded")]
+        else:
+            expected = " ".join(random.Random(seed).sample(WORDS, 4))
+            if expected in corpus.lower():
+                raise ValueError("generated phrase already appears in the distractors")
+            positions = (percent,)
+            markers = [tok.encode("\nArchive register: the archive verification phrase is " + expected + ".\n")]
+        n = depth - len(left) - len(right) - sum(map(len, markers))
         if n < 0:
-            raise ValueError(f"{depth} tokens cannot hold the question and phrase")
+            raise ValueError(f"{depth} tokens cannot hold the question and records")
         notes = (filler * ((n + len(filler) - 1) // len(filler)))[:n]
-        at = n * percent // 100
-        yield expected, left + notes[:at] + marker + notes[at:] + right
+        prompt, previous = left.copy(), 0
+        for position, marker in zip(positions, markers):
+            at = n * position // 100
+            prompt.extend(notes[previous:at])
+            prompt.extend(marker)
+            previous = at
+        yield expected, prompt + notes[previous:] + right
 
 
 def responses(log):
@@ -55,9 +74,9 @@ def responses(log):
         raise ValueError("truncated engine response")
 
 
-def llama_completion(url, prompt, limit, fixed_length=False):
+def llama_completion(url, prompt, limit, fixed_length=False, reuse=False):
     body = dict(prompt=prompt, n_predict=limit, temperature=0, seed=1, return_tokens=True, stream=False,
-                cache_prompt=fixed_length, ignore_eos=fixed_length)
+                cache_prompt=fixed_length or reuse, ignore_eos=fixed_length)
     req = Request(url.rstrip("/") + "/completion", data=json.dumps(body).encode(),
                   headers={"Content-Type": "application/json"})
     with urlopen(req, timeout=7200) as f:
@@ -74,6 +93,7 @@ def main():
     ap.add_argument("--data", required=True, type=Path, help="GSM8K JSONL distractor questions")
     ap.add_argument("--depths", default="32768,131072,392960")
     ap.add_argument("--percent", type=int, default=50)
+    ap.add_argument("--inventory", action="store_true", help="sum three consignment records at 5%, 50% and 95%")
     ap.add_argument("--max-tokens", type=int, default=200)
     ap.add_argument("--direct-answer", action="store_true",
                     help="prefill the final text channel as serve/server.py does for explicit reasoning_effort=none")
@@ -96,7 +116,7 @@ def main():
         count = len(depths) * (2 if args.decode_steps else 1)
         if len(recorded) != count:
             raise ValueError(f"expected {count} complete responses, got {len(recorded)}")
-    for index, (expected, prompt) in enumerate(requests(tok, depths, args.percent, corpus, args.direct_answer)):
+    for index, (expected, prompt) in enumerate(requests(tok, depths, args.percent, corpus, args.direct_answer, args.inventory)):
         if not args.score and not args.llama_url:
             payload = ",".join(map(str, prompt))
             print(f"GEN {args.max_tokens} 0 1 1 {stop} " + payload)
@@ -122,7 +142,8 @@ def main():
         if args.direct_answer:
             text = FINAL + text
         answer = text.rsplit(FINAL, 1)[1].split("<|end_message|>")[0].strip() if FINAL in text else ""
-        print(json.dumps(dict(prompt=seen, percent=args.percent, direct_answer=args.direct_answer, expected=expected, content=answer,
+        position = dict(positions=[5, 50, 95]) if args.inventory else dict(percent=args.percent)
+        print(json.dumps(dict(prompt=seen, **position, direct_answer=args.direct_answer, expected=expected, content=answer,
                               found=expected in answer.lower(), exact=answer.lower().rstrip(".") == expected,
                               cached=cached, finish=reason, generated=len(ids), prefill_s=pp, decode_s=tg, **extra)), flush=True)
     if not args.score and not args.llama_url:

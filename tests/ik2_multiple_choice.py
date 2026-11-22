@@ -13,17 +13,44 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokenizer", required=True, type=Path)
     parser.add_argument("--data", required=True, type=Path, help="JSONL rows with subject, index, question, choices, answer")
+    parser.add_argument("--prefix-tokens", type=int, default=0, help="exact length of a shared archive before the questions")
+    parser.add_argument("--background", type=Path, help="JSONL with distractor text in a question field")
+    parser.add_argument("--min-cached", type=int, default=0, help="stop scoring if a question reuses fewer tokens")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--score", type=Path, help="stdout from the prepared Maya requests")
     mode.add_argument("--llama-url")
     args = parser.parse_args()
+    if bool(args.prefix_tokens) != bool(args.background) or not 0 <= args.min_cached <= args.prefix_tokens:
+        parser.error("supply --prefix-tokens with --background, and keep --min-cached within that prefix")
     tok = Tokenizer.from_dir(args.tokenizer)
     stop, = tok.encode(STOP, parse_special=True)
     template = Environment().from_string((ROOT / "tools/ik2/chat_template.jinja").read_text())
     data = [json.loads(line) for line in args.data.read_text().splitlines()]
+    prefix = []
+    if args.background:
+        content = "The archive below is background material. Answer the question after the archive.\n\n@ARCHIVE@"
+        rendered = template.render(messages=[dict(role="user", content=content)], tools=[],
+                                   add_generation_prompt=True, reasoning_effort="none")
+        before, after = rendered.split("@ARCHIVE@")
+        prefix = tok.encode(before, parse_special=True)
+        fill = tok.encode("\n".join(json.loads(line)["question"] for line in args.background.read_text().splitlines()))
+        length = args.prefix_tokens - len(prefix)
+        if length < 0 or not fill:
+            parser.error("the prefix is too short or the archive is empty")
+        prefix.extend((fill * ((length + len(fill) - 1) // len(fill)))[:length])
+        if args.llama_url:
+            warm = llama_completion(args.llama_url, prefix, 1, reuse=True)
+            if warm[1] != len(prefix):
+                raise ValueError("incomplete archive prefill")
+        elif not args.score:
+            print("GEN 1 0 1 1 - " + ",".join(map(str, prefix)))
     if args.score:
         with args.score.open() as f:
             runs = list(responses(f))
+        if prefix:
+            if not runs or runs[0][1] != len(prefix) or len(runs[0][0]) != 1:
+                raise ValueError("incomplete archive prefill")
+            runs = runs[1:]
         if len(runs) != len(data):
             raise ValueError(f"expected {len(data)} responses, got {len(runs)}")
     correct = invalid = 0
@@ -32,11 +59,14 @@ def main():
             raise ValueError(f"invalid choices or label in row {i}")
         options = "\n".join(f"{letter}. {choice}" for letter, choice in zip("ABCD", row["choices"]))
         question = f'{row["question"]}\n\n{options}\n\nReply with the single letter of the correct answer.'
-        chat = template.render(messages=[dict(role="user", content=question)], tools=[],
-                               add_generation_prompt=True, reasoning_effort="none")
-        ids = tok.encode(chat + FINAL, parse_special=True)
+        if prefix:
+            ids = prefix + tok.encode("\n\nQuestion:\n" + question + after + FINAL, parse_special=True)
+        else:
+            chat = template.render(messages=[dict(role="user", content=question)], tools=[],
+                                   add_generation_prompt=True, reasoning_effort="none")
+            ids = tok.encode(chat + FINAL, parse_special=True)
         if args.llama_url:
-            result = llama_completion(args.llama_url, ids, 8)
+            result = llama_completion(args.llama_url, ids, 8, reuse=bool(prefix))
         elif args.score:
             result = runs[i]
         else:
@@ -45,6 +75,8 @@ def main():
         tokens, seen, cached, finish, _, _ = result
         if seen != len(ids) or not tokens:
             raise ValueError(f"invalid response to row {i}")
+        if cached < args.min_cached:
+            raise ValueError(f"row {i} reused {cached} tokens, required {args.min_cached}")
         content = tok.decode(tokens).partition("<|end_message|>")[0].strip()
         match = re.fullmatch(r"\(?([A-D])\)?[.]?", content)
         answer = match[1] if match else None
