@@ -351,10 +351,16 @@ def normalize_request(req):
 
 
 def new_response(model, req, response_id=None, status="in_progress"):
+    tools = []
+    for tool in req.get("tools") or []:
+        if tool["type"] == "namespace":
+            members = [sub for sub in tool["tools"] if isinstance(sub, dict) and sub.get("type") == "function"]
+            tool = dict(tool, description=tool.get("description") or "", tools=members)
+        tools.append(tool)
     response = {"id": response_id or "resp_" + uuid.uuid4().hex[:24], "object": "response", "created_at": int(time.time()),
                 "status": status, "error": None, "incomplete_details": None, "model": model, "output": [],
                 "instructions": req.get("instructions"), "max_output_tokens": req.get("max_output_tokens"),
-                "tools": req.get("tools") or [], "tool_choice": req.get("tool_choice", "auto"),
+                "tools": tools, "tool_choice": req.get("tool_choice", "auto"),
                 "parallel_tool_calls": req.get("parallel_tool_calls", True),
                 "reasoning": {"effort": None, "summary": None, **(req.get("reasoning") or {})},
                 "text": req.get("text") or {"format": {"type": "text"}}, "temperature": req.get("temperature"),
@@ -400,11 +406,11 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
         if req.get("parallel_tool_calls") is False and calls and call.id not in calls:
             raise ValueError("parallel_tool_calls=false: generation produced more than one function call")
 
-    def event(name, **data):
+    def event(event_type, **data):
         nonlocal sequence
-        out = {"type": name, "sequence_number": sequence, **data}
+        out = {"type": event_type, "sequence_number": sequence, **data}
         sequence += 1
-        return name, copy.deepcopy(out)
+        return event_type, copy.deepcopy(out)
 
     def start(kind, call=None):
         nonlocal current
@@ -447,7 +453,7 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
             if sealed:
                 item["encrypted_content"] = seal(item["content"][0]["text"])
         elif status == "completed":
-            yield event("response.function_call_arguments.done", **fields, arguments=item["arguments"])
+            yield event("response.function_call_arguments.done", **fields, name=item["name"], arguments=item["arguments"])
         item["status"] = status
         yield event("response.output_item.done", output_index=index, item=item)
 

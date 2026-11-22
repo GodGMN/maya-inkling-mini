@@ -135,6 +135,7 @@ class ToolContracts(ResponseCase):
                 events = self.stream(tools=[*TOOLS, space])
                 out = events[-1]["response"]
                 self.assertEqual(out["status"], "completed", out)
+                self.assertEqual(out["tools"][-1], {**space, "tools": [space["tools"][0]]})
                 call = out["output"][0]
                 self.assertEqual((call["name"], call["namespace"]), ("wait", "agents"))
                 added = next(e for e in events if e["type"] == "response.output_item.added")

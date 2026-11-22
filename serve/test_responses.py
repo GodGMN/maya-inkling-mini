@@ -150,6 +150,9 @@ class Responses(ResponseCase):
                     out = events[-1]["response"]
                     args = "".join(e["delta"] for e in events if e["type"] == "response.function_call_arguments.delta")
                     self.assertEqual(json.loads(args), {"key": "alpha"})
+                    done, = (e for e in events if e["type"] == "response.function_call_arguments.done")
+                    self.assertEqual((done["name"], done["arguments"], done["item_id"]),
+                                     ("lookup", args, out["output"][0]["id"]))
                 else:
                     status, out = self.post(tools=TOOLS)
                     self.assertEqual(status, 200)
