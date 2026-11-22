@@ -41,7 +41,11 @@ The live service ran the FastTracker II composition benchmark from the same sour
 |---:|---:|---|---:|---:|---:|---:|
 | 1 | 61.2 | 29.0 (recovered XM) | 24m 52s | 29.99 s | 126,504 | 1 |
 | 2 | 69.8 | 68.6 | 29m 02s | 25.60 s | 151,115 | 1 |
-| 3 | Running | HTTP 524, no XM | | | | |
+| 3 | 56.1 | HTTP 524, no XM | 1h 21m 28s | 7.99 s | 329,289 | 4 |
+
+All three Maya attempts produced an XM that the trusted renderer could play. The best listener score was 69.8, compared with 68.6 on the prior llama.cpp run. Attempt 3 used 204 tool commands and generated 225,855 tokens across 205 measured responses. On 194 of 204 follow-ups it reused every preceding token. Four transport retries had unknown usage. The local bundle scanner withheld the bundle with `Secret or environment dump detected`. The individual render and listener results were available independently. No benchmark result or bundle was sent upstream.
+
+The measured private run started at `20261122T142933Z`. In 276 samples taken about 30 seconds apart, the same server process stayed healthy with zero restarts and OOM kills. Its highest sampled anonymous RAM was 2.20 GiB, and device-wide VRAM was 23.08 GiB. The cgroup charge reached the 10 GiB limit, including file-backed model pages. Reproduce the per-attempt measurements with the commands below and the cache counts with the trajectory command under Growing conversations.
 
 Run from the pinned Keygen checkout on the controller host. The saved provider config names `https://prometheus.gimeno.dev/v1` and `inkling-2-mini-26.4b-iq4-nl`. Supply the controller credential through `KEYGEN_CONTRIB_API_KEY`. The work and bundle paths must be new for each run.
 
