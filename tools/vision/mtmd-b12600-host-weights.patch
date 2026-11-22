@@ -1,0 +1,10 @@
+--- mtmd.cpp
++++ mtmd.cpp
+@@ -945,4 +945,4 @@
+-        ggml_backend_buffer_type_t buft = device
+-            ? ggml_backend_dev_buffer_type(device)
+-            : ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
++        // Keep the original projector weights in RAM. The scheduler still gets the HIP device below
++        // and copies the tensors it needs for each image.
++        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+         models = mtmd_model_load(mmproj_fname, model_params, buft);
