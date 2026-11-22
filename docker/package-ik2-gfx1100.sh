@@ -36,6 +36,7 @@ cfg["vision"] = dict(exe="vision/maya-vision-cpu", model=cfg["args"][1], mmproj=
 default.write_text(json.dumps(cfg, indent=2) + "\n")
 if (directory / "vision/maya-vision-hip").exists():
     cfg["vision"].update(exe="vision/maya-vision-hip", gpu=True)
+    cfg["args"][cfg["args"].index("--chunk") + 1] = "256"
     (directory / "ik2-mini-gfx1100-hip-vision.json").write_text(json.dumps(cfg, indent=2) + "\n")
 PYCONFIG
 fi

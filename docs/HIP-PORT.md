@@ -61,6 +61,35 @@ ENCODER
 
 The encoder returned 35 embeddings of width 2,304 for each 256×192 image in 376 and 377 ms. This command ran without GPU devices. The host used four threads.
 
+### Image answers and GPU memory
+
+CPU and HIP mtmd and the incumbent llama.cpp server all identified the three left-hand colors after swapping the images under an identical prompt. All three read **39%** from the repository's setup screenshot. The CPU profile used four threads and the full 393,216-token context. Wall times include encoding, prefill and generation. Each row contains one request per server.
+
+| Image | CPU encoder + Maya | HIP encoder + Maya, 393,216 context | llama.cpp |
+|---|---:|---:|---:|
+| Red/blue | 1.232 s | 1.716 s | 1.508 s |
+| Blue/red | 0.497 s | 0.186 s | 1.140 s |
+| Green/blue | 0.498 s | 0.166 s | 1.129 s |
+| Setup screenshot | 14.058 s | 0.820 s | 2.131 s |
+
+The resident HIP encoder used 984 MiB above its 36 MiB device baseline after warming up at 1,024 image tokens. With 1,024-token prefill chunks, the engine passed at 360,448 positions. It could not keep every expert resident at 376,832 or 393,216. A 512-token chunk also failed at 393,216. **The packaged GPU-vision profile uses 256-token chunks and keeps all 393,216 positions.** The card reported 23.65 GiB used after the image requests. The CPU profile keeps 1,024-token chunks and leaves the GPU to the language model.
+
+Build the encoder in the same CPU-only build container as the CPU version. ROCm's static host objects need PIC on this distribution. The original link failed with `R_X86_64_32 ... can not be used when making a PIE object`. The HIP target now builds with `-fPIC`.
+
+```sh
+docker exec -w /work maya-ik2-hip-build cmake -S src/tools/vision -B vision-hip -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/work/vision-llama-b12600 -DSTRATA_VISION_HIP=ON \
+    -DSTRATA_VISION_HIP_TARGETS=gfx1100 -DCMAKE_HIP_ARCHITECTURES=gfx1100 -DGGML_HIP_NO_VMM=ON
+docker exec -w /work maya-ik2-hip-build cmake --build vision-hip --target maya-vision -j4
+# From the Prometheus build directory. The footprint measurement runs with the GPU idle.
+bash ik-vision-footprint.sh
+python3 ik-compare-image-rows.py
+python3 src/tests/ik2_image_answers.py http://127.0.0.1:18085
+python3 src/tests/ik2_image_answers.py http://127.0.0.1:8085
+```
+
+Comparing all 80,640 embedding values for each color-swap fixture gave CPU/HIP cosine similarities of 0.999370 and 0.999403. Pairing each CPU image with the opposite GPU image gave 0.913765 and 0.912137.
+
 ## Full-model measurements at 393,216 reserved tokens
 
 The RX 7900 XTX ran commit `9a0f164` with the installed ggml-org IQ4_NL GGUF, a 1,024-token prefill chunk and E4M3 KV. Every expert stayed on the card. The runner alternated prompt starts, checked that zero input tokens were reused and timed 128 decode steps after the first prediction. Each cell is the median of three requests. Startup is excluded.
