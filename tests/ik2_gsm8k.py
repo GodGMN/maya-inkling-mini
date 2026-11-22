@@ -35,14 +35,15 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--data", required=True, type=Path, help="OpenAI GSM8K test.jsonl")
     parser.add_argument("--count", type=int, default=96, help="take the first N questions in file order")
+    parser.add_argument("--offset", type=int, default=0, help="skip this many questions before taking --count")
     parser.add_argument("--max-tokens", type=int, default=1024)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--score", type=Path, help="server stdout from the prepared inputs")
     mode.add_argument("--llama-url", help="score the same tokenized inputs against a running llama.cpp service")
     args = parser.parse_args()
     with args.data.open() as f:
-        samples = [json.loads(line) for line in f][:args.count]
-    if len(samples) != args.count or args.count < 1:
+        samples = [json.loads(line) for line in f][args.offset:args.offset + args.count]
+    if args.offset < 0 or len(samples) != args.count or args.count < 1:
         parser.error("invalid question count")
     tok = Tokenizer.from_gguf(args.model)
     if args.score:
@@ -52,8 +53,10 @@ def main():
                 if line.startswith("@TOK "):
                     tokens.append(int(line.split()[1]))
                 elif line.startswith("@END "):
-                    result = score(line.split()[1], tokens, tok, samples[len(results)])
-                    print(json.dumps(dict(question=len(results), **result)))
+                    _, reason, prompt, cached, pp, tg = line.split()
+                    result = score(reason, tokens, tok, samples[len(results)])
+                    result.update(prompt=int(prompt), cached=int(cached), prefill_s=float(pp), decode_s=float(tg))
+                    print(json.dumps(dict(question=args.offset + len(results), **result)))
                     results.append(result)
                     tokens = []
         if len(results) != len(samples) or tokens:
@@ -80,7 +83,11 @@ def main():
             if not completion["tokens"]:
                 raise ValueError("llama.cpp returned no tokens")
             result = score(reason, completion["tokens"], tok, sample)
-            print(json.dumps(dict(question=index, **result)), flush=True)
+            timings = completion["timings"]
+            cached = timings.get("cache_n", 0)
+            result.update(prompt=timings["prompt_n"] + cached, cached=cached, prefill_s=timings["prompt_ms"] / 1000,
+                          decode_s=timings["predicted_ms"] / 1000)
+            print(json.dumps(dict(question=args.offset + index, **result)), flush=True)
             results.append(result)
         else:
             print(f"GEN {args.max_tokens} 0 1 1 {stop} " + ",".join(map(str, ids)))

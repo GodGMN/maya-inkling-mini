@@ -2141,13 +2141,13 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
                 CU(cudaStreamSynchronize(g_s));
                 for (int i = 0; i < nt; ++i) (*argmax_out)[i] = W.argmax_h[i];
             } else {
+                const size_t start = logits_out.size();
+                logits_out.resize(start + (size_t)nt * c.n_vocab);
                 for (int i = 0; i < nt; i += 16) {   // (W.logits holds 16 rows)
                     const int n = std::min(16, nt - i);
                     matmul(M.out_w, W.xq + (size_t) (t0 + i) * C, W.x16 + (size_t) i * C, n, W.logits, c.n_rows);
                     k::softcap(W.logits, (size_t) n * c.n_rows, c.logit_cap, g_s);
-                    const size_t at = logits_out.size();
-                    logits_out.resize(at + (size_t) n * c.n_vocab);
-                    CU(cudaMemcpy2DAsync(logits_out.data() + at, (size_t) c.n_vocab * 4, W.logits,
+                    CU(cudaMemcpy2DAsync(logits_out.data() + start + (size_t)i * c.n_vocab, (size_t) c.n_vocab * 4, W.logits,
                                          (size_t) c.n_rows * 4, (size_t) c.n_vocab * 4, n, cudaMemcpyDeviceToHost,
                                          g_s));
                 }
@@ -4131,7 +4131,11 @@ int verify_suffix(Model& M, const std::vector<int>& hist, int anchor, int remain
     while (matched < suffix_window && src >= matched && hist[src - matched] == hist[end - matched])
         ++matched;
     const int n = std::min({suffix_window, remaining, end - src, 2 * matched - 8});
+#ifdef STRATA_USE_HIP
     const bool use_block = g_block && n >= 2 && n <= kBlockMax && suffix_window <= kBlockMax;
+#else
+    constexpr bool use_block = false;
+#endif
     if (!use_block && n < match) return 0;
     std::vector<float> logits;
     std::vector<int> predicted;
@@ -4251,6 +4255,7 @@ int main(int argc, char** argv) {
     }
     if (model.empty() || (toks.empty() && !serve))
         die("usage: maya-ik2 --model FIRST.gguf (--tokens 1,2,3 [--gen N] | --serve) [--chunk 2048] [--ctx N] ...");
+    if (chunk < 1 || ctx < 1) die("--chunk and --ctx must be positive");
     std::vector<int> prompt;
     for (const char* p = toks.c_str(); *p;) {
         prompt.push_back(std::atoi(p));
@@ -4963,7 +4968,7 @@ int main(int argc, char** argv) {
     use_dev(d);
     CU(cudaMemGetInfo(&fr, &tot));
     Work& W = g_dev[d].W;
-    W.Tm = std::max(chunk, 1);
+    W.Tm = drafter ? std::max(chunk, kBlockMax) : chunk;
     W.ctx = ctx;
     W.nk_max = std::min(ctx, ctx);
     // Tokens a layer-major prefill pass (every expert not in VRAM streams in once a pass): 16384 when there is room
@@ -5209,6 +5214,19 @@ int main(int argc, char** argv) {
     }
     std::fflush(stdout);
     }
+#ifdef STRATA_USE_HIP
+    if ((drafter || suffix_window) && g_block) {
+        const bool planar = M.out_w.q8 && std::all_of(M.L.begin(), M.L.end(), [](const Layer& ly) {
+            return ly.wo.q8 && (ly.sliding ? ly.wqkvrg.q8 != nullptr : ly.wqrg.q8 && ly.wk.q8 && ly.wv.q8);
+        });
+        if (!planar) {
+            g_block = false;
+            std::fprintf(stderr, "HIP block verification requires planar Q8 projections and output head; using ordinary verification\n");
+        }
+    }
+    if (serve && drafter && !(g_fast && g_block))
+        die("HIP drafter serving requires all experts resident and planar Q8 projections and head");
+#endif
     // Keep space for allocations made on demand, including the image encoder.
     const size_t reserve =
         (size_t)(getenv("IK2_HEADROOM_MIB") ? std::max(0, atoi(getenv("IK2_HEADROOM_MIB"))) : 1536) << 20;

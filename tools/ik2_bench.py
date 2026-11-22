@@ -1,4 +1,4 @@
-"""Measure uncached prefill and greedy decode on maya-ik2 or a running llama.cpp service."""
+"""Measure uncached prefill and decode on maya-ik2 or a running llama.cpp service."""
 import argparse
 from contextlib import contextmanager
 import json
@@ -29,7 +29,7 @@ def maya_requests(args, capacity):
 
         def request(prompt, gen):
             ids = ",".join(map(str, prompt))
-            engine.stdin.write(f"GEN {gen} 0 1 1 - {ids}\n")
+            engine.stdin.write(f"GEN {gen} {args.temperature} {args.top_p} 1 - {ids}\n")
             engine.stdin.flush()
             fields = receive("@END ", gen)
             if len(fields) != 6 or fields[1] != "length" or int(fields[2]) != len(prompt) or int(fields[3]):
@@ -46,11 +46,11 @@ def maya_requests(args, capacity):
 
 
 @contextmanager
-def llama_requests(url):
+def llama_requests(args):
     def request(prompt, gen):
-        payload = dict(prompt=prompt, n_predict=gen, temperature=0, seed=1, cache_prompt=False,
+        payload = dict(prompt=prompt, n_predict=gen, temperature=args.temperature, top_p=args.top_p, top_k=1000, seed=1, cache_prompt=False,
                        ignore_eos=True, stream=False)
-        req = Request(url.rstrip("/") + "/completion", data=json.dumps(payload).encode(),
+        req = Request(args.llama_url.rstrip("/") + "/completion", data=json.dumps(payload).encode(),
                       headers={"Content-Type": "application/json"})
         with urlopen(req, timeout=3600) as response:
             result = json.load(response)
@@ -74,7 +74,11 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--chunk", type=int, default=128)
     parser.add_argument("--ctx", type=int, help="reserve at least this many context positions in Maya")
+    parser.add_argument("--temperature", type=float, default=0, help="zero selects greedy decode")
+    parser.add_argument("--top-p", type=float, default=1, help="nucleus probability for sampled decode")
     args = parser.parse_args()
+    if not 0 <= args.temperature < float("inf") or not 0 < args.top_p <= 1:
+        parser.error("temperature must be finite and nonnegative and top-p must be in (0, 1]")
     if args.engine and not args.model:
         parser.error("--engine requires --model")
     ids = [int(s) for s in args.tokens.read_text().strip().split(",")]
@@ -83,7 +87,7 @@ def main():
         parser.error("provide distinct token IDs, positive depths and repeats, and at least two generated tokens")
     shift = next(i for i, tok in enumerate(ids) if tok != ids[0])
     capacity = max(max(depths) + args.gen, args.ctx or 64)
-    with (maya_requests(args, capacity) if args.engine else llama_requests(args.llama_url)) as request:
+    with (maya_requests(args, capacity) if args.engine else llama_requests(args)) as request:
         request([ids[shift]], 9)
         run = 0
         for depth in depths:

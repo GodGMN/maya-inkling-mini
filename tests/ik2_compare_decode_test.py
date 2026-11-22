@@ -17,10 +17,13 @@ class DecodeComparison(unittest.TestCase):
             raw, ref = root / "prompt.f32", root / "ref.npy"
             np.log([[.1, .9], [.7, .3]]).astype("<f4").tofile(raw)
             np.save(ref, np.log([[.9, .1], [.7, .3]]))
+            ids = root / "tokens.csv"
+            ids.write_text("0,1")
             result = subprocess.check_output([sys.executable, str(SCRIPT), str(raw), "--ref", str(ref),
-                                              "--prefill", "--prompt-length", "2", "--vocab", "2"], text=True)
+                                              "--tokens", str(ids), "--prefill", "--prompt-length", "2", "--vocab", "2"], text=True)
             self.assertIn("top-1 1/2", result)
             self.assertIn("input position 0 ", result)
+            self.assertIn("1 target tokens: reference 10, engine 1.1111111", result)
 
     def test_forced_history(self):
         with tempfile.TemporaryDirectory() as tmp:

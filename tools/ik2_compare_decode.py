@@ -29,6 +29,7 @@ def main():
     mode.add_argument("--gen", type=int, help="engine --gen value for forced decode")
     mode.add_argument("--prefill", action="store_true", help="compare every prompt position")
     parser.add_argument("--vocab", type=int, required=True, help="unpadded vocabulary size")
+    parser.add_argument("--tokens", type=Path, help="IDs for the complete reference passage, to score next-token perplexity")
     args = parser.parse_args()
     if (args.gen is not None and args.gen < 2) or args.prompt_length < 1 or args.vocab < 1:
         parser.error("need --gen >= 2 and positive prompt length and vocabulary size")
@@ -46,6 +47,12 @@ def main():
         else:
             reference = raw_logits(args.baseline, rows, args.vocab)
 
+        labels = None
+        if args.tokens:
+            labels = np.asarray([int(s) for s in args.tokens.read_text().strip().split(",")])
+            if len(labels) != start + rows or np.any(labels < 0) or np.any(labels >= args.vocab):
+                raise ValueError(f"--tokens needs {start + rows} IDs within the vocabulary")
+        ref_nll, engine_nll = [], []
         divergences = []
         matches = 0
         for i, (ref, got) in enumerate(zip(reference, engine)):
@@ -54,12 +61,19 @@ def main():
             matches += int(ref.argmax() == got.argmax())
             r, g = log_softmax(ref), log_softmax(got)
             divergences.append(np.dot(np.exp(r), r - g))
+            if labels is not None and start + i + 1 < len(labels):
+                target = labels[start + i + 1]
+                ref_nll.append(-r[target])
+                engine_nll.append(-g[target])
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     worst = int(np.argmax(divergences))
     print(f"top-1 {matches}/{rows}; KL(ref || engine) mean {np.mean(divergences):.8g}, "
           f"median {np.median(divergences):.8g}, max {divergences[worst]:.8g} "
           f"at input position {start + worst} (zero-based)")
+    if engine_nll:
+        print(f"next-token perplexity over {len(engine_nll)} target tokens: reference {np.exp(np.mean(ref_nll)):.8g}, "
+              f"engine {np.exp(np.mean(engine_nll)):.8g}")
 
 
 if __name__ == "__main__":
