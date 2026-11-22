@@ -1,7 +1,7 @@
 {
   "backend": "hip",
   "exe": "build-ik2/maya-ik2",
-  "args": ["--model", "models/Inkling-2-Mini-IQ4_NL.gguf", "--max-context", "32768", "--chunk", "2048"],
+  "args": ["--model", "models/Inkling-2-Mini-IQ4_NL.gguf", "--max-context", "393216", "--chunk", "1024"],
   "env": {
     "IK2_HOST": "mmap",
     "IK2_KV": "fp8",

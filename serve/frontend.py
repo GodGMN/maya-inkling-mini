@@ -69,9 +69,6 @@ class ChatTemplate:
         # gets the tools in OpenAI's form - {"type": "function", "function": {...}} - so that is how they go in.
         self.qwen = (not self.glm_effort and not self.deepseek and not self.minimax and "<|im_start|>" in self.source
                      and "<function=" in self.source and "tool | tojson" in self.source)
-        # ... and it keeps a past turn's thinking (reasoning_content) unless told preserve_thinking=false: a client that
-        # sends the reasoning back gets the conversation as the model wrote it (the engine then goes on from it)
-        self.keeps_thinking = self.qwen and "preserve_thinking is undefined or preserve_thinking is true" in self.source
         # GLM-5.3 (744B, glm-dsa: the server sets it from the pack): text only; its template gets the tool call ids
         # (it orders parallel results by them) and clear_thinking, and a parameter whose schema allows a string stays
         # one (openai_to_messages / anthropic_to_messages / OutputParser with glm_dsa).  Its effort words are read from
@@ -92,6 +89,9 @@ class ChatTemplate:
         # "args"}<|end_message|> - which InklingRewriter turns into what OutputParser reads; reasoning_effort by name
         # (none .. max, its effort_map) or a number; tool call arguments must be objects
         self.inkling = "<|content_invoke_tool_json|>" in self.source and "effort_map" in self.source
+        self.keeps_thinking = self.inkling or (
+            self.qwen and "preserve_thinking is undefined or preserve_thinking is true" in self.source)
+
 
     def effort_shown(self, value) -> str | None:
         """Hy4-flash: a thinking level as given (a config's, a client's) -> the level this model really runs it at, in

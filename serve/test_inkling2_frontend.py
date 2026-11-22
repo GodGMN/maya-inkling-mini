@@ -102,6 +102,7 @@ class Template(unittest.TestCase):
     def test_detected(self):
         t = public()
         self.assertTrue(t.inkling)
+        self.assertTrue(t.keeps_thinking)
         self.assertFalse(t.minimax or t.deepseek or t.qwen or t.hy4 or t.glm_effort or t.glm_dsa)
 
     def test_other_templates_are_not(self):
