@@ -24,6 +24,12 @@ python3 src/tests/ik2_tool_conversations.py http://127.0.0.1:8085
 python3 src/tests/ik2_image_answers.py http://127.0.0.1:8085
 ```
 
+In Hyperion select `inkling-2-mini`. The on-node control daemon starts the Compose project in `~/ai/services/inkling-2-mini/`. The separate Hyperion repository still contains its original llama.cpp recipe. Copying that recipe back over the service directory would restore llama.cpp.
+
+Through the LAN router at `http://192.168.100.111:8079/v1`, a non-streaming Responses request called two functions. A streamed follow-up with `previous_response_id` and the results in reverse order returned both correct desk codes. Retrieving that stored response with GET returned HTTP 200 on Maya's own port 8085 and HTTP 502 on the router, which sends that GET to its default UI backend. The public gateway at `https://prometheus.gimeno.dev/v1` served Chat Completions during the music run and returned HTTP 404 for Responses. Use the direct port for stored-response retrieval.
+
+Run `python3 tests/ik2_responses_route.py http://192.168.100.111:8079 --direct-url http://192.168.100.111:8085`. With OpenAI Python SDK 3.57.0, `python3 -m unittest serve.test_responses serve.test_responses_tools serve.test_responses_schema` passed all 55 tests. A streamed function completion now includes its name for strict validators in SDK 2.24.0. The current SDK also requires a description on returned namespaces and accepts only supported namespace members.
+
 For rollback, the incumbent image remains on Prometheus. The following commands restore its Compose configuration and controller description.
 
 ```sh
