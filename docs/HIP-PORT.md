@@ -8,6 +8,30 @@ The full-context image reserves 393,216 positions with a 1,024-token prefill chu
 
 The first long chat found a direct-answer bug at 70,024 tokens. The engine reused all 70,003 available tokens, then generated the correct seal, switched to thinking and repeated the seal. The direct-answer path now ends generation at the first text segment's closing token. Reasoning and tool conversations still run to the end of their whole turn.
 
+On build `27a63d9`, every append reused the preceding input and every generated token that the engine had processed. The sampled stop token is read when the next turn arrives. Two short follow-ups added only 22 tokens. After replacing the whole chat with a summary, the engine started at zero and resumed reuse on the following turn. Each answer returned the requested seal. The harness checks a separate zero-cache replay for each row.
+
+| Turn | Prompt tokens | Cached | New | Wall seconds | Anonymous RAM, MiB |
+|---|---:|---:|---:|---:|---:|
+| 1 | 20,000 | 0 | 20,000 | 6.477 | 828 |
+| 2 | 20,024 | 20,002 | 22 | 0.172 | 870 |
+| 3 | 39,999 | 20,026 | 19,973 | 8.044 | 914 |
+| 4 | 70,000 | 40,001 | 29,999 | 14.991 | 960 |
+| 5 | 70,024 | 70,002 | 22 | 0.292 | 1037 |
+| 6 | 114,999 | 70,026 | 44,973 | 28.907 | 1120 |
+| 7 | 160,000 | 115,001 | 44,999 | 36.935 | 1208 |
+| 8 | 204,999 | 160,002 | 44,997 | 44.724 | 1283 |
+| 9 | 250,000 | 205,001 | 44,999 | 52.387 | 1294 |
+| 10 | 300,000 | 250,002 | 49,998 | 67.577 | 1311 |
+| 11 (compacted) | 48 | 0 | 48 | 0.117 | 1311 |
+| 12 | 74 | 51 | 23 | 0.101 | 1311 |
+
+Run from the Prometheus build directory with the full-context server on port 18085.
+
+```sh
+pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-api)
+python3 src/tests/ik2_chat_growth.py http://127.0.0.1:18085 --server-pid "$pid" >growth-direct-full.jsonl
+```
+
 ## Multi-turn tool calls on Prometheus
 
 Run `python3 tests/ik2_tool_conversations.py http://127.0.0.1:PORT` against each listening server. The packaged gfx1100 Maya image (`gfx1100-08aad41`) and the incumbent llama.cpp image (`server-rocm-inkling-1427-r2`, port 8085) each passed all four conversations. On both the OpenAI and Anthropic APIs, in streaming and non-streaming mode, the first assistant turn called the same tool twice with distinct IDs and desk arguments. The client returned results in reverse order. Every final answer associated Larch with VX-731 and Birch with PK-284. The llama.cpp answers sometimes added a heading. Raw responses are in `maya-tools.jsonl` and `llama-tools.jsonl` in the Prometheus build directory.
@@ -205,7 +229,7 @@ MODEL="$HOME/ai/models/inkling-2-mini/Inkling-2-Mini-IQ4_NL.gguf"
 docker run --rm --name maya-ik2-api --memory 9g --memory-swap 9g --device /dev/kfd --device /dev/dri \
     -p 127.0.0.1:18085:8080 \
     --mount "type=bind,src=$MODEL,dst=/opt/maya/models/Inkling-2-Mini-IQ4_NL.gguf,readonly" \
-    hyperion/maya-ik2:gfx1100-b747ddf
+    hyperion/maya-ik2:gfx1100-27a63d9
 ```
 
 To rebuild the image from the build directory, run `sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer hyperion/maya-ik2:local`. The script stages the executable and tokenizer, uses Buildx resource limits of four CPUs and 6 GiB, and loads the resulting image into the local Docker daemon. Prometheus used Buildx v0.36.1. The packaged chat template, parser and server passed all 18 Inkling frontend tests. Run `docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 --entrypoint python3 hyperion/maya-ik2:gfx1100-08aad41 -m unittest serve.test_inkling2_frontend`.
