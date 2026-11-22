@@ -7,7 +7,7 @@ from urllib.request import Request, urlopen
 from ik2_tool_conversations import NAME, QUESTION, SCHEMA, VALUES, matched_results
 
 
-def check(url, direct_url):
+def check(url, direct_url, sdk=False):
     endpoint = url.rstrip("/") + "/v1/responses"
     settings = dict(model="inkling-2-mini", temperature=0, max_output_tokens=1536, store=True,
                     tools=[dict(type="function", name=NAME, description="Read one desk's assigned pass code.", parameters=SCHEMA)])
@@ -55,10 +55,36 @@ def check(url, direct_url):
         if base == direct_url and code != 200:
             raise ValueError("direct response retrieval failed")
 
+    if sdk:
+        import openai
+        with openai.OpenAI(base_url=url.rstrip("/") + "/v1", api_key="lan", timeout=180,
+                           max_retries=0, _strict_response_validation=True) as client:
+            with client.responses.create(**settings, input=QUESTION, stream=True) as events:
+                done = {}
+                completed = None
+                for event in events:
+                    if event.type == "response.function_call_arguments.done":
+                        if event.name != NAME:
+                            raise ValueError("wrong function in SDK stream")
+                        done[event.item_id] = json.loads(event.arguments)["desk"]
+                    if event.type == "response.completed":
+                        completed = event.response
+            if completed is None or len(done) != 2 or set(done.values()) != VALUES.keys():
+                raise ValueError(f"incomplete SDK stream: {done}")
+            outputs = [dict(type="function_call_output", call_id=item.call_id, output=VALUES[done[item.id]])
+                       for item in reversed(completed.output) if item.type == "function_call"]
+            reply = client.responses.create(**settings, previous_response_id=completed.id, input=outputs)
+            if reply.status != "completed" or not matched_results(reply.output_text):
+                raise ValueError(f"incorrect SDK follow-up: {reply.output_text}")
+            print(json.dumps(dict(sdk=openai.__version__, strict=True, streamed_tools=list(done.values()),
+                                  followup=reply.output_text, input_tokens=reply.usage.input_tokens,
+                                  output_tokens=reply.usage.output_tokens)))
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("url", help="server or LAN router base URL without /v1")
     p.add_argument("--direct-url", help="also require retrieval from the model port")
+    p.add_argument("--sdk", action="store_true", help="also validate streamed calls with the installed OpenAI Python SDK")
     args = p.parse_args()
-    check(args.url, args.direct_url)
+    check(args.url, args.direct_url, args.sdk)
