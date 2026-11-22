@@ -1587,6 +1587,55 @@ std::vector<uint8_t> page_cache(const std::vector<uint8_t>& linear, int heads, b
     return pages;
 }
 
+#ifdef STRATA_USE_HIP
+void test_rdna3_deep_attention() {
+    constexpr int n = 392957, D = 128, H = 3, T = 2, splits = 512, padded = ((n + 15) / 16) * 16;
+    const int marks[] = {n / 20, n / 2, 19 * n / 20, n - 1};
+    std::vector<uint8_t> keys(size_t(padded) * D), values(keys.size());
+    for (int i = 0; i < 4; ++i) {
+        keys[size_t(marks[i]) * D] = 0x58 + i; // 16, 18, 20, 22 in E4M3.
+        for (int d = 0; d < D; ++d) values[size_t(marks[i]) * D + d] = d & (1 << i) ? 0x38 : 0xb8;
+    }
+    std::fill(keys.begin() + size_t(n) * D, keys.end(), 0x7e);
+    std::fill(values.begin() + size_t(n) * D, values.end(), 0x7e);
+    std::vector<uint16_t> query(T * H * D);
+    std::vector<double> expected(query.size());
+    for (int t = 0; t < T; ++t) {
+        const int seen = n - 1 + t, active = t == 0 ? 3 : 4;
+        for (int h = 0; h < H; ++h) {
+            const double q = 1. - h / 8.;
+            query[(t * H + h) * D] = f2h_host(q);
+            double normalizer = seen - active + 1.;  // Unmarked keys and the sink all score zero.
+            for (int i = 0; i < active; ++i) normalizer += std::exp(q * (16 + 2 * i));
+            for (int d = 0; d < D; ++d)
+                for (int i = 0; i < active; ++i)
+                    expected[(t * H + h) * D + d] += (d & (1 << i) ? 1. : -1.) * std::exp(q * (16 + 2 * i)) / normalizer;
+        }
+    }
+    auto* dq = dev(query);
+    auto* zero = dev(std::vector<float>(H * 16, 0.f));
+    auto* pos = dev(std::vector<int>{n - 1});
+    auto* out = dev_n<float>(query.size());
+    const size_t scratch_n = std::max(k::attn_decode_mma_scratch(H, splits), size_t(T * H * 130 * 16));
+    auto* scratch = dev_n<float>(scratch_n);
+    for (int format : {1, 2}) {
+        const auto layout = test_fp8_layout(format, 0);
+        auto* dk = dev(format == 2 ? page_cache(keys, 1, false) : keys);
+        auto* dv = dev(format == 2 ? page_cache(values, 1, true) : values);
+        k::attn_flash_fp8(dq, H * D, dk, dv, layout, H, 1, D, T, n - T, 1.f, 1.f, zero, 1, n,
+                          zero, out, H * D, scratch, scratch_n, 16, nullptr);
+        expect(format == 1 ? "393K linear causal prefill" : "393K paged causal prefill",
+               host(out, query.size()), expected, 2e-3, 5e-5);
+        k::attn_decode_mma_fp8(dq + H * D, zero, zero, dk, dv, layout, H, 1, pos, 0, splits, 1.f, 1.f,
+                               zero, 16, 1, n, scratch, out, nullptr, nullptr, nullptr);
+        expect(format == 1 ? "393K linear decode" : "393K paged decode", host(out, H * D),
+               std::vector<double>(expected.begin() + H * D, expected.end()), 2e-3, 5e-5);
+        CU(cudaFree(dk)); CU(cudaFree(dv));
+    }
+    CU(cudaFree(dq)); CU(cudaFree(zero)); CU(cudaFree(pos)); CU(cudaFree(out)); CU(cudaFree(scratch));
+}
+#endif
+
 void test_attn_decode_mma() {
     const int D = 128, d_rel = 16;
     struct Case {
@@ -3321,6 +3370,7 @@ int main() {
     test_q8_verify_tile();
 #ifdef STRATA_USE_HIP
     test_experts_mma(2304, 1152, 1);
+    test_rdna3_deep_attention();
 #endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;

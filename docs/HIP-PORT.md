@@ -736,6 +736,8 @@ for pair in (0, 1):
 PY
 ```
 
+### Single-token NVFP4 timings
+
 For single-token WMMA, the E2M1 lookup now constructs the four FP16 values directly from their high bytes. Sixteen waves split the gate/up dot products, and four split each down projection. At model width, all 1,152 activated gate/up outputs and 2,304 down outputs passed the FP64 check with the same tolerances as the smaller case. The device suite passed at both K depths and with register tiles.
 
 With eight of 128 generated experts active and width 2,304, the median gate/up kernel time fell from 60.455 to 42.411 microseconds. The down projection went from 25.720 to 27.730 microseconds. Scalar gate/up and down measured 37.715 and 23.225 microseconds on the new binary. These are device-event times across 96 expert selections per repetition. They exclude routing and input conversion. The scalar default still wins for single-token NVFP4 on this fixture.
@@ -747,3 +749,36 @@ hipcc --offload-arch=gfx1100 -O3 -DSTRATA_USE_HIP=1 -Isrc/include/strata/hip_com
 # In the GPU container.
 IK2_EXPERT_MMA=1 ./ik2-nv-bench
 ```
+
+### Other gfx1100 experiments
+
+Prometheus kept four waves for global prefill. Using eight after 8,192 cached positions reduced the time of an isolated deep attention kernel but increased full-model prefill at both 32K and 64K. Double buffering the input and weight tiles in LDS also increased full-model prefill time at 2K, 8K and 32K. Fully unrolling the 2,304-input Q8 projections changed median decode by less than 0.5 tok/s at both 512 and 8K. The preset keeps the existing unroll.
+
+The resident loader also tried copying each mapped tensor in file order across experts. Both orders produced byte-identical held-out decode logits. Their relative startup times changed across runs with different file-cache contents, so the loader keeps its existing order.
+
+These commands use the retained experiment binaries in the Prometheus build directory. Export the Radeon preset first, then set the listed overrides to reproduce the comparison.
+
+```sh
+for waves in 4 auto; do
+    IK2_FLASH_WAVES=$waves IK2_PREFILL_DENSE=1 python3 src/tools/ik2_bench.py --engine ./flash-depth \
+        --model /weight.gguf --tokens profile-pp-ids --depths 32768,65536 --gen 3 --ctx 393216 --repeats 3 --chunk 1024
+done
+for pipeline in 0 1; do
+    IK2_PREFILL_PIPELINED=$pipeline IK2_WMMA_K=32 IK2_PREFILL_TILE=64 IK2_PREFILL_DENSE=1 \
+        python3 src/tools/ik2_bench.py --engine ./pipeline --model /weight.gguf --tokens profile-pp-ids \
+        --depths 2048,8192,32768 --gen 3 --repeats 3 --chunk 2048
+done
+for unroll in 4 18; do
+    IK2_PROJ_UNROLL=$unroll python3 src/tools/ik2_bench.py --engine ./proj-width --model /weight.gguf \
+        --tokens water.force --depths 512,8192 --gen 257 --repeats 3 --chunk 2048
+done
+for order in 1 0; do
+    IK2_ORDERED_LOAD=$order IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="order-$order.f32" ./ordered \
+        --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
+done
+cmp order-0.f32 order-1.f32
+```
+
+### Global attention at 392,957 keys
+
+The device suite checks the global attention computation at the production context depth independently of a language task. Four keys at 5%, 50%, 95% and the last position carry known scores and value patterns. All other keys and the attention sink have score zero. This gives a closed-form FP64 reference for every output channel. The first query must exclude the last key, the second must include it, and unused positions in the final 16-token page carry large sentinel values. On gfx1100 both cache layouts passed all 768 prefill outputs and all 384 decode outputs at 512 decode splits. Run `./build-ik2/ik2_kernels_test` with the Radeon preset.

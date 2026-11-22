@@ -69,7 +69,7 @@ python tools/strata_tokenizer.py --gguf models/Inkling-2-Mini-UD-Q4_K_XL.gguf --
 python serve/server.py --engine maya --config docs/inkling2-mini/ik2-mini.json --host 127.0.0.1 --port 18000
 ```
 
-Then talk to `http://127.0.0.1:18000/v1` with any OpenAI client, model `inkling-2-mini`. There are 4 configs in [`docs/inkling2-mini/`](docs/inkling2-mini/): the default (the drafter, 262K context, image encoder on the CPU), the longest context (344K, no drafter), text only, and the image encoder on the GPU.
+Then talk to `http://127.0.0.1:18000/v1` with any OpenAI client, model `inkling-2-mini`. There are four CUDA configs in [`docs/inkling2-mini/`](docs/inkling2-mini/): the default (the drafter, 262K context, image encoder on the CPU), the longest context (344K, no drafter), text only, and the image encoder on the GPU.
 
 ## Why the CUDA engine is faster than llama.cpp
 
@@ -81,11 +81,11 @@ The drafter's window has its own path: the tokens' expert picks are grouped on t
 
 The [guide](docs/INKLING2-MINI.md#how-it-works) has the details, and what I tried that didn't work.
 
-## Quality
+## Upstream CUDA quality checks
 
 The engine computes the model the GGUF holds, no pruning and no requantizing. On 96 GSM8K questions, greedy: 74 solved with plain decode and 77 with the drafter (the drafter only changes which pass computes a token, so the difference is noise). Against the float64 reference in `ref/inkling2.py` the engine picks the same top token on 45 to 46 of 47 positions, and the reference agrees with llama.cpp on 47 of 47.
 
-## Limits
+## Upstream CUDA limits
 
 * One request at a time. Two GPUs run as expert parallel (`IK2_EP=1`, tested on Windows with an RTX 5080 and an RTX 4060 Ti by @cobra91), the drafter is one GPU's.
 * It reads `UD-Q4_K_XL` only. `UD-Q8_K_XL` keeps the last 4 layers' experts in BF16 and the engine doesn't load them.
