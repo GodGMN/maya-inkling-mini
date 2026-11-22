@@ -10,6 +10,10 @@ Both Prometheus engines load the same `Inkling-2-Mini-IQ4_NL.gguf` text weights.
 
 ## Live service on Prometheus
 
+The current service is `hyperion/maya-ik2:gfx1100-service-r3` on port 8085, image ID `sha256:41b5796fba7d9d09e515dc966ca962e3acd59180d9567be0d5a46729e0a2fecc`. It runs the same native text engine as r1, with 393,216 positions and one slot. GPU vision with host-resident projector weights returned 39%, 43% and 55% on three fresh screenshots in 1.557, 0.881 and 0.656 s. The first was the first inference request after the server became ready. A cold 8,220-token parcel lookup returned H317, taking 2.601 s for prefill (3,160 tok/s). This was one live request. The music scores below were collected on r1. At Sergio's request, the music benchmark was run only once and the remaining long timing runs were stopped.
+
+All four OpenAI Chat Completions and Anthropic tool conversations passed on r3. Through the Hyperion LAN router, OpenAI Python SDK 3.57.0 with strict validation streamed both function calls and used their results in a stored follow-up. Check with `python3 tests/ik2_responses_route.py http://192.168.100.111:8079 --direct-url http://192.168.100.111:8085 --sdk`. Run `python3 ik-r3-short-check.py` from the Prometheus build directory for the parcel lookup.
+
 On 2026-11-22, `hyperion/maya-ik2:gfx1100-service-r1` replaced `hyperion/llama.cpp:server-rocm-inkling-1427-r2` on port 8085. The first Maya image ID was `sha256:9f2df85e9fde0a5d4450c7f4cb87e4247bdb651d63ba5c4168d754dec9ed89d9`. Its native engine SHA-256 is `81cbe5f004ff5c0e64db8ead4fe13f1a7f410acbe26f5d01bdf6b33d9aa959b3`. Compose kept the controller's service name, port, device access, restart policy and 10 GiB memory and swap limits. The live health response reported one slot, 393,216 positions, images enabled and medium default reasoning effort.
 
 The deployed image passed all 19 Inkling frontend tests. On the live port all four tool conversations returned Larch's VX-731 and Birch's PK-284, and all four image answers matched the incumbent. The CPU-encoded screenshot request took 13.965 seconds. The incumbent had its own 8,192-token reasoning budget. Maya's Inkling backend accepts a reasoning effort and a total output limit. Its separate thinking-budget endpoint reports `supported: false`.
@@ -220,6 +224,16 @@ python3 src/tools/strata/bench_http.py --url http://127.0.0.1:8085 --api openai 
 ```
 
 An OpenBLAS CPU experiment encoded the same three images in 27.993, 27.719 and 27.880 s with four threads. The original CPU kernel took 13.855, 13.873 and 14.135 s. These are encoder times before any language-model work. The services keep the original CPU encoder. Run `bash ik-vision-blas-check.sh` in the Prometheus build directory.
+
+The r3 encoder keeps the FP16 projector weights in host memory. mtmd's scheduler transfers weights for HIP operations when reading a picture. At the same 1,024-image-token limit it measured 404 MiB of additional GPU memory, down from 984 MiB. On the three screenshots, its embeddings had cosine similarities of 0.99872, 0.99876 and 0.99819 against CPU, and at least 0.99970 against the resident HIP encoder. Each comparison covered all 1,960,704 values. Run `bash ik-measure-host-vision.sh` with the GPU otherwise idle and `python3 src/tests/ik2_vision_compare.py vision-fixtures/cpu-compile.sve vision-fixtures/host-compile.sve --min-cosine 0.998` from the Prometheus build directory.
+
+Four slots needed a 512-token prefill chunk to fit every expert and the encoder. All four cold controls at 97,962 tokens matched their warm replies. Eight alternating follow-ups read 20 new tokens each in 0.197–0.345 s. Cold replays took 51.015–51.114 s. The three screenshots took 1.403, 0.935 and 0.752 s. Device-wide VRAM peaked at 23.67 GiB in the post-request samples, with zero OOM kills. Two slots loaded at 196,608 positions each with 1,024-token chunks and answered the same screenshots in 1.116, 0.916 and 0.662 s. The full two-slot replay was stopped. Three slots use the four-slot chunk size; the earlier three-slot cold controls used CPU vision. On the deployed single-slot profile, the device reported 23.50 GiB after the image checks.
+
+```sh
+python3 src/tests/ik2_image_answers.py http://127.0.0.1:8085 --screenshots
+# The four-slot result used a separate listener in the same build directory.
+python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --slots 4 --depth 98000 --images --server-pid "$pid"
+```
 
 ## Full-model measurements at 393,216 reserved tokens
 

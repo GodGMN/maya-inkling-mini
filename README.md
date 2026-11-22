@@ -10,7 +10,7 @@ The Radeon server offers OpenAI and Anthropic tool calls, including streamed par
 
 For independent chats, set `IK2_CACHE_SLOTS=2`, `3` or `4` at startup. With two 196K chats and four 98K chats, every follow-up processed only its new tokens and every final answer matched its cold replay. All requests run serially. [Slot sizes, timings and VRAM](docs/HIP-PORT.md#separate-conversation-caches)
 
-The packaged server can read images on the CPU or GPU. Both encoders matched llama.cpp on three color tests and read 39% from a setup screenshot. The screenshot request took 14.06 seconds with the CPU encoder and 0.82 seconds with the HIP encoder at full context. [Vision profiles and measurements](docs/HIP-PORT.md#image-answers-and-gpu-memory)
+Prometheus serves Maya on port 8085 under the Hyperion model name `inkling-2-mini`. The deployed GPU encoder read three different screenshots in **1.56, 0.88 and 0.66 seconds** at full context. The first was the first request after startup. It uses the original FP16 image weights and adds 404 MiB of GPU memory. The previous CPU encoder took about 14 seconds per new screenshot. [Image timings and memory](docs/HIP-PORT.md#image-latency-on-port-8085) · [API routes and private benchmark results](docs/HIP-PORT.md#live-service-on-prometheus)
 
 ```sh
 git clone --branch hip-port https://github.com/GodGMN/maya-inkling-mini.git
