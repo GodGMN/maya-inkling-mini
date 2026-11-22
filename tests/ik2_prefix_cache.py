@@ -57,15 +57,44 @@ def cancel_and_resume(engine, request, control_ids, cancel_after):
     print(f"cancelled after {len(emitted)} tokens; reused {reused}; 8/8 predictions match the cold replay", flush=True)
 
 
+def check_fork(engine, ids, depth):
+    base = list(itertools.islice(itertools.cycle(ids), depth))
+    markers = list(dict.fromkeys(ids))[:2]
+    generate(engine, base, 1)
+    histories = []
+    for marker in markers:
+        branch = base + [marker] * 32
+        output, reused = generate(engine, branch, 4)
+        if reused != depth:
+            raise RuntimeError(f"fork reused {reused} of {depth} shared tokens")
+        histories.append(branch + output[:-1])
+    controls = []
+    for i, history in enumerate(histories):
+        request = history + [markers[i]] * 7
+        output, reused = generate(engine, request, 8)
+        if reused != len(history):
+            raise RuntimeError(f"fork {i} retained {reused} of {len(history)} live tokens")
+        controls.append((request, output))
+    for marker in markers:
+        generate(engine, [markers[1], marker], 1)
+    for request, expected in controls:
+        output, reused = generate(engine, request, 8)
+        if reused or output != expected:
+            raise RuntimeError(f"cold fork replay cached {reused}, returned {output}, expected {expected}")
+    print(f"both forks retained {len(histories[0])} tokens and matched all 8 cold predictions", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--engine", required=True)
     ap.add_argument("--model", required=True)
+    ap.add_argument("--draft", help="also check the optional DSpark drafter's cached state")
     ap.add_argument("--tokens", required=True, type=Path, help="comma-separated IDs of a reference passage")
     ap.add_argument("--cancel-request", type=Path, help="also interrupt the first long copy request in this file")
     ap.add_argument("--chunk", type=int, default=256, help="prefill chunk size and first shared prefix")
     ap.add_argument("--cancel-after", type=int, default=128, help="send STOP after this many emitted copy tokens")
     ap.add_argument("--branches", type=int, default=0, help="branch repeatedly from one shared prefix")
+    ap.add_argument("--fork-slots", action="store_true", help="fork one prefix into two slots and resume each")
     args = ap.parse_args()
     if args.branches < 0:
         ap.error("branches must be nonnegative")
@@ -76,7 +105,20 @@ def main():
     if len(distinct) < 2:
         ap.error("the passage needs two distinct token IDs")
     a, b = distinct[:2]
-    cmd = [args.engine, "--serve-ik2", "--model", args.model, "--ctx", str(max(4096, 7 * args.chunk + 64)), "--chunk", str(args.chunk)]
+    ctx = max(4096, 7 * args.chunk + 64)
+    cmd = [args.engine, "--serve-ik2", "--model", args.model, "--ctx", str(ctx * (2 if args.fork_slots else 1)), "--chunk", str(args.chunk)]
+    if args.draft:
+        cmd.extend(["--draft", args.draft])
+    if args.fork_slots:
+        cmd.extend(["--cache-slots", "2"])
+        with subprocess.Popen(cmd, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as engine:
+            receive(engine, "@READY ")
+            check_fork(engine, ids, 7 * args.chunk)
+            engine.stdin.write("QUIT\n")
+            engine.stdin.close()
+            if engine.wait():
+                raise RuntimeError("engine exited unsuccessfully")
+        return
     with subprocess.Popen(cmd, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as engine:
         receive(engine, "@READY ")
         for depth in (args.chunk, 7 * args.chunk):

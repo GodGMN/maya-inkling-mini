@@ -38,7 +38,7 @@ python3 src/tests/ik2_chat_growth.py http://127.0.0.1:18085 --server-pid "$pid" 
 
 Set `IK2_CACHE_SLOTS` in Compose or pass `--cache-slots N` to the native server. One request runs at a time. Each slot retains its token and image history, KV, convolution state and prefix checkpoints. The engine selects the longest prefix it can restore. A new conversation uses an empty slot first, then the least recently used one. A restart clears all slots. With a single slot the engine allocates no exchange buffer.
 
-All 18 follow-ups across the three settings reused every previously processed token. Each needed 20 new tokens. The nine final replies matched their independent zero-cache controls on prompt length, assistant message, finish reason and generated token count. No cgroup OOM kills occurred. Memory below is the highest device-wide reading sampled after a request. All four configurations used the CPU vision encoder and 1,024-token prefill chunks.
+All 18 follow-ups across the three settings reused every previously processed token. Each needed 20 new tokens. The nine final replies matched their independent zero-cache controls on prompt length, assistant message, finish reason and generated token count. No cgroup OOM kills occurred. Memory below is the highest device-wide reading sampled after a request. All runs used 1,024-token prefill chunks. The two-, three- and four-slot servers included the CPU vision encoder. The one-slot row uses the timings from the growing conversation and the device reading from the full-context CPU vision profile.
 
 | Slots | Context per slot | Final prompt per chat | Warm follow-up, seconds | Final cold control, seconds | Device VRAM, GiB |
 |---:|---:|---:|---:|---:|---:|
@@ -57,9 +57,18 @@ From the Prometheus build directory, start a fresh instance with the indicated s
 pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-slots-2)
 python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 2 --depth 196352
 pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-slots-3)
-python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 3 --depth 24576 --images
+python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 3 --depth 24576
+python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 3 --depth 768 --images
 pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-slots-4)
 python3 src/tests/ik2_slot_chats.py http://127.0.0.1:18085 --server-pid "$pid" --slots 4 --depth 98000
+```
+
+A separate native test forked one shared history at 1,792 tokens, then resumed both descendants. The first implementation restored only 1,792 of the first descendant's 1,827 live tokens. The engine now preserves that descendant when it restores a checkpoint into an unused or older slot. Both descendants reused all 1,827 tokens and matched eight cold predictions apiece, with plain decode and with the official DSpark drafter. The first cold-control fixture accidentally shared one token with its eviction prompt. The regression now requires zero cached tokens before comparing predictions.
+
+```sh
+radeon python3 src/tests/ik2_prefix_cache.py --engine ./cache-slots-fork --model /weight.gguf --tokens water.force --fork-slots
+radeon env IK2_DRAFT_ADAPT=0 IK2_DRAFT_WIDTH=2 python3 src/tests/ik2_prefix_cache.py --engine ./cache-slots-fork \
+    --model /weight.gguf --tokens water.force --fork-slots --draft mtp.safetensors
 ```
 
 Median single-slot decode before and after introducing slots measured 116.89 and 117.00 tok/s after 512 tokens. At 8,192 tokens both measured 107.56 tok/s. Each median is from three independent greedy requests with 128 timed decode steps.

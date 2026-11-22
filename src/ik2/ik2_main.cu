@@ -442,6 +442,17 @@ struct SlotStorage {
         CU(cudaStreamSynchronize(g_s));
         std::swap(parked[from], parked[to]);
     }
+    // Fork the active history in place. The victim's backing allocation now holds the original.
+    void preserve(int from, int to, size_t length) {
+        uint8_t* dst = parked[to];
+        for (const Region& r : regions) {
+            const size_t n = r.bytes(length);
+            if (n) CU(cudaMemcpyAsync(dst, r.active, n, cudaMemcpyDeviceToDevice, g_s));
+            dst += r.rows * r.stride;
+        }
+        CU(cudaStreamSynchronize(g_s));
+        std::swap(parked[from], parked[to]);
+    }
 };
 
 // Y [T][N] (ldy) = X [T][K] FP16 . W [N][K]^T FP16, F32 sums
@@ -5698,6 +5709,23 @@ int main(int argc, char** argv) {
                 slot_storage.exchange(active_slot, selected, conversations[active_slot].hist.size(),
                                       conversations[selected].hist.size());
                 active_slot = selected;
+            }
+            if (restore >= 0 && cache_slots > 1) {
+                auto victim = std::min_element(conversations.begin(), conversations.end(),
+                                                [](const Conversation& a, const Conversation& b) { return a.used < b.used; });
+                const int target = (int)(victim - conversations.begin());
+                if (target != selected) {
+                    auto& source = conversations[selected];
+                    auto& checkpoint = source.snaps[restore];
+                    slot_storage.preserve(selected, target, source.hist.size());
+                    snap_copy(checkpoint, false);
+                    L = checkpoint.pos;
+                    victim->hist.assign(source.hist.begin(), source.hist.begin() + L);
+                    victim->hist_sig.assign(source.hist_sig.begin(), source.hist_sig.begin() + std::min(L, source.hist_sig.size()));
+                    victim->last.clear();
+                    for (auto& sn : victim->snaps) sn.pos = -1;
+                    active_slot = target;
+                }
             }
             auto& slot = conversations[active_slot];
             slot.used = ++request_order;
