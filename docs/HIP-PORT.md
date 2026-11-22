@@ -457,3 +457,27 @@ IK2_DECODE_PROJ=1 IK2_PAGED_KV=1 ./build-ik2/maya-ik2 --model /weight.gguf --ser
 oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer --score mmlu-maya.log
 oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer --llama-url http://127.0.0.1:8085
 ```
+
+### Attention workgroups and KV layout
+
+The Radeon kernel splits the keys according to the number of query workgroups. Each wave covers 16 queries. Larger decode graphs use additional key splits at 32K, 128K and 256K positions. The paged decode kernel reads global KV directly, while prefill shares each page between waves. Four-wave measurements on the installed IQ4_NL model gave the following medians in tok/s. Each depth had three uncached requests and 128 timed decode steps.
+
+| Input tokens | Token-major prefill | Paged prefill | Token-major decode | Paged decode |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 2,393 | 2,327 | 113.98 | 112.87 |
+| 8,192 | 3,660 | 3,674 | 104.58 | 102.48 |
+| 32,768 | 3,159 | 3,233 | 91.76 | 93.77 |
+
+The 32K server preset uses token-major KV. The page layout takes the same bytes per token. For the two- and eight-wave boundary cases, the device tests checked results against the CPU attention reference.
+
+```sh
+# Use the cooperative prefill environment above.
+export IK2_DECODE_PROJ=1 IK2_FLASH_WAVES=4
+for page in 0 1; do
+    IK2_PAGED_KV=$page python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+        --tokens water.force --depths 512,8192,32768 --gen 129 --repeats 3 --chunk 2048
+done
+for waves in 2 8; do
+    IK2_FLASH_WAVES=$waves IK2_PAGED_KV=1 ./build-ik2/ik2_kernels_test
+done
+```

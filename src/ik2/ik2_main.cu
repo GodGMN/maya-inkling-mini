@@ -2298,7 +2298,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
     // the attention's key splits: fixed, so that the launches are the same at every position
     const int P_sl = std::min(128, std::max(1, (c.window + 63) / 64));
-    constexpr int full_splits[] = {128, 16, 32, 64, 128};
+    constexpr int full_splits[] = {128, 16, 32, 64, 128, 256, 512};
     const int P_full = full_splits[attention_bucket];
     CU(cudaMemcpyAsync(W.tmp, W.emb_h, Cb, cudaMemcpyHostToDevice, g_s));
     k::rms(W.tmp, M.embd_norm, 1, C, c.eps, W.h, g_s);
@@ -2431,7 +2431,10 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
 #endif
         const bool mma = g_attn_mma == 1 || ((g_attn_mma == 2 || attention_bucket >= 3) && !Ly.sliding);
         const int ring = Ly.sliding ? Ly.kv_cap : 0;
-        const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : (attention_bucket ? P_full : g_mma_split);
+        int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : (attention_bucket ? P_full : g_mma_split);
+#ifdef STRATA_USE_HIP
+        if (Ly.paged_kv && attention_bucket == 5) ns = 128;
+#endif
         uint16_t* q16 = mma ? W.x16 : nullptr;
         if (Ly.kc8) {
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
@@ -2576,7 +2579,8 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
 #ifdef STRATA_USE_HIP
-    const int attention_bucket = g_attn_mma != 3 ? 0 : pos < 1024 ? 1 : pos < 8192 ? 2 : pos < 131072 ? 3 : 4;
+    const int attention_bucket = g_attn_mma != 3 ? 0 : pos < 1024 ? 1 : pos < 8192 ? 2 : pos < 32768 ? 3 :
+                                 pos < 131072 ? 4 : pos < 262144 ? 5 : 6;
 #else
     constexpr int attention_bucket = 0;
 #endif

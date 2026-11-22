@@ -5553,21 +5553,25 @@ void rdna3_flash(const uint16_t* q, int q_ld, const KV* kc, const KV* vc, Fp8KvL
     }
     splits = std::max(1, std::min<int>(splits, scratch_floats / per_split));
     static const int waves = getenv("IK2_FLASH_WAVES") ? atoi(getenv("IK2_FLASH_WAVES")) : 1;
-    if (layout.paged && waves == 4) {
-        rdna3_attn_part<true, false, 4, true, true><<<dim3(H, splits, (T + 63) / 64), 128, 0, stream>>>(
+    auto launch = [&]<int Waves>() {
+        constexpr int queries = Waves * 16;
+        const dim3 grid(H, splits, (T + queries - 1) / queries);
+        if constexpr (sizeof(KV) == 1) {
+            if (layout.paged) {
+                rdna3_attn_part<true, false, Waves, (Waves > 1), true><<<grid, Waves * 32, 0, stream>>>(
+                    q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias);
+                return;
+            }
+        }
+        rdna3_attn_part<true, false, Waves><<<grid, Waves * 32, 0, stream>>>(
             q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias);
-    } else if (layout.paged && waves == 1) {
-        rdna3_attn_part<true, false, 1, false, true><<<dim3(H, splits, (T + 15) / 16), 32, 0, stream>>>(
-            q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias);
-    } else if (waves == 4) {
-        rdna3_attn_part<true, false, 4><<<dim3(H, splits, (T + 63) / 64), 128, 0, stream>>>(
-            q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias);
-    } else if (waves == 1) {
-        rdna3_attn_part<true><<<dim3(H, splits, (T + 15) / 16), 32, 0, stream>>>(
-            q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias);
-    } else {
-        std::fprintf(stderr, "IK2_FLASH_WAVES expects 1 or 4\n");
-        std::abort();
+    };
+    switch (waves) {
+        case 1: launch.template operator()<1>(); break;
+        case 2: launch.template operator()<2>(); break;
+        case 4: launch.template operator()<4>(); break;
+        case 8: launch.template operator()<8>(); break;
+        default: std::fprintf(stderr, "IK2_FLASH_WAVES expects 1, 2, 4 or 8\n"); std::abort();
     }
     check("rdna3 prefill attention");
     attn_combine_kernel<<<dim3(H, T), 128, 0, stream>>>(sink, scratch, H, splits, inv, out, nullptr, nullptr, o_ld);
@@ -5660,8 +5664,10 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
 }
 int attn_flash_splits(int Tq, int H, int nk, int n_sm) {
 #ifdef STRATA_USE_HIP
-    const int waves = (Tq + 15) / 16 * H;
-    return std::max(1, std::min({16, (nk + 255) / 256, (n_sm * 8 + waves - 1) / waves}));
+    static const int waves = getenv("IK2_FLASH_WAVES") ? std::max(1, atoi(getenv("IK2_FLASH_WAVES"))) : 1;
+    const int rows = 16 * waves;
+    const int groups = (Tq + rows - 1) / rows * H;
+    return std::max(1, std::min({16, (nk + 127) / 128, (n_sm * 8 + groups - 1) / groups}));
 #else
     const int blocks = (Tq + 16 * kFaNW - 1) / (16 * kFaNW) * H;
     const int want = (6 * n_sm + blocks - 1) / blocks;   // (about three waves of two blocks an SM)
@@ -6503,10 +6509,7 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
         std::abort();
     }
     static const bool staged = getenv("IK2_ATTN_STAGED") && atoi(getenv("IK2_ATTN_STAGED"));
-    if (layout.paged && staged)
-        rdna3_attn_part<false, false, 1, true, true><<<dim3(Hkv, n_split), 32, 0, s>>>(q16, r, kc, vc, kv_cap, H, Hkv, pos, qpos,
-                                                      qk_scale, proj, d_rel, extent, window, scratch, 1, H * 128, nullptr);
-    else if (layout.paged)
+    if (layout.paged)
         rdna3_attn_part<false, false, 1, false, true><<<dim3(Hkv, n_split), 32, 0, s>>>(q16, r, kc, vc, kv_cap, H, Hkv, pos, qpos,
                                                       qk_scale, proj, d_rel, extent, window, scratch, 1, H * 128, nullptr);
     else if (staged)
