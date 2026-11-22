@@ -10,7 +10,7 @@ The gfx1100 kernel suite passes. On the same 96 GSM8K questions with a 1,024-tok
 git clone --branch hip-port https://github.com/GodGMN/maya-inkling-mini.git
 ```
 
-See the [HIP build instructions and validation commands](docs/HIP-PORT.md).
+[Build the HIP engine](docs/HIP-PORT.md#build-on-prometheus-without-a-gpu) or [run its OpenAI-compatible server](docs/HIP-PORT.md#serve-the-iq4_nl-model-on-gfx1100).
 
 ## Upstream CUDA results on RTX 3090
 

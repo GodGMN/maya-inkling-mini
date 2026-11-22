@@ -1,0 +1,24 @@
+{
+  "backend": "hip",
+  "exe": "build-ik2/maya-ik2",
+  "args": ["--model", "models/Inkling-2-Mini-IQ4_NL.gguf", "--max-context", "32768", "--chunk", "1024"],
+  "env": {
+    "IK2_HOST": "mmap",
+    "IK2_KV": "fp8",
+    "IK2_GATE_TILE": "64",
+    "IK2_GATE_BF16": "1",
+    "IK2_Q8_UNROLL": "1",
+    "IK2_BATCH_PREFILL": "1",
+    "IK2_PREFILL_WMMA": "1",
+    "IK2_PREFILL_DENSE": "1",
+    "IK2_FLASH": "1",
+    "IK2_ATTN_MMA": "0",
+    "IK2_EXPERT_LIMB": "0",
+    "IK2_F16_MV": "2",
+    "IK2_IQ4_MV": "1",
+    "IK2_Q8_MV": "1",
+    "IK2_Q8_TILE": "1"
+  },
+  "tokenizer": "ik2/tokenizer",
+  "model_name": "inkling-2-mini"
+}

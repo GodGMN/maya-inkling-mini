@@ -29,6 +29,26 @@ cmake --build build-ik2 -j4 --target maya-ik2 ik2_kernels_test ik2_host_ref_test
 
 The base library uses the same source and target architecture. For the separate base build directory on Prometheus, the build command is `cmake --build build -j4 --target strata_engine`. The engine links its own kernels and hipBLAS directly.
 
+## Serve the IQ4_NL model on gfx1100
+
+The Radeon preset runs a single text session with FP8 KV. From the repository root inside the ROCm environment, set the paths in the preset to the built executable and the installed GGUF, then export its tokenizer and start the HTTP server.
+
+```sh
+MODEL=models/Inkling-2-Mini-IQ4_NL.gguf
+python3 tools/strata_tokenizer.py --gguf "$MODEL" --out ik2 --chat-template tools/ik2/chat_template.jinja
+python3 serve/server.py --engine maya --config docs/inkling2-mini/ik2-mini-gfx1100.json \
+    --host 127.0.0.1 --port 18085
+```
+
+On Prometheus the executable and installed weights were mounted at `/work/specialized` and `/weight.gguf`. The loopback HTTP check used a 32,768-token context and 1,024-token chunks. `GET /v1/models` returned `inkling-2-mini`. The ordinary chat request returned “Paris” and the streaming request returned “42”, a stop reason, and the final SSE `[DONE]`.
+
+```sh
+curl -fsS http://127.0.0.1:18085/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"model":"inkling-2-mini","messages":[{"role":"user","content":"What is the capital of France? Reply in one word."}],"temperature":0,"reasoning_effort":"none","max_tokens":512}'
+curl -NsS http://127.0.0.1:18085/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"model":"inkling-2-mini","messages":[{"role":"user","content":"What is 17 plus 25? Reply with digits only."}],"temperature":0,"reasoning_effort":"none","max_tokens":512,"stream":true}'
+```
+
 ## CUDA and HIP differences in the initial scalar port
 
 | Area | Phase 1 implementation |
