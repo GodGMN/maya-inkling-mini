@@ -510,3 +510,16 @@ The server has eight snapshots of the sliding KV and convolution state. Previous
 python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
     --tokens water.force --branches 12
 ```
+
+### Host RAM on the production comparison server
+
+Prometheus gives the `inkling-2-mini` container 10 GiB of host RAM and the same combined RAM-plus-swap limit. The RX 7900 XTX has a separate 24 GB of VRAM. The service image defaults to a prompt cache of up to 8,192 MiB and 32 context checkpoints per slot. A checkpoint at 229,211 tokens occupied 48.670 MiB in the server log. Thirty-two checkpoints of that size would occupy 1.52 GiB. The crash did not retain an allocator-level breakdown.
+
+The deployed Compose command now sets `--cache-ram 0 --ctx-checkpoints 2`. It keeps one slot, 393,216 context positions, Q4_0 K/V and the 10 GiB cgroup limit. This bounds the two host-side caches while preserving prefix reuse in the active slot. The host kernel also charges file-backed pages to the cgroup, so the resident-memory total includes reclaimable file data.
+
+```sh
+docker run --rm --memory 1g --memory-swap 1g --cpus 1 \
+    hyperion/llama.cpp:server-rocm-inkling-1427-r2 --help 2>&1 | grep -A3 -E -- '--cache-ram|--ctx-checkpoints'
+docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{json .Config.Cmd}}' inkling-2-mini
+docker logs inkling-2-mini 2>&1 | grep 'erasing old context checkpoint' | tail -1
+```
