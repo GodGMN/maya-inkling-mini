@@ -36,6 +36,29 @@ python3 src/tests/ik2_chat_growth.py http://127.0.0.1:18085 --server-pid "$pid" 
 
 Run `python3 tests/ik2_tool_conversations.py http://127.0.0.1:PORT` against each listening server. The packaged gfx1100 Maya image (`gfx1100-08aad41`) and the incumbent llama.cpp image (`server-rocm-inkling-1427-r2`, port 8085) each passed all four conversations. On both the OpenAI and Anthropic APIs, in streaming and non-streaming mode, the first assistant turn called the same tool twice with distinct IDs and desk arguments. The client returned results in reverse order. Every final answer associated Larch with VX-731 and Birch with PK-284. The llama.cpp answers sometimes added a heading. Raw responses are in `maya-tools.jsonl` and `llama-tools.jsonl` in the Prometheus build directory.
 
+## Image encoder on the Ryzen 5 3600
+
+The installed `mmproj-F16.gguf` works with the node's llama.cpp `b12600` source. The older ggml tree used for the language engine predates the Inkling vision tower. From the build directory on Prometheus, copy the needed source from the existing checkout, then build in the CPU container.
+
+```sh
+mkdir -p vision-llama-b12600
+git -C ../llama.cpp-b12600 archive b12600 -- CMakeLists.txt cmake src include common ggml tools vendor LICENSE convert_hf_to_gguf.py | tar -x -C vision-llama-b12600
+docker exec -w /work maya-ik2-hip-build cmake -S src/tools/vision -B vision-cpu -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/work/vision-llama-b12600
+docker exec -w /work maya-ik2-hip-build cmake --build vision-cpu --target maya-vision -j4
+python3 src/tests/ik2_image_answers.py --write-images vision-fixtures
+docker run --rm -i --memory 2304m --memory-swap 2304m --cpus 4 -v "$PWD:/work" \
+    -v "$HOME/ai/models/inkling-2-mini:/models:ro" --entrypoint /work/vision-cpu/bin/maya-vision \
+    ghcr.io/ggml-org/llama.cpp:server-rocm-b11176 --threads 4 \
+    --model /models/Inkling-2-Mini-IQ4_NL.gguf --mmproj /models/mmproj-F16.gguf <<'ENCODER'
+ENC /work/vision-fixtures/red-blue.png /work/vision-fixtures/cpu-red-blue.sve
+ENC /work/vision-fixtures/blue-red.png /work/vision-fixtures/cpu-blue-red.sve
+QUIT
+ENCODER
+```
+
+The encoder returned 35 embeddings of width 2,304 for each 256×192 image in 376 and 377 ms. This command ran without GPU devices. The host used four threads.
+
 ## Full-model measurements at 393,216 reserved tokens
 
 The RX 7900 XTX ran commit `9a0f164` with the installed ggml-org IQ4_NL GGUF, a 1,024-token prefill chunk and E4M3 KV. Every expert stayed on the card. The runner alternated prompt starts, checked that zero input tokens were reused and timed 128 decode steps after the first prediction. Each cell is the median of three requests. Startup is excluded.

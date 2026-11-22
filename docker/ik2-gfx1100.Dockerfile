@@ -8,6 +8,7 @@ COPY maya-ik2 build-ik2/maya-ik2
 COPY serve/ serve/
 COPY tools/ tools/
 COPY tokenizer/ ik2/tokenizer/
-COPY ik2-mini-gfx1100.json ik2-mini-gfx1100.json
+COPY vision/ vision/
+COPY ik2-mini-gfx1100*.json ./
 ENTRYPOINT ["python3", "serve/server.py", "--engine", "maya"]
 CMD ["--config", "ik2-mini-gfx1100.json", "--host", "0.0.0.0", "--port", "8080"]
