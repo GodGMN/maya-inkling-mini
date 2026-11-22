@@ -801,6 +801,54 @@ void test_experts_mv() {
 }
 
 #ifdef STRATA_USE_HIP
+void test_rdna3_loop_gate() {
+    constexpr int C = 2304, R = 64, jobs = 3;
+    std::mt19937 gen(714);
+    std::uniform_real_distribution<float> random(-1.f, 1.f);
+    std::vector<uint16_t> weights(4 * C * R);
+    std::vector<float> w(weights.size()), x(jobs * C), m(jobs * C);
+    for (size_t i = 0; i < w.size(); ++i) {
+        float v = random(gen) / 32;
+        uint32_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        weights[i] = bits >> 16;
+        bits &= 0xffff0000u;
+        std::memcpy(&w[i], &bits, sizeof(bits));
+    }
+    for (float& v : x) v = random(gen);
+    for (float& v : m) v = random(gen);
+    auto *dx = dev(x), *dm = dev(m), *scratch = dev_n<float>(jobs * (2 * R + 2));
+    auto* dw = dev(weights);
+    k::LoopGate gates[jobs]{};
+    std::vector<double> expected(jobs * C);
+    for (int j = 0; j < jobs; ++j) {
+        const int off = j * C;
+        gates[j] = {dx + off, dm + off, nullptr, nullptr, nullptr, dx + off, {dw, dw + 2 * R * C, dw + 3 * R * C}};
+        double sx = 0., sm = 0.;
+        for (int c = 0; c < C; ++c) { sx += (double)x[off+c] * x[off+c]; sm += (double)m[off+c] * m[off+c]; }
+        double rank[R];
+        for (int r = 0; r < R; ++r) {
+            double ax = 0., am = 0.;
+            for (int c = 0; c < C; ++c) {
+                ax += (double)w[2*r*C + c] * x[off+c];
+                am += (double)w[(2*r+1)*C + c] * m[off+c];
+            }
+            rank[r] = ax / std::sqrt(sx/C + 1e-6) + am / std::sqrt(sm/C + 1e-6);
+        }
+        for (int c = 0; c < C; ++c) {
+            double forget = 0., gain = 0.;
+            for (int r = 0; r < R; ++r) {
+                forget += w[(2*R+r)*C + c] * rank[r];
+                gain += w[(3*R+r)*C + c] * rank[r];
+            }
+            expected[off+c] = (1. - std::tanh(forget)) * x[off+c] + std::tanh(gain) * m[off+c];
+        }
+    }
+    k::loop_gates(gates, jobs, 1, C, R, 1e-6f, scratch, 0);
+    expect("three in-place BF16 loop gates vs FP64", host(dx, expected.size()), expected, 2e-5, 2e-6);
+    cudaFree(dx); cudaFree(dm); cudaFree(scratch); cudaFree(dw);
+}
+
 void test_iq4nl_gate_cancellation() {
     constexpr int C = 512, F = 2;
     constexpr size_t row_bytes = C / 32 * 18, gate_bytes = F * row_bytes;
@@ -3094,6 +3142,7 @@ int main() {
     test_experts_mv();
 #ifdef STRATA_USE_HIP
     test_iq4nl_gate_cancellation();
+    test_rdna3_loop_gate();
     test_rdna3_small_dense();
     test_rdna3_dense_gemm();
     test_rdna3_expert_groups();

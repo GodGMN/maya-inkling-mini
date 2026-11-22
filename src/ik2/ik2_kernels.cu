@@ -1999,6 +1999,10 @@ __global__ void loop_gate_apply_kernel(LoopGateArgs a, int T, int C, int R, floa
     const size_t i = (size_t) t * C + c;
     a.y[j][i] = (1.0f - tanhf(f)) * a.x[j][i] + tanhf(gn) * a.m[j][i];
 }
+#ifdef STRATA_USE_HIP
+#include "ik2_loop_rdna3.cuh"
+#endif
+
 // ---- sampling: the largest logits found on the device - the host gets a thousand or two candidates and not the
 // vocabulary (copying 200,000 logits out and sorting them was 0.8 ms a token).  A histogram of the values a block,
 // the bin from which the bins hold K values at least, the values of those bins gathered.
@@ -5798,13 +5802,26 @@ void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float
         a.F[j] = compact ? (const void*)gt[j].compact[1] : gt[j].F;
         a.G[j] = compact ? (const void*)gt[j].compact[2] : gt[j].G;
     }
+    static const int tile = getenv("IK2_GATE_TILE") ? atoi(getenv("IK2_GATE_TILE")) : 0;
+#ifdef STRATA_USE_HIP
+    bool aligned = true;
+    for (int j = 0; j < n; ++j) {
+        aligned &= !(((uintptr_t)a.x[j] | (uintptr_t)a.m[j]) & 15) && !((uintptr_t)a.D[j] & 7);
+    }
+    if (tile == 256 && T == 1 && R == 64 && C % 64 == 0 && compact && aligned) {
+        rdna3_gate_dots<<<dim3(R, n), 128, 0, s>>>(a, C, sc);
+        check("rdna3_gate_dots");
+        rdna3_gate_apply<<<dim3(C / 64, n), 256, 0, s>>>(a, C, eps, sc);
+        check("rdna3_gate_apply");
+        return;
+    }
+#endif
     const dim3 dots(R, n, T);
     if (compact)
         loop_gate_dots_kernel<true><<<dots, 128, 0, s>>>(a, T, C, R, sc);
     else
         loop_gate_dots_kernel<false><<<dots, 128, 0, s>>>(a, T, C, R, sc);
     check("loop_gates (dots)");
-    static const int tile = getenv("IK2_GATE_TILE") ? atoi(getenv("IK2_GATE_TILE")) : 0;
     const bool fixed = T == 1 && R == 64 && (tile == 32 || tile == 64 || tile == 128);
     const int threads = fixed ? tile : kBlk;
     const dim3 apply((C + threads - 1) / threads, n, T);

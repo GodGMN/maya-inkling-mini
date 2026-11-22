@@ -481,3 +481,22 @@ for waves in 2 8; do
     IK2_FLASH_WAVES=$waves IK2_PAGED_KV=1 ./build-ik2/ik2_kernels_test
 done
 ```
+
+### Looped-layer message gates
+
+On a single decode token, 128 threads now read four input channels each for the two BF16 projections. One rank computes the input norms. The next kernel applies the two output projections to 64 channels per workgroup. The device test checks three simultaneous in-place gates against FP64 across all 6,912 outputs.
+
+With `IK2_GATE_TILE=256`, median decode at 512 tokens rose from 113.93 to **117.38 tok/s**. At 8,192 it rose from 105.05 to **107.61 tok/s**. Across 32 forced held-out steps, both variants agreed with the CPU reference on 30 top tokens. Mean full-vocabulary KL changed from 0.002206 to 0.002220. The Radeon preset enables the new gate.
+
+```sh
+# Use the cooperative prefill environment above with IK2_DECODE_PROJ=1.
+for tile in 64 256; do
+    IK2_GATE_TILE=$tile python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+        --tokens water.force --depths 32,512,8192 --gen 257 --repeats 3 --chunk 2048
+    IK2_GATE_TILE=$tile IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="gate-$tile.f32" \
+        ./build-ik2/maya-ik2 --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
+    oracle-env/bin/python src/tools/ik2_compare_decode.py "gate-$tile.f32" --ref heldout-teacher-ref.npy \
+        --tokens heldout-teacher.all --vocab 200058 --gen 33 --prompt-length 224
+done
+IK2_GATE_TILE=256 ./build-ik2/ik2_kernels_test
+```
