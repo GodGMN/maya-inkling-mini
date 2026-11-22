@@ -4,7 +4,7 @@ On Prometheus’s RX 7900 XTX, `maya-ik2` decoded at **115.2 tok/s after a 512-t
 
 Maya read an uncached 8,192-token prompt at **3,559 tok/s**. Llama.cpp reached 1,488 tok/s. [Prefill measurements and commands](docs/HIP-PORT.md#cooperative-prefill-and-depth-dependent-decode-attention)
 
-For a rename in an 886-output-token Python file, verifying proposed tokens from the prompt reached **445.8 tok/s**, up from **107.8 tok/s** with plain decode. Copying a repetitive inventory reached **750.7 tok/s**. All three repeats produced the requested text exactly. Both tasks used direct answers and the target model alone. [Copy and edit commands](docs/HIP-PORT.md#copy-and-edit-requests-without-a-drafter)
+On a Python rename that required returning 886 tokens, a 256-token verification window reached **693.6 tok/s**. A 512-token window copied a repetitive inventory at **996.6 tok/s**. All three repeats produced the requested text exactly. Both tasks used direct answers and proposals from the prompt itself. [Copy and edit commands](docs/HIP-PORT.md#larger-copy-and-edit-windows)
 
 The gfx1100 kernel suite passes. Maya answered **187 of 192** GSM8K questions correctly with a 4,096-token output limit. Every response finished. On the original 96-question run with a 1,024-token cap, Maya scored 90 and llama.cpp scored 93. [Quality checks and commands](docs/HIP-PORT.md#gsm8k)
 

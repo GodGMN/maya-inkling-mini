@@ -8,7 +8,7 @@ from jinja2 import Environment
 from ik2_retrieval import FINAL, ROOT, STOP, Tokenizer, responses
 
 
-def examples(workload):
+def examples(workload, inventory_lines=9):
     if workload == "python":
         source = (ROOT / "tests/ik2_compare_decode_test.py").read_text().rstrip()
         old, new = "test_forced_history", "test_forced_decode_history"
@@ -19,7 +19,7 @@ def examples(workload):
         return
     names = ("notebooks", "folders", "maps", "letters")
     lines = ["The archive shelf contains " + ", ".join(
-        f"box {j} storing {names[j % 4]}" for j in range(i, i + 9)) + "." for i in range(0, 81, 9)]
+        f"box {j} storing {names[j % 4]}" for j in range(i, i + 9)) + "." for i in range(0, inventory_lines * 9, 9)]
     inventory = "\n".join(lines)
     yield "copy", "Copy the following archive inventory verbatim. Return only the inventory, with every line.", inventory, inventory
     yield "edit", "Return this inventory verbatim with exactly one change: replace 'box 46' with 'box forty-six'.", inventory, inventory.replace("box 46", "box forty-six")
@@ -32,14 +32,17 @@ def main():
     ap.add_argument("--direct-answer", action="store_true", help="prefill the final channel used by the HTTP server")
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--workload", choices=("inventory", "python"), default="inventory")
+    ap.add_argument("--inventory-lines", type=int, default=9, help="number of nine-box lines in the inventory")
     ap.add_argument("--score", type=Path, help="stdout of maya-ik2 --serve-ik2")
     args = ap.parse_args()
     if min(args.max_tokens, args.repeats) < 1:
         ap.error("--max-tokens and --repeats must be positive")
+    if args.workload == "inventory" and args.inventory_lines < 6:
+        ap.error("--inventory-lines must include box 46 (at least six lines)")
     tok = Tokenizer.from_dir(args.tokenizer)
     end, = tok.encode(STOP, parse_special=True)
     template = Environment().from_string((ROOT / "tools/ik2/chat_template.jinja").read_text())
-    cases = list(examples(args.workload))
+    cases = list(examples(args.workload, args.inventory_lines))
     cases_per_run = len(cases)
     cases *= args.repeats
     if args.score:

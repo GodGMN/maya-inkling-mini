@@ -1224,6 +1224,7 @@ struct Work {
     int *gidx_h[2] = {}, *inv_h[2] = {};
     float *sg_h[2] = {}, *su_h[2] = {}, *wt_h[2] = {};
     int *argmax_d = nullptr, *argmax_h = nullptr;
+    int head_rows = 16;
     std::vector<cudaEvent_t> miss_ev;
     // prefill: the next layer's experts copied in while this one runs (prefetch_layer)
     // the prefetches in flight, a ring by layer: their batches' events, expert -> its batch
@@ -2140,11 +2141,13 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
             const int t0 = all_logits ? 0 : T - 1, nt = T - t0;
             if (out_mode == OutMode::kArgmax) {
                 argmax_out->resize(nt);
-                for (int i = 0; i < nt; i += 16) {
-                    const int n = std::min(16, nt - i);
+                for (int i = 0; i < nt;) {
+                    const int remaining = nt - i;
+                    const int n = remaining >= 32 ? std::min(W.head_rows, remaining / 16 * 16) : std::min(16, remaining);
                     matmul(M.out_w, W.xq + (size_t) (t0 + i) * C, W.x16 + (size_t) i * C, n, W.logits, c.n_rows);
                     if (n == 1) k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d + i, g_s);
                     else k::argmax_rows(W.logits, c.n_rows, n, c.n_vocab, W.argmax_d + i, g_s);
+                    i += n;
                 }
                 CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) nt * 4, cudaMemcpyDeviceToHost, g_s));
                 CU(cudaStreamSynchronize(g_s));
@@ -2152,7 +2155,7 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
             } else {
                 const size_t start = logits_out.size();
                 logits_out.resize(start + (size_t)nt * c.n_vocab);
-                for (int i = 0; i < nt; i += 16) {   // (W.logits holds 16 rows)
+                for (int i = 0; i < nt; i += 16) {
                     const int n = std::min(16, nt - i);
                     matmul(M.out_w, W.xq + (size_t) (t0 + i) * C, W.x16 + (size_t) i * C, n, W.logits, c.n_rows);
                     k::softcap(W.logits, (size_t) n * c.n_rows, c.logit_cap, g_s);
@@ -4999,8 +5002,13 @@ int main(int argc, char** argv) {
                     ik2::draft::bytes(drafter) / 1073741824.0, now() - t0);
     }
 
+#ifdef STRATA_USE_HIP
+    constexpr int max_suffix_inputs = 512;
+#else
+    constexpr int max_suffix_inputs = 128;
+#endif
     if (getenv("IK2_SUFFIX") && n_gpu == 1 && g_fast_want && !drafter)
-        suffix_window = std::min({std::max(0, atoi(getenv("IK2_SUFFIX"))), chunk, 128});
+        suffix_window = std::min({std::max(0, atoi(getenv("IK2_SUFFIX"))), chunk, max_suffix_inputs});
     if (suffix_window >= 8) {
         for (auto& v : M.V) {
             const size_t cc[] = {KD, KD, C, C};
@@ -5139,7 +5147,10 @@ int main(int argc, char** argv) {
     W.gi_stamp.assign(c.E, 0);
     W.seen_late.assign(c.E, 0);
     W.gi_idx.assign(c.E, 0);
-    W.logits = dalloc<float>((size_t) 16 * c.n_rows);
+#ifdef STRATA_USE_HIP
+    if (suffix_window >= 32) W.head_rows = std::min(64, suffix_window / 16 * 16);
+#endif
+    W.logits = dalloc<float>((size_t) W.head_rows * c.n_rows);
     if (c.n_pass > 1) {
         W.lp_pre = work_alloc<float>(Tm * C);
         W.lp_bank = work_alloc<float>((size_t)(n_core / c.block) * Tm *

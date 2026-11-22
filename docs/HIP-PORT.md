@@ -588,3 +588,33 @@ ledger() {
 ledger | IK2_PAGED_KV=1 ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 >ledger.log
 ledger --score ledger.log
 ```
+
+### Larger copy and edit windows
+
+The HIP verifier can check up to 512 proposed inputs per target pass. With a window of at least 32 it computes up to 64 vocabulary rows together for greedy verification. The window is bounded by the prefill chunk size. Plain generation is the default.
+
+| Verification window | Inventory copy, tok/s | Inventory edit, tok/s | Python rename, tok/s |
+| ---: | ---: | ---: | ---: |
+| 128 | 833.57 | 527.65 | 479.67 |
+| 256 | 881.64 | 553.23 | 693.57 |
+| 512 | 996.57 | 488.66 | 637.15 |
+
+These are medians of three direct-answer requests per cell. All 27 final answers exactly matched the requested text. On the longer, 27-line inventory, the client sent STOP after reading 750 tokens. The server ended the verified batch after emitting 1,164 and reused 2,939 tokens on the next request. Its eight predictions after resumption matched a cold replay.
+
+```sh
+# Use the preceding copy/edit commands with a 512-token chunk and windows 128, 256 and 512.
+for task in inventory python; do
+    oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
+        --direct-answer --workload "$task" --repeats 3 >"$task.requests"
+    for w in 128 256 512; do
+        IK2_SUFFIX=$w ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 8192 \
+            --chunk 512 <"$task.requests" >"$task-$w.log"
+        oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
+            --direct-answer --workload "$task" --repeats 3 --score "$task-$w.log"
+    done
+done
+oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
+    --direct-answer --inventory-lines 27 --max-tokens 2048 >long-copy.requests
+IK2_SUFFIX=512 python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    --tokens water.force --chunk 512 --cancel-after 750 --cancel-request long-copy.requests
+```
