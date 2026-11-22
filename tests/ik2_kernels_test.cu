@@ -2845,6 +2845,33 @@ void test_round6() {
 }  // namespace
 
 #ifdef STRATA_USE_HIP
+void test_rdna3_dense_output_prefill() {
+    constexpr int N = 2304, K = 3072, T = 513;
+    std::mt19937 gen(8033);
+    std::vector<uint16_t> weights((size_t)N * K), x((size_t)T * K);
+    auto fill = [&](std::vector<uint16_t>& values) {
+        for (auto& v : values) v = f2h_host(((int)(gen() % 511) - 255) / 256.f);
+    };
+    fill(weights);
+    fill(x);
+    auto* dw = dev(weights);
+    auto* dx = dev(x);
+    auto* dy = dev_n<float>((size_t)T * N);
+    k::rdna3_dense_gemm(dw, N, K, dx, T, dy, N, 0);
+    const auto result = host(dy, (size_t)T * N);
+    std::vector<float> actual;
+    std::vector<double> expected;
+    for (int t : {0, 15, 64, 511, 512})
+        for (int n : {0, 31, 63, 64, 1153, N - 1}) {
+            double dot = 0;
+            for (int k = 0; k < K; ++k) dot += (double)h2f_host(weights[n * K + k]) * h2f_host(x[t * K + k]);
+            actual.push_back(result[t * N + n]);
+            expected.push_back(dot);
+        }
+    expect("3072-wide prefill output projection vs FP64", actual, expected, 2e-4, 5e-4);
+    cudaFree(dw); cudaFree(dx); cudaFree(dy);
+}
+
 void test_rdna3_small_dense() {
     constexpr int K = 2304, N = 128;
     const auto x = fvec(K);
@@ -3238,6 +3265,7 @@ int main() {
     test_rdna3_loop_gate();
     test_rdna3_attention_output_projection();
     test_rdna3_equal_attention_scores();
+    test_rdna3_dense_output_prefill();
     test_rdna3_small_dense();
     test_rdna3_dense_gemm();
     test_rdna3_expert_groups();
