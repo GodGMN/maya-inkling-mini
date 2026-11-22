@@ -122,14 +122,14 @@ curl -NsS http://127.0.0.1:18085/v1/chat/completions -H 'Content-Type: applicati
 
 ## Run the packaged image on Prometheus
 
-The local image `hyperion/maya-ik2:gfx1100-9a0f164` contains the selected executable, its Python server, the Radeon preset and the tokenizer exported from the installed IQ4_NL checkpoint. It reads the weights from a read-only mount. The preset reserves 32,768 positions. When the card is available exclusively for Maya, run the following on Prometheus.
+The local image `hyperion/maya-ik2:gfx1100-08aad41` contains the selected executable, its Python server, the Radeon preset and the tokenizer exported from the installed IQ4_NL checkpoint. It reads the weights from a read-only mount. The preset reserves 32,768 positions. When the card is available exclusively for Maya, run the following on Prometheus.
 
 ```sh
 MODEL="$HOME/ai/models/inkling-2-mini/Inkling-2-Mini-IQ4_NL.gguf"
 docker run --rm --name maya-ik2-api --memory 9g --memory-swap 9g --device /dev/kfd --device /dev/dri \
     -p 127.0.0.1:18085:8080 \
     --mount "type=bind,src=$MODEL,dst=/opt/maya/models/Inkling-2-Mini-IQ4_NL.gguf,readonly" \
-    hyperion/maya-ik2:gfx1100-9a0f164
+    hyperion/maya-ik2:gfx1100-08aad41
 ```
 
 For the 393,216-position benchmark configuration, create a copy of the preset on the host. From `~/ai/build/maya-ik2-hip`, run the following command. For the mixed-precision profile, also set `cfg["env"]["IK2_KV"] = "fp8-global"` before writing the file.
@@ -149,7 +149,7 @@ PYCFG
 
 Add `--mount "type=bind,src=$PWD/ik2-393216.json,dst=/opt/maya/ik2-mini-gfx1100.json,readonly"` before the image name in the Docker command above.
 
-To rebuild the image from the build directory, run `sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer hyperion/maya-ik2:local`. The script stages the executable and tokenizer, uses Buildx resource limits of four CPUs and 6 GiB, and loads the resulting image into the local Docker daemon. Prometheus used Buildx v0.36.1.
+To rebuild the image from the build directory, run `sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer hyperion/maya-ik2:local`. The script stages the executable and tokenizer, uses Buildx resource limits of four CPUs and 6 GiB, and loads the resulting image into the local Docker daemon. Prometheus used Buildx v0.36.1. The packaged chat template, parser and server passed all 18 Inkling frontend tests. Run `docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 --entrypoint python3 hyperion/maya-ik2:gfx1100-08aad41 -m unittest serve.test_inkling2_frontend`.
 
 ## CUDA and HIP differences in the initial scalar port
 
