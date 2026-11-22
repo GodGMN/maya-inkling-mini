@@ -61,6 +61,10 @@ if(STRATA_VISION_HIP)
 endif()
 
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
+if(TARGET ggml-hip)
+  # ROCm's static host objects also enter the distribution's PIE executable.
+  set_target_properties(ggml-hip PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 if(MSVC AND TARGET ggml-cuda)
   target_compile_options(ggml-cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
 endif()

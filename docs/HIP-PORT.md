@@ -8,7 +8,9 @@ The full-context image reserves 393,216 positions with a 1,024-token prefill chu
 
 The first long chat found a direct-answer bug at 70,024 tokens. The engine reused all 70,003 available tokens, then generated the correct seal, switched to thinking and repeated the seal. The direct-answer path now ends generation at the first text segment's closing token. Reasoning and tool conversations still run to the end of their whole turn.
 
-On build `27a63d9`, every append reused the preceding input and every generated token that the engine had processed. The sampled stop token is read when the next turn arrives. Two short follow-ups added only 22 tokens. After replacing the whole chat with a summary, the engine started at zero and resumed reuse on the following turn. Each answer returned the requested seal. The harness checks a separate zero-cache replay for each row.
+On build `27a63d9`, every append reused the preceding input and every generated token that the engine had processed. The sampled stop token is read when the next turn arrives. Two short follow-ups added only 22 tokens. After replacing the whole chat with a summary, the engine started at zero and resumed reuse on the following turn. Each answer returned the requested seal. All 12 matched their independent zero-cache replay on the complete response, finish reason and generated token count. The cold 300,000-token request took 259.365 seconds. VRAM stayed at 23.08 GiB after the first long prefill. Anonymous host memory reached 1.28 GiB at 300K and 1.29 GiB after the final cold controls. The remaining cgroup charge was mostly file-backed model pages. No OOM kills occurred.
+
+A separate medium-effort chat added 17 and 26, then removed four. The first reply contained 415 characters of reasoning. Feeding back the complete message reused 174 of 174 available tokens. Omitting `reasoning_content` reused the 52-token prompt checkpoint. Both variants answered 39. See `retained-reasoning.jsonl` in the Prometheus build directory, reproduced with `python3 ik-reason-history.py` there.
 
 | Turn | Prompt tokens | Cached | New | Wall seconds | Anonymous RAM, MiB |
 |---|---:|---:|---:|---:|---:|
