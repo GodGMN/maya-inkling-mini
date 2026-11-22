@@ -643,3 +643,22 @@ The gfx1100 test suite exercises the 3,072-input by 2,304-output attention proje
 ```sh
 for k in 32 64; do IK2_WMMA_K=$k ./build-ik2/ik2_kernels_test; done
 ```
+
+### Short prompt tiles and inventory control
+
+The Radeon preset chooses the MoE tile height from the number of routed rows per expert. On this model it uses 16 rows through 128 input tokens, 32 rows through 256, and 64 rows above that. The 64-row case uses fused SwiGLU. Median prefill time for 16, 32, 64 and 128 new tokens fell from 63, 88, 101 and 116 ms to 57, 80, 91 and 108 ms. At 256, 512, 1,024 and 2,048 tokens both settings measured 141, 180, 290 and 513 ms. At chunk sizes 64 and 256, all 256 held-out prefill rows matched the fixed-height run byte for byte across the full vocabulary.
+
+```sh
+# Start with the Radeon preset environment. The natural token fixture construction is shown above.
+for rows in auto 64; do
+    IK2_WMMA_K=32 IK2_PREFILL_TILE=$rows python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 \
+        --model /weight.gguf --tokens profile-pp-ids --depths 16,32,64,128,256,512,1024,2048 --chunk 2048 --gen 3 --repeats 5
+    for chunk in 64 256; do
+        IK2_WMMA_K=32 IK2_PREFILL_TILE=$rows IK2_PREFILL_LOGITS_OUT="tile-$chunk-$rows.f32" ./build-ik2/maya-ik2 \
+            --model /weight.gguf --ctx 1024 --chunk "$chunk" --tokens @heldout-teacher.all --gen 0
+    done
+done
+for chunk in 64 256; do cmp "tile-$chunk-auto.f32" "tile-$chunk-64.f32"; done
+```
+
+On the three-record inventory, the direct-answer prompt returned the correct 986 at 256 and 2,048 input tokens and 1,008 at 32,768. Allowing the model to reason before answering produced 986 at all three depths. The model used 355, 169 and 488 generated tokens respectively. Switching all KV entries to FP16 did not recover the 32,768-token direct answer. Run the ledger command above with `--depths 256,2048,32768`, then remove `--direct-answer` and use `--max-tokens 512` for the reasoning control.

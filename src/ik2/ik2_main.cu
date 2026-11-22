@@ -3103,8 +3103,15 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
 bool resident_wmma_prefill(const Config& c, const Layer& ly, int T, Work& w) {
     static const bool enabled = getenv("IK2_PREFILL_WMMA") && atoi(getenv("IK2_PREFILL_WMMA"));
     const int S = T * c.K, C = c.C, F = c.F;
-    static const int tile_rows = getenv("IK2_PREFILL_TILE") ? atoi(getenv("IK2_PREFILL_TILE")) : 16;
-    if (tile_rows != 16 && tile_rows != 32 && tile_rows != 64) die("IK2_PREFILL_TILE expects 16, 32 or 64");
+    static const int fixed_rows = [] {
+        const char* rows = getenv("IK2_PREFILL_TILE");
+        if (!rows) return 16;
+        if (!std::strcmp(rows, "auto")) return 0;
+        const int n = atoi(rows);
+        if (n == 16 || n == 32 || n == 64) return n;
+        die("IK2_PREFILL_TILE expects auto, 16, 32 or 64");
+    }();
+    const int tile_rows = fixed_rows ? fixed_rows : S <= 8 * c.E ? 16 : S <= 16 * c.E ? 32 : 64;
     const int capacity = k::expert_tile_capacity(S, c.E, tile_rows);
     if (!enabled || !g_fast || T < 2 || !ly.tab_blob || c.E > 1024 ||
         ly.ty[0] != ly.ty[1] || ly.ty[0] != ly.ty[2] || (ly.ty[0] != k::kIQ4_NL && ly.ty[0] != k::kQ8_0) ||
