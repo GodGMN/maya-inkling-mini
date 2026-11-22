@@ -11,6 +11,8 @@ from urllib.request import Request, urlopen
 @contextmanager
 def maya_requests(args, capacity):
     cmd = [args.engine, "--model", args.model, "--serve-ik2", "--ctx", str(capacity), "--chunk", str(args.chunk)]
+    if args.draft:
+        cmd.extend(["--draft", str(args.draft)])
     with subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1) as engine:
         assert engine.stdin and engine.stdout
 
@@ -68,6 +70,7 @@ def main():
     target.add_argument("--engine", help="path to maya-ik2")
     target.add_argument("--llama-url", help="base URL of llama.cpp server")
     parser.add_argument("--model", help="GGUF for --engine")
+    parser.add_argument("--draft", type=pathlib.Path, help="optional DSpark mtp.safetensors for --engine")
     parser.add_argument("--tokens", required=True, type=pathlib.Path, help="comma-separated token IDs, cycled to each depth")
     parser.add_argument("--depths", default="32,512,4096")
     parser.add_argument("--gen", type=int, default=129, help="includes the first token predicted by prefill")
@@ -81,6 +84,8 @@ def main():
         parser.error("temperature must be finite and nonnegative and top-p must be in (0, 1]")
     if args.engine and not args.model:
         parser.error("--engine requires --model")
+    if args.draft and not args.engine:
+        parser.error("--draft requires --engine")
     ids = [int(s) for s in args.tokens.read_text().strip().split(",")]
     depths = [int(s) for s in args.depths.split(",")]
     if len(set(ids)) < 2 or min(depths) < 1 or args.gen < 2 or args.repeats < 1:
