@@ -322,6 +322,8 @@ python3 tests/ik2_feasibility.py --url "$URL" --reasoning-effort medium
 
 Eight further eight-needle MRCR rows contained 23,365 to 60,974 input tokens. Their mean direct-answer match ratios were 0.0600 on FP8 and 0.0773 on FP4. Neither model reproduced the requested answer on any row. In five cases the generated text was identical. The rows were 1714, 1725, 1750, 1797, 1920, 1959, 1979 and 1992 in the default train split. Results and the exact inputs are in `~/ai/build/maya-ik2-hip/fp4-overnight/results/` on Prometheus.
 
+On the first medium-effort run of row 1714 (23,365 tokens), FP8 copied the requested seventh article verbatim. FP4 copied the eighth verbatim. Both emitted the correct identifying prefix and finished within 4,096 output tokens. The evaluator records each exact match against the previous articles as well as the official string-similarity score. Use `--require-cached-archive` for the multi-turn MMLU and coding checks to fail immediately if a follow-up rereads its archive.
+
 ```sh
 python3 tests/ik2_kv_quality.py --url "$URL" --mmlu mmlu256.jsonl
 python3 tests/ik2_gsm8k.py --chat-url "$URL" --data gsm8k-test.jsonl --count 32 --max-tokens 4096
