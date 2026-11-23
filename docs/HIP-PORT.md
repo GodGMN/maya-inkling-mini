@@ -167,6 +167,23 @@ RUN pip install --no-cache-dir numpy==2.2.6
 DOCKER
 ```
 
+### Serving an attention output LoRA
+
+The native engine accepts `--lora FILE.gguf` for GGUF LoRAs with F32 A and B tensors on `blk.N.attn_output.weight`. It checks the base architecture, tensor dimensions, and each A/B pair. Other targets fail at startup. Each visit to an adapted layer adds the low-rank projection before the attention output convolution. The original quantized weights stay on disk and in VRAM. The adapter takes effect at process startup.
+
+For an agent-facing service, copy the stock Maya server preset, append `["--lora", "/opt/maya/adapters/adapter.gguf"]` to its native `args`, and set a distinct `model_name`. Mount the adapter read-only. Register this model ID and the new service port in Hyperion's router, then sync its client configs. Both model IDs share the normal `/v1` endpoint. Stop the active full-context service before switching on a 24 GB card.
+
+The regression fixture uses a rank-two adapter with a non-unit scale. A separate Q8_0 model expresses the same projection by copying two rows and flipping the sign of one. The test compares prompt and teacher-forced decode logits and repeats the requests with the adapter disabled. Only the changed matrix is written to a test shard. Run it with the production image's NumPy and a checkout mounted at `/source`:
+
+```sh
+python3 /source/tests/ik2_lora_reference.py /weights/Inkling-2-Mini-IQ4_NL.gguf /opt/maya/build-ik2/maya-ik2
+python3 /source/tests/ik2_lora_reference.py /weights/Inkling-2-Mini-IQ4_NL.gguf /opt/maya/build-ik2/maya-ik2 --adapter /adapter.gguf
+python3 tests/ik2_responses_route.py "$ROUTER" --model "$MODEL_ID" --sdk
+python3 tests/ik2_tool_conversations.py "$ROUTER" --model "$MODEL_ID"
+```
+
+With the final physical layer replaced, the native adapter and the independent weight edit agreed on the top token at all 12 prompt positions and three teacher-forced decode steps. The largest per-position logit RMS errors were 0.000986 and 0.0000651, respectively. Disabling the adapter increased RMS error to at least 0.1445. An earlier version of the test reshaped three decode rows as four. An early-layer version agreed on every top token but exceeded its logit tolerance after downstream layers. The final-layer fixture isolates the projection, and `--adapter` checks the actual adapter against CPU matrix products at every adapted visit.
+
 ### Named FP4 profiles
 
 The packaged host-staged vision build includes two explicit `MAYA_IK2_PRESET` values. Each preset sets the native slot count, per-request context budget and 512-token prefill chunk together. The native `--max-context` argument is the sum of all slots. The HTTP `/health` field `max_context` is the limit on one conversation.

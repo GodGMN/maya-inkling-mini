@@ -122,10 +122,13 @@ def run(url, model, api, stream):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url")
+    parser.add_argument("--model", help="model ID when testing through a router")
     args = parser.parse_args()
     url = args.url.rstrip("/")
-    with urlopen(url + "/v1/models", timeout=15) as response:
-        model = json.load(response)["data"][0]["id"]
+    model = args.model
+    if not model:
+        with urlopen(url + "/v1/models", timeout=15) as response:
+            model = json.load(response)["data"][0]["id"]
     failures = 0
     for api in ("openai", "anthropic"):
         for stream in (False, True):

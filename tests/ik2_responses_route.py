@@ -7,9 +7,9 @@ from urllib.request import Request, urlopen
 from ik2_tool_conversations import NAME, QUESTION, SCHEMA, VALUES, matched_results
 
 
-def check(url, direct_url, sdk=False):
+def check(url, direct_url, sdk=False, model="inkling-2-mini"):
     endpoint = url.rstrip("/") + "/v1/responses"
-    settings = dict(model="inkling-2-mini", temperature=0, max_output_tokens=1536, store=True,
+    settings = dict(model=model, temperature=0, max_output_tokens=1536, store=True,
                     tools=[dict(type="function", name=NAME, description="Read one desk's assigned pass code.", parameters=SCHEMA)])
 
     def send(**fields):
@@ -84,7 +84,8 @@ def check(url, direct_url, sdk=False):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("url", help="server or LAN router base URL without /v1")
+    p.add_argument("--model", default="inkling-2-mini")
     p.add_argument("--direct-url", help="also require retrieval from the model port")
     p.add_argument("--sdk", action="store_true", help="also validate streamed calls with the installed OpenAI Python SDK")
     args = p.parse_args()
-    check(args.url, args.direct_url, args.sdk)
+    check(args.url, args.direct_url, args.sdk, args.model)
