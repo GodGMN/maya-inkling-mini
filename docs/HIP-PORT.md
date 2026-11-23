@@ -107,6 +107,38 @@ pid=$(docker inspect -f '{{.State.Pid}}' maya-ik2-api)
 python3 src/tests/ik2_chat_growth.py http://127.0.0.1:18085 --server-pid "$pid" >growth-direct-full.jsonl
 ```
 
+## FP4 global KV experiment on gfx1100
+
+`IK2_KV=fp4-global` stores 32 consecutive channels as sixteen E2M1 bytes and one FP16 scale. It applies to keys and values of the eight full-attention visits. The 40 sliding-window visits keep E4M3. The text weights are the same stock IQ4_NL GGUF. At 393,216 tokens the global KV payload is 3.375 GiB per conversation, including scales. Conversation state and windowed KV require additional memory.
+
+Build and check the FP4 kernels with the existing Prometheus build containers:
+
+```sh
+docker exec -w /work maya-ik2-hip-build cmake --build build-ik2 -j4 --target maya-ik2 ik2_kernels_test
+docker exec -w /work -e IK2_FLASH_WAVES=4 -e IK2_ATTN_STAGED=1 -e IK2_DECODE_SUBWAVE=1 \
+    maya-ik2-gfx1100 ./build-ik2/ik2_kernels_test
+```
+
+The binary built from `4d384de` passed the Radeon suite. The independent CPU tests cover clipped K, RMS-normalized V, empty blocks, nibble decoding, causal prefill, scalar decode, WMMA decode and block verification. The GPU vision profile kept the 1,024-image-token host-staged encoder loaded. With two caches, 393,216 tokens per slot failed the resident-expert check at both 512- and 256-token prefill chunks. At chunk 512, 385,024, 376,832 and 368,640 also failed. The server started at 360,448 per slot with 3,291.7 MiB per cache and a 4 MiB exchange buffer. The three screenshot requests returned 39%, 43%, and 55% in 0.785, 0.844, and 0.741 s on this configuration.
+
+The trial used the service-r3 image with the new executable mounted over `/opt/maya/build-ik2/maya-ik2`. Set `IK2_CACHE_SLOTS=2` in the container environment. In a copy of the host-staged GPU vision preset, set `env.IK2_KV` to `fp4-global`, `--max-context` to twice the per-slot capacity, and `--chunk` to the tested chunk. Start with `MAYA_IK2_PRESET` pointing to the mounted preset. The established all-resident expert requirement and 256 MiB loader reserve remain in force.
+
+```sh
+python3 tests/ik2_image_answers.py "$URL" --screenshots
+python3 tests/ik2_kv_quality.py --url "$URL" --mmlu mmlu32.jsonl
+python3 tests/ik2_coding.py --url "$URL" --data humanevalplus.jsonl > coding.jsonl
+python3 tests/ik2_coding.py --data humanevalplus.jsonl --score coding.jsonl --image ik2-evalplus:local
+```
+
+The coding test samples 16 task IDs with seed 1429 from [EvalPlus HumanEval+](https://huggingface.co/datasets/evalplus/humanevalplus/blob/d32357cf319e50e9c8d8dab5ea876c72b0fd321b/test.jsonl). The scorer runs each first answer against the dataset's supplied tests in an isolated, network-disabled CPU container. Build the local grader image with:
+
+```sh
+docker build -t ik2-evalplus:local - <<'DOCKER'
+FROM python:3.12-slim
+RUN pip install --no-cache-dir numpy==2.2.6
+DOCKER
+```
+
 ## Separate conversation caches
 
 Set `IK2_CACHE_SLOTS` in Compose or pass `--cache-slots N` to the native server. One request runs at a time. Each slot retains its token and image history, KV, convolution state and prefix checkpoints. The engine selects the longest prefix it can restore. A new conversation uses an empty slot first, then the least recently used one. A restart clears all slots. With a single slot the engine allocates no exchange buffer.
