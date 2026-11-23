@@ -182,7 +182,7 @@ python3 tests/ik2_responses_route.py "$ROUTER" --model "$MODEL_ID" --sdk
 python3 tests/ik2_tool_conversations.py "$ROUTER" --model "$MODEL_ID"
 ```
 
-With the final physical layer replaced, the native adapter and the independent weight edit agreed on the top token at all 12 prompt positions and three teacher-forced decode steps. The largest per-position logit RMS errors were 0.000986 and 0.0000651, respectively. Disabling the adapter increased RMS error to at least 0.1445. An earlier version of the test reshaped three decode rows as four. An early-layer version agreed on every top token but exceeded its logit tolerance after downstream layers. The final-layer fixture isolates the projection, and `--adapter` checks the actual adapter against CPU matrix products at every adapted visit.
+With the final physical layer replaced, the native adapter and the independent weight edit agreed on the top token at all 12 prompt positions and three teacher-forced decode steps. The largest per-position logit RMS errors were 0.000986 and 0.0000651, respectively. Disabling the adapter increased RMS error to at least 0.1445. An earlier version of the test reshaped three decode rows as four. An early-layer version agreed on every top token but exceeded its logit tolerance after downstream layers. The final-layer fixture isolates the projection, and `--adapter` checks the actual adapter against CPU matrix products at every adapted visit. For a rank-16 adapter on 20 physical layers, the test compared 128 output channels on four input tokens across all 44 adapted visits. The worst relative L2 error was 0.0000322 against the full CPU projection and 0.000638 relative to the adapter contribution alone.
 
 ### Named FP4 profiles
 
