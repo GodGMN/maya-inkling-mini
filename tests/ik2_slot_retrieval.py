@@ -6,7 +6,7 @@ import random
 from urllib.request import urlopen
 
 from ik2_chat_growth import archive, ask, post
-from ik2_image_answers import png
+from ik2_image_answers import png, setup_screenshots
 
 
 def make_chat(url, depth, index):
@@ -31,6 +31,7 @@ def main():
     p.add_argument("--serial", action="store_true", help="one-slot baseline, finish each chat before loading the next")
     p.add_argument("--server-pid", type=int)
     p.add_argument("--cold", action="store_true", help="replay the late-record queries after evicting all warm slots")
+    p.add_argument("--screenshots", action="store_true", help="read a 1480×900 screenshot in each nearly full chat")
     args = p.parse_args()
     if args.depth < 512 or args.slots < 1:
         p.error("positive slots and depth >=512 required")
@@ -48,18 +49,23 @@ def main():
                                                                    dict(role="user", content="Hi")]))
     evict()
     colors = [("red", (236, 24, 24)), ("blue", (16, 40, 236)), ("green", (16, 165, 46)), ("yellow", (225, 225, 16))]
+    screenshots = setup_screenshots() if args.screenshots else []
 
     def turns(i):
         messages, codes = make_chat(args.url, args.depth, i)
         cached = 0
         for t in range(4):
             if t == 3:
-                name, left = colors[i % 4]
-                data = base64.b64encode(png(left, colors[(i + 1) % 4][1])).decode()
+                if screenshots:
+                    _, picture, question, expected = screenshots[i % len(screenshots)]
+                else:
+                    expected, left = colors[i % 4]
+                    picture = png(left, colors[(i + 1) % 4][1])
+                    question = "What color is the left half of this image? Reply with only the color name."
+                data = base64.b64encode(picture).decode()
                 content = [dict(type="image_url", image_url=dict(url="data:image/png;base64,"+data)),
-                           dict(type="text", text="What color is the left half of this image? Reply with only the color name.")]
+                           dict(type="text", text=question)]
                 messages.append(dict(role="user", content=content))
-                expected = name
             else:
                 expected = codes[t]
                 if t:
@@ -67,7 +73,7 @@ def main():
                     messages.append(dict(role="user", content=f"What is the {label} verification number? Reply with just the number."))
             request = dict(model="inkling-2-mini", temperature=0, reasoning_effort="none", max_tokens=32, messages=messages)
             record = ask(args.url, request, f"register-{i}", t, cached, args.server_pid)
-            answer = (record["answer"].get("content") or "").strip().lower().rstrip(".")
+            answer = (record["answer"].get("content") or "").strip().lower().rstrip(".").replace(" %", "%")
             score = dict(chat=i, turn=t, expected=expected, answer=answer, correct=answer == expected)
             scores.append(score)
             print(json.dumps(score), flush=True)

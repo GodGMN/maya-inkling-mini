@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from ik2_coding import problems
+from ik2_image_answers import setup_screenshots
 
 
 def completion(url, messages, limit, effort):
@@ -97,12 +98,11 @@ def main():
             result = completion(args.url, messages+[dict(role="user", content=prompt)], limit, args.reasoning_effort)
             yield dict(case="code", chat=i, task_id=q["task_id"], **result)
         if args.screenshots:
-            files = [("03-compiling.png", "39%"), ("04-downloading.png", "43%")]
-            name, expected = files[i % len(files)]
-            path = Path(__file__).resolve().parents[1] / "docs/media/setup-tui" / name
-            data = base64.b64encode(path.read_bytes()).decode()
+            fixtures = setup_screenshots()
+            _, picture, question, expected = fixtures[i % len(fixtures)]
+            data = base64.b64encode(picture).decode()
             content = [dict(type="image_url", image_url=dict(url="data:image/png;base64," + data)),
-                       dict(type="text", text="What percentage is printed beside the progress bar? Reply with the percentage only.")]
+                       dict(type="text", text=question)]
             result = completion(args.url, messages + [dict(role="user", content=content)], 256, "none")
             answer = result["answer"].strip().replace(" %", "%").rstrip(".")
             yield dict(case="screenshot", chat=i, expected=expected, correct=answer == expected, **result)

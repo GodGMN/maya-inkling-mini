@@ -32,13 +32,15 @@ PAIRS = (
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
+    parser.add_argument("--reasoning-effort", choices=("none", "medium"), default="none")
     args = parser.parse_args()
     cases = [(i, bool(j), prompt) for i,pair in enumerate(PAIRS) for j,prompt in enumerate(pair)]
     random.Random(1429).shuffle(cases)
     for i, feasible, prompt in cases:
         question = ("Can a program always meet this specification using only the inputs described? "
                     "Start with Yes or No, then justify your answer in one sentence.\n\n" + prompt)
-        result = completion(args.url, [dict(role="user", content=question)], 160, "none")
+        limit = 160 if args.reasoning_effort == "none" else 2048
+        result = completion(args.url, [dict(role="user", content=question)], limit, args.reasoning_effort)
         label = re.match(r"(yes|no)\b", result["answer"].strip().strip("*"), flags=re.I)
         expected = "yes" if feasible else "no"
         print(json.dumps(dict(case="feasibility", pair=i, expected=expected, correct=bool(label and

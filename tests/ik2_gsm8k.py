@@ -7,11 +7,7 @@ import re
 import sys
 from urllib.request import Request, urlopen
 
-from jinja2 import Environment
-
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tools"))
-from strata_tokenizer import Tokenizer
 
 NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 END = "<|content_model_end_sampling|>"
@@ -58,6 +54,8 @@ def main():
         return
     if not args.model:
         parser.error("--model is required for tokenized inputs")
+    sys.path.insert(0, str(ROOT / "tools"))
+    from strata_tokenizer import Tokenizer
     tok = Tokenizer.from_gguf(args.model)
     if args.score:
         tokens, results = [], []
@@ -77,6 +75,7 @@ def main():
         print(json.dumps(dict(correct=sum(r["correct"] for r in results), total=len(results),
                               truncated=sum(r["finish"] == "length" for r in results))))
         return
+    from jinja2 import Environment
     template = Environment().from_string((ROOT / "tools/ik2/chat_template.jinja").read_text())
     stop, = tok.encode(END, parse_special=True)
     results = []

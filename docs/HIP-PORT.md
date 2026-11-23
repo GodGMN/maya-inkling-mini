@@ -6,7 +6,7 @@ On Prometheus’s RX 7900 XTX, the Radeon server runs the installed ggml-org IQ4
 
 `maya-ik2` implements the Inkling 2 Mini architecture. Its HIP executable contains code for AMD target `gfx1100`, with 32-lane waves and RDNA3 matrix instructions. Prometheus's 24 GiB RX 7900 XTX is the card tested here. The 20 GiB RX 7900 XT and 16 GiB RX 7900 GRE share the target, but neither fits the measured 23.64 GiB full-context image configuration. A smaller configuration needs its own fit and correctness tests. The RX 7800 XT uses `gfx1101` and needs a separately supported build. The NVIDIA CUDA build has its own kernels. [AMD GPU specifications](https://rocm.docs.amd.com/en/docs-7.2.3/reference/gpu-arch-specs.html)
 
-Both Prometheus engines load the same `Inkling-2-Mini-IQ4_NL.gguf` text weights. Maya stores attention keys and values from previously read tokens in E4M3, an 8-bit floating-point format. The previous llama.cpp service stored its keys and values in Q4_0. On the 7900 XTX, Maya unpacks E4M3 in software for attention. The separate image encoder loads the same `mmproj-F16.gguf` with either backend. These settings can change the numerical results even with identical text weights.
+Both Prometheus engines load the same `Inkling-2-Mini-IQ4_NL.gguf` text weights. The FP8 Maya profile stores attention keys and values from previously read tokens in E4M3, an 8-bit floating-point format. The FP4 profiles use block-scaled E2M1 for the global cache and E4M3 for sliding-window attention. The previous llama.cpp service stored its keys and values in Q4_0. On the 7900 XTX, Maya unpacks E4M3 in software for attention. The separate image encoder loads the same `mmproj-F16.gguf` with either backend. These settings can change the numerical results even with identical text weights.
 
 ## Live service on Prometheus
 
@@ -150,6 +150,8 @@ The packaged host-staged vision build includes two explicit `MAYA_IK2_PRESET` va
 | `ik2-mini-gfx1100-fp4-2.json` | 2 | 360,448 | 720,896 | 3,291.7 MiB |
 | `ik2-mini-gfx1100-fp4-4.json` | 4 | 176,128 | 704,512 | 1,671.7 MiB |
 
+Set `MAYA_IK2_PRESET` in `~/ai/services/inkling-2-mini/.env` to one of the filenames above and run `docker compose up -d --no-deps --pull never llama` from that directory. The new container starts with empty caches. Check `cache_slots`, `max_context` and `images` on `/health`. To explicitly select a single 393,216-token FP8 cache, set `MAYA_IK2_PRESET=ik2-mini-gfx1100-hip-host-vision.json` and `IK2_CACHE_SLOTS=1`.
+
 At four slots, per-slot capacities 196,608, 192,512, 188,416, 184,320 and 180,224 all failed the resident-expert requirement. At 176,128 the server started and read three 1480×900 screenshots correctly in 1.385, 0.888 and 0.749 seconds. The minimum free VRAM sampled every 100 ms during those requests was 257.7 MiB. Both profiles use a shared 4 MiB slot-exchange buffer.
 
 Four independent registers started at 174,934 tokens apiece. All twelve early, middle and late lookups were correct, along with all four color questions. The eight text follow-ups reused 174,936 or 174,959 tokens and processed 21 each in 0.273–0.483 seconds. The image follow-ups reused 174,982 tokens and processed 62 each in 0.358–0.377 seconds. Four independent 174,980-token cold replays matched the respective warm answers, lengths and finish reasons in 120.956–121.210 seconds. Device memory peaked at 23.734 GiB, leaving 256.7 MiB. The container reported zero OOM kills. The two-slot run also reported zero OOM kills.
@@ -160,6 +162,17 @@ pid=$(docker inspect -f '{{.State.Pid}}' ik2-fp4-trial)
 cg=/sys/fs/cgroup$(cut -d: -f3 "/proc/$pid/cgroup")
 cat "$cg/memory.events" "$cg/memory.peak"
 cat /sys/class/drm/card0/device/mem_info_vram_{total,used}
+```
+
+The packaged r4 image (ID `sha256:b47adcb1799042529b2079f83c083facf8f67d08dd832af54a3783d29ebe2815`) repeated the four-way workload with 1480×900 screenshots in place of color panels. All twelve register lookups and four image answers were correct. The image turns reused 174,982 tokens each and read 878–879 new tokens. Complete requests took 1.590, 1.766, 1.573 and 1.293 seconds. Device-wide free VRAM stayed at or above 256.7 MiB in 5,887 samples taken at 100 ms intervals. The container recorded zero OOM kills and zero restarts.
+
+OpenAI Chat Completions and Anthropic Messages each passed streaming and non-streaming parallel tool calls with their results fed back in reverse order. The strict OpenAI Python SDK 3.57.0 streamed both calls, continued the stored response, and read both desk codes. Direct stored-response retrieval returned HTTP 200. After a rewritten history, the next turn reused the new prefix. All five warm answers matched independent cold replays after filling every cache with an unrelated request.
+
+```sh
+python3 tests/ik2_slot_retrieval.py --url "$URL" --slots 4 --depth 175104 --screenshots
+python3 tests/ik2_tool_conversations.py "$URL"
+python3 tests/ik2_responses_route.py "$URL" --direct-url "$URL" --sdk
+python3 tests/ik2_chat_growth.py "$URL" --depths 2048,0,8192
 ```
 
 The 10 GiB host-memory limit includes reclaimable file pages from the mapped weights. Across the two- and four-slot trials, sampled anonymous RAM peaked at 2.52 and 2.44 GiB respectively. The container cgroups reclaimed file pages at their limit. These host-memory numbers are separate from the device-wide VRAM readings.
@@ -576,10 +589,10 @@ mkdir -p vision-resident
 cp -n vision-hip/bin/maya-vision vision-resident/maya-vision
 docker exec -w /work maya-ik2-hip-build cmake -S src/tools/vision -B vision-hip -DSTRATA_VISION_HOST_WEIGHTS=ON
 docker exec -w /work maya-ik2-hip-build cmake --build vision-hip --target maya-vision -j4
-sh src/docker/package-ik2-gfx1100.sh cache-slots-fork ik2-tokenizer/tokenizer \
-    hyperion/maya-ik2:gfx1100-service-r3 vision-cpu/bin/maya-vision vision-resident/maya-vision vision-hip/bin/maya-vision
+sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer \
+    hyperion/maya-ik2:gfx1100-service-r4 vision-cpu/bin/maya-vision vision-resident/maya-vision vision-hip/bin/maya-vision
 docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 \
-    --entrypoint python3 hyperion/maya-ik2:gfx1100-service-r3 -m unittest serve.test_inkling2_frontend
+    --entrypoint python3 hyperion/maya-ik2:gfx1100-service-r4 -m unittest serve.test_inkling2_frontend
 ```
 
 The service uses Compose project `inkling-2-mini` and service key `llama` so the existing Prometheus controller can manage it. Install [the Compose file](../docker/compose.ik2-gfx1100.yml) as `~/ai/services/inkling-2-mini/docker-compose.yml` and run these commands from that directory. The model mount is read-only. The memory and swap limits are both 10 GiB.
