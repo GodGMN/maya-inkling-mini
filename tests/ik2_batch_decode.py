@@ -96,6 +96,7 @@ def run(args, engine, ids, width, concurrency, env, cancel_first=False, mixed=Fa
         finally:
             if p.poll() is None:
                 send("QUIT")
+                p.stdin.close()
         if p.wait() != 0:
             raise RuntimeError(f"engine exited with status {p.returncode}")
     return generated
