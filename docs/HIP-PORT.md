@@ -527,7 +527,7 @@ python -m unittest serve.test_{engine_contract,fair,stop,stream_jobs,response_jo
 
 ### Slot selection
 
-Set `IK2_CACHE_SLOTS` in Compose or pass `--cache-slots N` to the native server. One request runs at a time. Each slot retains its token and image history, KV, convolution state and prefix checkpoints. The engine selects the longest prefix it can restore. A new conversation uses an empty slot first, then the least recently used one. A restart clears all slots. With a single slot the engine allocates no exchange buffer.
+Set `IK2_CACHE_SLOTS` in Compose or pass `--cache-slots N` to the native server. With the default decoder, one request runs at a time. Each slot retains its token and image history, KV, convolution state and prefix checkpoints. The engine selects the longest prefix it can restore. A new conversation uses an empty slot first, then the least recently used one. A restart clears all slots. With a single slot the engine allocates no exchange buffer.
 
 An early r4 build evicted chat A when the loop guard retried chat B from a checkpoint. The next HumanEval/62 request had to read all 345,238 input tokens again in 370.542 seconds. A divergent continuation now forks into an empty slot if available. When all slots are occupied it rewinds its matching chat in place. A cancelled prefill releases its slot for the next new chat.
 
@@ -588,6 +588,20 @@ for exe in full-direct-stop cache-slots-api; do
         --ctx 393216 --chunk 1024 --gen 129 --repeats 3 --tokens water.force
 done
 ```
+
+### Concurrent decode for short chat requests
+
+Set `IK2_BATCH` to the maximum number of active requests (2 to 32) and use the gfx1100 Maya server. The native `--max-context` is the total across those slots. For 32 conversations of 4,096 tokens each, use `--max-context 131072`. A 256-token prefill chunk keeps the sliding-window allocation small. Run the following from the repository root with the tokenizer and weights installed.
+
+```sh
+jq '.args = ["--model","models/Inkling-2-Mini-IQ4_NL.gguf","--max-context","131072","--chunk","256"]
+    | .env.IK2_BATCH = "32"' docs/inkling2-mini/ik2-mini-gfx1100.json > ik2-batch.json
+python3 serve/server.py --engine maya --config ik2-batch.json --host 127.0.0.1 --port 8088
+```
+
+The engine advertises `READY 4096 stop multi=32`. The HTTP server queues excess requests. Between decode steps the engine reads at most one prefill chunk, then predicts one token for every ready request. Each sequence has its own sampler, position, KV and convolution histories for all 48 visits. Completed and cancelled requests release their slot. Follow-up turns read their full prompt. Leave `IK2_BATCH` unset or set it to 1 for the original decoder with prefix reuse.
+
+Concurrent decode requires a single HIP GPU with resident experts and planar Q8 attention projections and output head. Speculative decoding with a drafter uses the single-request server. For the concurrent path, leave `IK2_CACHE_SLOTS` unset or use the same count as `IK2_BATCH`. Increasing the slot count reserves a sliding ring for each slot as well as its global KV.
 
 ## Multi-turn tool calls on Prometheus
 
