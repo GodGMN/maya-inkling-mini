@@ -82,7 +82,8 @@ def hy4_tool_pictures_noted(messages: list) -> list:
         out.append(m)
     return out
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
-                            EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
+                            EFFORT_WORDS, QWEN_EFFORT, INK_CALL, INK_END, INK_MODEL, INK_TEXT, INK_THINK,
+                            InklingRewriter, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
                             deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
@@ -2659,6 +2660,15 @@ class Service:
             (_special_ids("</think%s>" % template.hy4_tag) or _special_ids("</think>")) \
             if getattr(template, "hy4", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
+        self.inkling_marks = {}
+        self.native_inkling_guard = False
+        if getattr(template, "inkling", False):
+            self.inkling_marks = {mark: token for mark in InklingRewriter.MARKS for token in _special_ids(mark)}
+            missing = {INK_THINK, INK_TEXT, INK_CALL, INK_END, INK_MODEL} - self.inkling_marks.keys()
+            self.native_inkling_guard = not missing
+            if missing:
+                print("[maya] using the generic loop guard because this tokenizer splits " + ", ".join(sorted(missing)),
+                      flush=True)
         # the tokens the engine itself ends a request at, whatever the server does (see THINK_RESTARTS): a pack
         # tokenizer that names its "eos" (DeepSeek's, MiniMax's: their engines' --eos default) ends there only; the
         # GLM/Qwen engine ends at every turn-end token of its vocabulary (GLM: <|endoftext|>, <|user|>,
@@ -4452,7 +4462,7 @@ class Service:
             if act is not None:                         # a loop: what is kept, then on from there - or the end
                 del produced[max(sent, len(produced) - act.drop):]   # (what was sent stays sent: only the held tail goes)
                 if act.kind == loop_guard.CLOSE_THINKING:
-                    produced.append(guard.think_end)
+                    produced.extend(guard.close_tokens[:max_new - len(produced)])
                 guard.resume(produced, act)
                 self._loop_noted(act, len(produced))
                 if act.kind == loop_guard.STOP or len(produced) >= max_new or cancel.is_set() or self.stopping:
@@ -4552,11 +4562,9 @@ class Service:
         seg = {"prompt": ids, "ids": [], "next": None}   # this engine call's prompt and tokens; the next one's
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         direct_end = None
-        if getattr(self.template, "inkling", False) and prefill == "<|message_model|><|content_text|>" and not tools:
-            end = self.tok.encode("<|end_message|>", parse_special=True)
-            if len(end) == 1:
-                direct_end = end[0]
-                sampling = {**(sampling or {}), "_inkling_end": direct_end}
+        if INK_END in self.inkling_marks and prefill == INK_MODEL + INK_TEXT and not tools:
+            direct_end = self.inkling_marks[INK_END]
+            sampling = {**(sampling or {}), "_inkling_end": direct_end}
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         reasoning_tokens = 0
@@ -4694,9 +4702,13 @@ class Service:
                     engine's ERR says "non-finite") before the first token, the engine has dropped that conversation's
                     state and the request runs once more, its prompt read from token 0."""
                     for again in (False, True):
-                        guard = loop_guard.ToolSafeGuard(self.think_end_id, parser.state == "reasoning",
-                                                         piece=self._guard_piece()) \
-                            if guard_on else None       # (serve/loop_guard.py; a fresh one for a run again; leaves tool calls alone)
+                        guard = None
+                        if guard_on:
+                            if self.native_inkling_guard:
+                                guard = loop_guard.InklingGuard(self.inkling_marks, prompt[-1] if prompt else None)
+                            else:
+                                guard = loop_guard.ToolSafeGuard(self.think_end_id, parser.state == "reasoning",
+                                                                 piece=self._guard_piece())
                         guards[:] = [guard] if guard is not None else []
                         sliced, got = self._sliced(prompt, left, sampling, cancel, emb, hold, stat, guard), 0
                         try:

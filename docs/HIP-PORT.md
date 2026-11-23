@@ -312,6 +312,14 @@ python3 tools/ik2_http_bench.py --url "$URL" --max-tokens 129 --repeats 3
 
 On GSM8K test item 12 both models computed that the tree breaks even after 12 years. FP8 gave the first profitable year, 13, and FP4 returned 12. Neither answer hit its cap. On item 106, FP8 computed the inner volume of three boxes correctly in 551 tokens. FP4 exhausted its 4,096-token limit without a final answer. All 128 request hashes and input lengths matched. On the long college mathematics item 0, FP8 returned the correct letter. FP4 began reasoning in the answer and reached the eight-token cap. The feasibility questions are a local check of whether the model can recognize missing information. Both direct-answer runs recognized all eight impossible tasks and only one of the eight feasible tasks.
 
+At medium reasoning effort and a 4,096-token output limit, both formats returned the requested fourth entry from the 348,465-token archive. The official string match ratio was 0.998739 for FP8 (2,364 output tokens) and 0.998379 for FP4 (3,536 tokens). Relative to the reference, FP8 inserted seven characters and FP4 inserted seven and omitted two. Both exhausted the output budget without a final answer on the 344,768-token archive that asked for the seventh entry. All four retrieval requests started cold. On the 16 feasible and impossible specifications, both formats answered 16/16 correctly with medium effort. All corresponding request hashes matched.
+
+```sh
+python3 tests/ik2_kv_quality.py --url "$URL" --mrcr mrcr-mid-0.json mrcr-mid-1.json \
+    --mmlu mmlu16.jsonl --code humanevalplus.jsonl --screenshots --reasoning-effort medium
+python3 tests/ik2_feasibility.py --url "$URL" --reasoning-effort medium
+```
+
 Eight further eight-needle MRCR rows contained 23,365 to 60,974 input tokens. Their mean direct-answer match ratios were 0.0600 on FP8 and 0.0773 on FP4. Neither model reproduced the requested answer on any row. In five cases the generated text was identical. The rows were 1714, 1725, 1750, 1797, 1920, 1959, 1979 and 1992 in the default train split. Results and the exact inputs are in `~/ai/build/maya-ik2-hip/fp4-overnight/results/` on Prometheus.
 
 ```sh
@@ -323,6 +331,21 @@ python3 tests/ik2_kv_quality.py --url "$URL" --mrcr mrcr-short/row-*.json
 ```
 
 ## Separate conversation caches
+
+### Distinguishing reasoning loops from answer loops
+
+During the first FP4 medium-effort HumanEval/130 run at 348K, the server classified three copies of a 153-token reasoning block as a loop in the final answer. Its next retry stopped with a server notice and no Python function. Inkling marks thinking, text and tool JSON with distinct vocabulary tokens. The server's generic guard had only looked for a closing `</think>` and XML-style tool calls.
+
+The Inkling guard now follows those segment tokens, including a tool header already present in the request. If a persistent reasoning loop needs to be closed, the retry prompt ends with `<|end_message|><|message_model|><|content_text|>`. An answer loop can still stop the response. The native sampler currently ignores the generic repetition penalty setting. The server can still trim unsent repeats, retry and close reasoning.
+
+Three scripted requests failed before the change. They cover a reasoning passage that naturally resolves, a persistent reasoning loop followed by a final answer, and repeated legitimate tool calls with identical JSON. A fourth checks that visible answer loops still stop. The following command passed all 144 tests on the development host. The packaged image ran the same suite with three optional SDK skips.
+
+```sh
+python -m unittest serve.test_loop_guard serve.test_inkling2_frontend \
+    serve.test_responses serve.test_responses_tools serve.test_responses_schema
+```
+
+### Slot selection
 
 Set `IK2_CACHE_SLOTS` in Compose or pass `--cache-slots N` to the native server. One request runs at a time. Each slot retains its token and image history, KV, convolution state and prefix checkpoints. The engine selects the longest prefix it can restore. A new conversation uses an empty slot first, then the least recently used one. A restart clears all slots. With a single slot the engine allocates no exchange buffer.
 
