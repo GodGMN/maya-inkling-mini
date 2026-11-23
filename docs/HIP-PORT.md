@@ -1,6 +1,6 @@
 # Inkling 2 Mini on gfx1100
 
-On Prometheus’s RX 7900 XTX, the Radeon server runs the installed ggml-org IQ4_NL model with all routed experts in VRAM. [Current measurements](#full-model-measurements-at-393216-reserved-tokens) · [Packaged server](#run-the-packaged-image-on-prometheus) · [Long-context retrieval](#exact-phrase-retrieval-at-long-context)
+On Prometheus’s RX 7900 XTX, the Radeon server runs the installed ggml-org IQ4_NL model with all routed experts in VRAM. [Live service](#live-service-on-prometheus) · [Choose a cache profile](#named-fp4-profiles) · [FP8 and FP4 quality](#same-slots-different-kv-precision) · [Decode and prefill measurements](#full-model-measurements-at-393216-reserved-tokens)
 
 ### Which GPUs and models can run it?
 
@@ -10,13 +10,28 @@ Both Prometheus engines load the same `Inkling-2-Mini-IQ4_NL.gguf` text weights.
 
 ## Live service on Prometheus
 
-The current service is `hyperion/maya-ik2:gfx1100-service-r3` on port 8085, image ID `sha256:41b5796fba7d9d09e515dc966ca962e3acd59180d9567be0d5a46729e0a2fecc`. It runs the same native text engine as r1, with 393,216 positions and one slot. GPU vision with host-resident projector weights returned 39%, 43% and 55% on three fresh screenshots in 1.557, 0.881 and 0.656 s. The first was the first inference request after the server became ready. A cold 8,220-token parcel lookup returned H317, taking 2.601 s for prefill (3,160 tok/s). This was one live request. The music scores below were collected on r1. At Sergio's request, the music benchmark was run only once and the remaining long timing runs were stopped.
+On 2026-11-23, `hyperion/maya-ik2:gfx1100-service-r4` replaced r3 on port 8085. The image ID is `sha256:b66e209a0315be451a02ccce3f0819f9dee938cec763cb6a4f388285d6493042`. Hyperion still selects `inkling-2-mini`. The default is the stock ggml-org IQ4_NL file, one 393,216-token FP8 cache, GPU vision and medium reasoning. Two and four larger resident FP4 profiles are available at startup. [Profile selection](#named-fp4-profiles) · [Why FP8 remains the default](#same-slots-different-kv-precision)
+
+On port 8085, all four OpenAI and Anthropic parallel tool conversations returned both correct desk codes, including streaming and a second turn with tool results. The three fresh screenshots returned 39%, 43% and 55% in 1.384, 0.861 and 0.650 seconds. The first was the first inference after startup. The strict OpenAI Python SDK passed through the LAN Responses router on port 8079. Stored-response retrieval by ID uses Maya’s direct port 8085.
+
+The median across nine short streamed requests was **111.54 tok/s** end to end on r4 and **111.61 tok/s** in the same test on r3. The running native engine had SHA-256 `58fe3173ea7c0c1aa1197a2b9599f3c39fad40bd11571f04ea03f21c4ddb15a1`. Its actual arguments and environment confirmed one slot, 393,216 positions, chunk 1,024, FP8 KV and all experts resident. The live container was healthy with zero restarts and zero OOM kills under its 10 GiB memory and swap limits. Its server, model configuration reader and loop guard matched the checkout by SHA-256. The stock text and image weight files retained their original inodes, sizes and modification times.
+
+```sh
+python3 tests/ik2_image_answers.py http://192.168.100.111:8085 --screenshots
+python3 tests/ik2_tool_conversations.py http://192.168.100.111:8085
+python3 tests/ik2_responses_route.py http://192.168.100.111:8079 --direct-url http://192.168.100.111:8085 --sdk
+python3 tools/ik2_http_bench.py --url http://192.168.100.111:8085 --max-tokens 129 --repeats 3
+```
+
+The stock release evidence is in `~/ai/build/maya-ik2-hip/fp4-overnight/results/` on Prometheus. `sha256sum --quiet -c evidence.sha256` verified all 478 listed files, including the replay inputs, raw responses, client timings and memory samples. The system disk had 9.04 GiB free after the copy.
+
+The previous r3 service used image ID `sha256:41b5796fba7d9d09e515dc966ca962e3acd59180d9567be0d5a46729e0a2fecc`. It ran the same native text engine as r1, with 393,216 positions and one slot. GPU vision with host-resident projector weights returned 39%, 43% and 55% on three fresh screenshots in 1.557, 0.881 and 0.656 s. The first was the first inference request after the server became ready. A cold 8,220-token parcel lookup returned H317, taking 2.601 s for prefill (3,160 tok/s). This was one live request. The music scores below were collected on r1. At Sergio's request, the music benchmark was run only once and the remaining long timing runs were stopped.
 
 All four OpenAI Chat Completions and Anthropic tool conversations passed on r3. Through the Hyperion LAN router, OpenAI Python SDK 3.57.0 with strict validation streamed both function calls and used their results in a stored follow-up. Check with `python3 tests/ik2_responses_route.py http://192.168.100.111:8079 --direct-url http://192.168.100.111:8085 --sdk`. Run `python3 ik-r3-short-check.py` from the Prometheus build directory for the parcel lookup.
 
 On 2026-11-22, `hyperion/maya-ik2:gfx1100-service-r1` replaced `hyperion/llama.cpp:server-rocm-inkling-1427-r2` on port 8085. The first Maya image ID was `sha256:9f2df85e9fde0a5d4450c7f4cb87e4247bdb651d63ba5c4168d754dec9ed89d9`. Its native engine SHA-256 is `81cbe5f004ff5c0e64db8ead4fe13f1a7f410acbe26f5d01bdf6b33d9aa959b3`. Compose kept the controller's service name, port, device access, restart policy and 10 GiB memory and swap limits. The live health response reported one slot, 393,216 positions, images enabled and medium default reasoning effort.
 
-The deployed image passed all 19 Inkling frontend tests. On the live port all four tool conversations returned Larch's VX-731 and Birch's PK-284, and all four image answers matched the incumbent. The CPU-encoded screenshot request took 13.965 seconds. The incumbent had its own 8,192-token reasoning budget. Maya's Inkling backend accepts a reasoning effort and a total output limit. Its separate thinking-budget endpoint reports `supported: false`.
+The r1 image passed all 19 Inkling frontend tests. On port 8085 at that time, all four tool conversations returned Larch's VX-731 and Birch's PK-284, and all four image answers matched the incumbent. The CPU-encoded screenshot request took 13.965 seconds. The incumbent had its own 8,192-token reasoning budget. Maya's Inkling backend accepts a reasoning effort and a total output limit. Its separate thinking-budget endpoint reports `supported: false`.
 
 ```sh
 cd ~/ai/build/maya-ik2-hip
@@ -34,7 +49,16 @@ Through the LAN router at `http://192.168.100.111:8079/v1`, a non-streaming Resp
 
 Run `python3 tests/ik2_responses_route.py http://192.168.100.111:8079 --direct-url http://192.168.100.111:8085`. With OpenAI Python SDK 3.57.0, `python3 -m unittest serve.test_responses serve.test_responses_tools serve.test_responses_schema` passed all 55 tests. A streamed function completion now includes its name for strict validators in SDK 2.24.0. The current SDK also requires a description on returned namespaces and accepts only supported namespace members.
 
-For rollback, the incumbent image remains on Prometheus. The following commands restore its Compose configuration and controller description.
+To restore the previous Maya r3 release, use its saved Compose configuration and controller description. If you selected an r4 FP4 preset in `.env`, clear that selection before starting r3.
+
+```sh
+cd ~/ai/services/inkling-2-mini
+cp docker-compose.yml.pre-fp4-r4 docker-compose.yml
+cp service.json.pre-fp4-r4 service.json
+docker compose up -d --no-deps --pull never llama
+```
+
+The earlier llama.cpp image also remains on Prometheus. Its configuration and controller description have separate backups.
 
 ```sh
 cd ~/ai/services/inkling-2-mini
@@ -154,6 +178,12 @@ The packaged host-staged vision build includes two explicit `MAYA_IK2_PRESET` va
 
 Set `MAYA_IK2_PRESET` in `~/ai/services/inkling-2-mini/.env` to one of the filenames above and run `docker compose up -d --no-deps --pull never llama` from that directory. The new container starts with empty caches. Check `cache_slots`, `max_context` and `images` on `/health`. To explicitly select a single 393,216-token FP8 cache, set `MAYA_IK2_PRESET=ik2-mini-gfx1100-hip-host-vision.json` and `IK2_CACHE_SLOTS=1`.
 
+For two resident conversations at the original precision, leave `MAYA_IK2_PRESET` empty and set `IK2_CACHE_SLOTS=2`. The release image served two 196,608-token FP8 slots with GPU vision. Both chats grew to 196,365 input tokens. All ten early, middle, late, image and sampled answers were correct. The screenshots took 1.615 and 1.818 seconds, with 195,463 tokens already cached in each conversation. The two sampled turns processed 21 new tokens apiece. Independent cold replays at 195,461 tokens matched both warm answers and took 128.998 and 129.040 seconds.
+
+```sh
+python3 tests/ik2_slot_retrieval.py --url "$URL" --slots 2 --depth 195584 --screenshots --sampled-turn --cold
+```
+
 The running dashboard's context setting is per conversation. Previously a request for 49,152 on two caches passed 49,152 total to the engine, leaving 24,576 per conversation. The reload now passes 98,304 total and saves that value to the config. Failure restores the prior per-slot capacity. The server also reads the training limit from the exact text GGUF passed with `--model`. The stock header reports 1,048,576. The tested GPU capacities are the ones in the table above.
 
 On the packaged two-slot server, posting 8,192 to `/api/context` saved 16,384 native positions and finished reloading in 66.3 seconds. A request for 8,200 output tokens returned HTTP 400 with `context_length_exceeded`. Both existing desks then reused their full 237- and 236-token histories and returned their own codes. Restoring 360,448 per conversation saved 720,896 native positions and took 70.0 seconds. The trained limit and model path came from the stock IQ4_NL file in both configurations. The HTTP reload check is archived as `fp4-overnight/results/check-resize.py`.
@@ -201,6 +231,14 @@ python3 tests/ik2_slot_retrieval.py --url "$URL" --slots 4 --depth 175104 --scre
 python3 fp4-overnight/peak-sampler.py /tmp/ik2-finish-profile-001
 ```
 
+Four clients also submitted **175,022-token cold conversations simultaneously** to the release image. Maya read one at a time. The four clients received their correct answers after 124.172, 245.723, 367.362 and 489.159 seconds, including queue time. The same four clients then sent two simultaneous follow-up rounds. All eight replies were correct. Each request processed 20 new tokens and reused its entire 175,024- or 175,046-token prefix. Client latency across the eight warm requests was 0.279–1.354 seconds.
+
+All four independent cold replays processed 175,066 tokens, matched their own warm answer, generated length and finish reason, and took 121.552–121.724 seconds. The server passed the image and tool checks afterward. Across 98,104 device-wide readings about 10 ms apart, minimum free VRAM was 256.63 MiB. The container recorded zero OOM kills and zero restarts. Results are in `fp4-four-final-{chats,screenshots,tools}.jsonl` and `fp4-four-final-vram-10ms.tsv`.
+
+```sh
+python3 tests/ik2_slot_chats.py "$URL" --slots 4 --depth 175104 --concurrent --images
+```
+
 ```sh
 # From ~/ai/build/maya-ik2-hip on Prometheus
 sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer \
@@ -211,7 +249,7 @@ docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 --entry
     serve.test_responses serve.test_responses_tools serve.test_responses_schema
 ```
 
-The image's engine SHA256 was `f08cbeb153f26ea7e1fcf219a1f61fdca50aba7c737b19541d77dadbac822454`, matching the GPU tests. The packaged Python suites ran 74 tests with three skips and zero failures. All 74 passed on the development host with OpenAI SDK 3.57.0, jsonschema 4.26.0 and Jinja2 3.1.2. The shipped image includes jsonschema and skips the three optional SDK tests. An initial host run used SDK 2.24.0 without jsonschema and failed structured-output and namespace checks. A fresh Python 3.14 environment also lacked Jinja2. The complete run used the existing Python 3.11 SDK environment.
+The first packaged FP4 trial used engine SHA-256 `f08cbeb153f26ea7e1fcf219a1f61fdca50aba7c737b19541d77dadbac822454`. The live release digest is recorded at the top of this log. The packaged Python suites ran 74 tests with three skips and zero failures. All 74 passed on the development host with OpenAI SDK 3.57.0, jsonschema 4.26.0 and Jinja2 3.1.2. The shipped image includes jsonschema and skips the three optional SDK tests. An initial host run used SDK 2.24.0 without jsonschema and failed structured-output and namespace checks. A fresh Python 3.14 environment also lacked Jinja2. The complete run used the existing Python 3.11 SDK environment.
 
 ### Repeating the paired checks
 

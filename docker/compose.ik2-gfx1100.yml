@@ -1,7 +1,7 @@
 name: inkling-2-mini
 services:
   llama:
-    image: hyperion/maya-ik2:gfx1100-service-r3
+    image: hyperion/maya-ik2:gfx1100-service-r4
     container_name: inkling-2-mini
     restart: unless-stopped
     mem_limit: 10g
