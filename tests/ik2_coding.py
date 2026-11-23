@@ -23,10 +23,23 @@ def score(row, answer, image):
     program = blocks[-1] if blocks else text
     marker = secrets.token_hex(16)
     script = program + "\n" + row["test"] + "\ncheck(" + row["entry_point"] + ")\n" + f"print({marker!r})\n"
+    # After a SIGKILL the child cannot print a traceback. Its cgroup distinguishes an OOM
+    # from the timeout's kill signal, before Docker removes the container.
+    runner = """timeout -k 1 20 python -B -
+status=$?
+if [ "$status" -eq 137 ] && [ -r /sys/fs/cgroup/memory.events ]; then
+    while read -r event count; do
+        if [ "$event" = oom_kill ] && [ "$count" -gt 0 ]; then
+            echo 'Generated program exceeded the 256 MiB grader memory limit.' >&2
+        fi
+    done < /sys/fs/cgroup/memory.events
+fi
+exit "$status"
+"""
     command = ["docker", "run", "--rm", "-i", "--network=none", "--read-only", "--cap-drop=ALL",
                "--security-opt=no-new-privileges", "--memory=256m", "--memory-swap=256m",
                "--pids-limit=32", "--cpus=1", "--user=65534:65534", "-e", "OPENBLAS_NUM_THREADS=1",
-               image, "timeout", "-k", "1", "20", "python", "-B", "-"]
+               image, "sh", "-c", runner]
     result = subprocess.run(command, input=script, text=True, capture_output=True, timeout=45)
     if result.returncode in (125, 126, 127) or "ModuleNotFoundError: No module named 'numpy'" in result.stderr:
         raise RuntimeError(result.stderr[-1000:])
