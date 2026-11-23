@@ -416,14 +416,15 @@ __device__ __forceinline__ void store_fp4_head(const float* src, uint8_t* cache,
 }
 
 // 1 warp (32 threads) per group across all q, k, v, r groups of T tokens
-template <class KV>
+template <class KV, bool Sequences = false>
 __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const float* k_in, KV* kc, const float* v_in,
                                        KV* vc, float* r, const float* r_clip, int T, int H, int KVh, int D, int d_rel,
                                        float qk_clip, float rel_clip, float eps, const int* pos, float alpha,
                                        float n_floor, int pos0, int kv_cap, float k_scale, float v_scale,
                                        const int* pos0_d, uint16_t* q16, const uint16_t* sink_w, const float* sink_x,
-                                       int sink_k, float* sink_y, int q_ld = 0, int r_ld = 0, bool paged = false, bool fp4 = false) {
-    if (pos0_d) pos0 = *pos0_d;   // (a token of a replayed graph: its position read here)
+                                       int sink_k, float* sink_y, int q_ld = 0, int r_ld = 0, bool paged = false, bool fp4 = false,
+                                       const int* slots = nullptr, size_t slot_stride = 0) {
+    if (!Sequences && pos0_d) pos0 = *pos0_d;   // (a token of a replayed graph: its position read here)
     const int gid = blockIdx.x;
     const int per_tok = 2 * H + 2 * KVh;
     if (q_ld <= 0) q_ld = H * D;   // (q's and r's rows: a token's [H][D] and [H][d_rel] unless given)
@@ -442,6 +443,11 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
         return;
     }
     const int t = gid / per_tok, rem = gid % per_tok;
+    if constexpr (Sequences) {
+        pos0 = pos0_d[t] - t;
+        kc += slots[t] * slot_stride;
+        vc += slots[t] * slot_stride;
+    }
     const float tau = pos ? (1.0f + alpha * logf(fmaxf(1.0f, ((float) pos[t] + 1.0f) / n_floor))) : 1.0f;
     if (rem < H) {
         const int h = rem;
@@ -3875,8 +3881,9 @@ __global__ void attn_combine_kernel(const float* sink, const float* part, int H,
 #ifdef STRATA_USE_HIP
 // Compute one exponential per split. Each feature then combines the same partials in the scalar kernel's order.
 __global__ void rdna3_combine_splits(const float* sink, const float* partials, int splits, float inv,
-                                     float* out, const float* gate, uint16_t* out16) {
-    const int head = blockIdx.x, tid = threadIdx.x;
+                                     float* out, const float* gate, uint16_t* out16, int gate_ld = 0) {
+    const int head = blockIdx.x + blockIdx.y * gridDim.x, tid = threadIdx.x;
+    if (gate_ld) gate += blockIdx.y * (gate_ld - gridDim.x * 128);
     const float* data = partials + (size_t)head * splits * 130;
     __shared__ float wave_max[4];
     extern __shared__ float2 weights[];
@@ -4183,6 +4190,46 @@ __device__ __forceinline__ void mv_q8p_row(const int8_t* __restrict__ q, const u
     acc = wsum(acc);
     if (lane == 0 && !mv_conv_row(c0, row, acc) && !mv_conv_row(c1, row, acc)) y[row] = acc;
 }
+// Four sequences share each planar weight load. Each wave reduces one output channel
+// in the same lane and iteration order as mv_q8p_row.
+template <int Rows>
+__global__ void mv_q8p_sequences_kernel(const int8_t* q, const uint16_t* d, int N, int K,
+                                        const float* x, int T, float* y, int ldy) {
+    const int r = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (r >= N) return;
+    const int first = blockIdx.y * Rows;
+    const uint32_t* qr = (const uint32_t*)(q + (size_t)r * K);
+    const uint16_t* dr = d + (size_t)r * (K >> 5);
+    float acc[Rows] = {};
+#pragma unroll 4
+    for (int i = 0; i < K / 128; ++i) {
+        const uint32_t w = qr[i * 32 + lane];
+        const float scale = h2f(dr[i * 4 + (lane >> 3)]);
+#pragma unroll
+        for (int t = 0; t < Rows; ++t) {
+            if (first + t >= T) break;
+            const float4 v = ((const float4*)(x + (size_t)(first + t) * K))[i * 32 + lane];
+            acc[t] += scale * ((int8_t)w * v.x + (int8_t)(w >> 8) * v.y +
+                               (int8_t)(w >> 16) * v.z + (int8_t)(w >> 24) * v.w);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < Rows && first + t < T; ++t) {
+        const float sum = wsum(acc[t]);
+        if (!lane) y[(size_t)(first + t) * ldy + r] = sum;
+    }
+}
+
+__global__ void conv_sequences_kernel(const int* slots, const float* x, int ldx, MvConv cv) {
+    const int row = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cv.n) return;
+    cv.hist += (size_t)slots[row] * 3 * cv.n;
+    if (cv.dyn) cv.dyn += row * cv.heads * 4;
+    if (cv.res) cv.res += row * cv.n;
+    cv.y += row * cv.n;
+    mv_conv_row(cv, c, x[(size_t)row * ldx + c]);
+}
+
 template <int WARPS, int StaticK = 0, int Unroll = 4>
 __global__ void mv_q8p_kernel(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y,
                               MvConv c0, MvConv c1, MvAlt a0, MvAlt a1) {
@@ -4216,18 +4263,32 @@ __global__ void decode_q8p_f16_kernel(const int8_t* __restrict__ q, const uint16
 
 // the routed slots' tables from the picks, on the device: slot i's expert e = top[i] - its blocks, its token, its
 // scales; wt = the route weight times down's scale
+template <bool GroupByExpert>
 __global__ void route_gather_kernel(const int* __restrict__ top, const float* __restrict__ w,
                                     const uint8_t* const* __restrict__ tab, const float* __restrict__ sg_t,
                                     const float* __restrict__ su_t, const float* __restrict__ sd_t, int S, int K,
                                     const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt) {
     const int i = threadIdx.x;
-    if (i >= S) return;
+    int ordered = i;
+    if constexpr (GroupByExpert) {
+        // Run neighboring picks of the same expert together so they can share cached weights.
+        // The inverse map restores the original top-K summation order in moe_combine_f32.
+        extern __shared__ int counts[];
+        if (i < 128) counts[i] = 0;
+        __syncthreads();
+        const int e = i < S ? top[i] : 0;
+        const int within = i < S ? atomicAdd(counts + e, 1) : 0;
+        __syncthreads();
+        if (i >= S) return;
+        ordered = within;
+        for (int j = 0; j < e; ++j) ordered += counts[j];
+    } else if (i >= S) return;
     const int e = top[i];
-    blob[i] = tab[e];
-    tok[i] = i / K;
-    inv[i] = i;
-    sg[i] = sg_t ? sg_t[e] : 1.0f;
-    su[i] = su_t ? su_t[e] : 1.0f;
+    blob[ordered] = tab[e];
+    tok[ordered] = i / K;
+    inv[i] = ordered;
+    sg[ordered] = sg_t ? sg_t[e] : 1.0f;
+    su[ordered] = su_t ? su_t[e] : 1.0f;
     wt[i] = w[i] * (sd_t ? sd_t[e] : 1.0f);
 }
 // One token's routing in one launch: route's picks and weights and route_gather's tables, the same values.  A
@@ -5861,7 +5922,7 @@ void softcap(float* x, size_t n, float cap, cudaStream_t s) {
     check("softcap");
 }
 
-void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s) {
+void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s, bool sequences) {
     if (T <= 0 || n <= 0) return;
     if (n > 3 || R > kLoopRankMax || T > 65535) {
         std::fprintf(stderr, "ik2::k::loop_gates: %d gates, rank %d, %d tokens\n", n, R, T);
@@ -5885,10 +5946,10 @@ void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float
     for (int j = 0; j < n; ++j) {
         aligned &= !(((uintptr_t)a.x[j] | (uintptr_t)a.m[j]) & 15) && !((uintptr_t)a.D[j] & 7);
     }
-    if (tile == 256 && T == 1 && R == 64 && C % 64 == 0 && compact && aligned) {
-        rdna3_gate_dots<<<dim3(R, n), 128, 0, s>>>(a, C, sc);
+    if (tile == 256 && (T == 1 || sequences) && R == 64 && C % 64 == 0 && compact && aligned) {
+        rdna3_gate_dots<<<dim3(R, n, T), 128, 0, s>>>(a, C, sc);
         check("rdna3_gate_dots");
-        rdna3_gate_apply<<<dim3(C / 64, n), 256, 0, s>>>(a, C, eps, sc);
+        rdna3_gate_apply<<<dim3(C / 64, n, T), 256, 0, s>>>(a, C, eps, sc);
         check("rdna3_gate_apply");
         return;
     }
@@ -6402,6 +6463,17 @@ void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x
 }
 
 #endif
+void mv_q8p_sequences(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int rows,
+                      float* y, int ldy, cudaStream_t s) {
+    mv_q8p_sequences_kernel<4><<<dim3((N + 3) / 4, (rows + 3) / 4), 128, 0, s>>>(q, d, N, K, x, rows, y, ldy);
+    check("mv_q8p_sequences");
+}
+
+void conv_sequences(const int* slots, int rows, const float* x, int ldx, MvConv cv, cudaStream_t s) {
+    conv_sequences_kernel<<<dim3((cv.n + 127) / 128, rows), 128, 0, s>>>(slots, x, ldx, cv);
+    check("conv_sequences");
+}
+
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
                  const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1, const MvF16Jobs& side) {
     if (N <= 0) return;
@@ -6464,14 +6536,19 @@ void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStrea
 
 void route_gather(const int* top, const float* w, const uint8_t* const* tab, const float* sg_t, const float* su_t,
                   const float* sd_t, int S, int K, const uint8_t** blob, int* tok, int* inv, float* sg, float* su,
-                  float* wt, cudaStream_t s) {
+                  float* wt, cudaStream_t s, bool group) {
     if (S <= 0) return;
     if (S > 1024) {
         std::fprintf(stderr, "ik2::k::route_gather: %d slots\n", S);
         std::abort();
     }
-    route_gather_kernel<<<1, (unsigned) ((S + 31) / 32 * 32), 0, s>>>(top, w, tab, sg_t, su_t, sd_t, S, K, blob, tok, inv,
-                                                                       sg, su, wt);
+    const unsigned threads = (S + 31) / 32 * 32;
+    if (group)
+        route_gather_kernel<true><<<1, std::max(128u, threads), 128 * sizeof(int), s>>>(
+            top, w, tab, sg_t, su_t, sd_t, S, K, blob, tok, inv, sg, su, wt);
+    else
+        route_gather_kernel<false><<<1, threads, 0, s>>>(top, w, tab, sg_t, su_t, sd_t, S, K, blob, tok, inv,
+                                                        sg, su, wt);
     check("route_gather");
 }
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
@@ -6545,6 +6622,42 @@ void split_token_attention(const float* q, const float* r, const KV* kc, const K
                                                              proj, dr, extent, window, scratch, pos, layout.paged, layout.fp4);
     check("attn_split_kernel");
 }
+
+#ifdef STRATA_USE_HIP
+bool sequence_attention_fp8(float* q, float* r, float* gate, int ld, const float* qclip, const float* rclip,
+                            const float* keys, const float* values, uint8_t* kc, uint8_t* vc, Fp8KvLayout layout,
+                            size_t stride, const int* slots, const int* pos, int T, int H, int KV, int dr,
+                            float qcap, float rcap, float eps, float alpha, float floor, float kscale, float vscale,
+                            const float* rel, int extent, int window, int splits, const float* sink,
+                            float* scratch, float* out, cudaStream_t stream) {
+    static const bool grouped = getenv("IK2_DECODE_SUBWAVE") && atoi(getenv("IK2_DECODE_SUBWAVE"));
+    if (!grouped || layout.fp4) return false;
+    const int ring = layout.ring_capacity;
+    prep_qkv_r_impl_kernel<uint8_t, true><<<T * (2 * H + 2 * KV), 32, 0, stream>>>(
+        q, qclip, keys, kc, values, vc, r, rclip, T, H, KV, 128, dr, qcap, rcap, eps,
+        ring ? nullptr : pos, alpha, floor, 0, ring, kscale, vscale, pos, nullptr, nullptr, nullptr,
+        0, nullptr, ld, ld, layout.paged, false, slots, stride);
+    check("sequence KV append");
+    const dim3 grid(H, splits, T);
+    const float scale = (1.f / sqrtf(128.f)) / kscale;
+    if (layout.paged)
+        rdna3_decode_split<uint8_t, true, true><<<grid, 128, 0, stream>>>(
+            q, r, kc, vc, ring, H, KV, pos, scale, rel, dr, extent, window, scratch, slots, stride, ld);
+    else
+        rdna3_decode_split<uint8_t, false, true><<<grid, 128, 0, stream>>>(
+            q, r, kc, vc, ring, H, KV, pos, scale, rel, dr, extent, window, scratch, slots, stride, ld);
+    check("sequence attention");
+    static const bool shared = getenv("IK2_SHARED_COMBINE") && atoi(getenv("IK2_SHARED_COMBINE"));
+    if (shared && splits >= 16)
+        rdna3_combine_splits<<<dim3(H, T), 128, splits * sizeof(float2), stream>>>(
+            sink, scratch, splits, 1.f / vscale, out, gate, nullptr, ld);
+    else
+        attn_combine_kernel<<<dim3(H, T), 128, 0, stream>>>(
+            sink, scratch, H, splits, 1.f / vscale, out, gate, nullptr, 0, ld);
+    check("sequence attention combine");
+    return true;
+}
+#endif
 
 void attn_decode_f16_at(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
