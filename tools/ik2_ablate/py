@@ -1,0 +1,3 @@
+#!/bin/sh
+# py ARGS: python3 with numpy (the service image), the lab at /lab, Maya tools importable
+exec docker run --rm -i --network host -u $(id -u):$(id -g) -v /home/sergio/ai/build/maya-ik2-hip/ablate-lab:/lab -v /home/sergio/ai/models/inkling-2-mini:/opt/maya/models:ro -w /lab --entrypoint python3 hyperion/maya-ik2:gfx1100-service-r4 "$@"

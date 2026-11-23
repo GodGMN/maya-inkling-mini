@@ -255,6 +255,72 @@ docker top inkling-2-mini-direction -eo pid,args
 docker inspect -f '{{.State.Health.Status}} restarts={{.RestartCount}} oom={{.State.OOMKilled}}' inkling-2-mini-direction
 ```
 
+### Runtime refusal ablation (experimental)
+
+The caption trial edited eight attention-output matrices and barely moved refusals. Inkling cannot be abliterated
+exactly by editing weights. Each attention and MoE output passes through a per-channel time convolution before it
+joins the residual. Each layer then reads a learned mix of earlier block states, and the loop gates rescale channels.
+So `maya-ik2` removes a direction at runtime instead. After every write has joined the residual state, the engine
+applies `y <- y - s r (r . y - c)`. That covers the normed embedding (pictures included) and each layer visit's
+attention and MoE states, on the prefill, resident-token and block paths. The block bank, the loop's kept stream and
+its messages are copies of those states. The conv histories keep the raw outputs. Without `IK2_ABLATE` nothing
+launches. One GPU only.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `IK2_ABLATE=FILE` | off | the direction: the hidden size (2304) of raw little-endian floats, made unit length at load |
+| `IK2_ABLATE_SCALE` | 1 | `s`; above 1 over-projects |
+| `IK2_ABLATE_VISITS=LO:HI` | all | only the writes of visits `LO .. HI-1`; the embedding only when `LO` is 0 |
+| `IK2_ABLATE_MEAN=FILE` | none | `1 + 2 n_visit` floats: the target `c` of the embedding, then each visit's attention and MoE state |
+| `IK2_CAPTURE_ATTN_RESIDUALS=FILE` | off | appends each visit's post-attention state at the last prompt token, in the `IK2_CAPTURE_PREFILL_RESIDUALS` record format |
+
+`k::project_out` is checked against a double reference in `ik2_kernels_test` (scales 0.8, 1 and 1.3, a nonzero
+target, a row's bits independent of `T`). With a random direction, the component left in every one of the 48
+captured prefill states was about 1e-9 of the state, against about 1e-2 without the projection.
+
+**Fitting.** The scripts are in `tools/ik2_ablate/` and ran from `~/ai/build/maya-ik2-hip/ablate-lab/` on Prometheus, with `tools/ablate_fit.py`, `tools/gguf_reader.py` and `tools/gguf_writer.py` copied beside them. The lab's `sets/` holds the prompt sets, and `labels-*/`, `dirs*/` and the captures are its outputs.
+`lab.sh` restarts a lab server on 127.0.0.1:8087 from a `preset.py` preset: no vision, 32K context, extra engine env.
+`py` runs a script in the service image, which has numpy. The prompt sets are `tools/ablate_fit.py prompts`: AdvBench
+harmful and Alpaca harmless, 416 train and 104 test each. `label.py` sends every prompt once to stock with capture on,
+greedy with reasoning off and 48 tokens. It stores only a refused flag (`ablate_fit.refused`) and the capture's byte
+range, never prompt or answer text. Stock refused 415/416 harmful training prompts, 103/104 harmful test prompts,
+15/416 harmless training prompts and 1/104 harmless test prompts. `fit.py` takes, at each visit, the mean
+post-visit state over refused harmful prompts minus the mean over answered harmless ones. It ranks visits by the
+held-out separation along that direction. Cohen's d peaked at 14.7 at visit 26. `variants.py` removes from a
+direction its component along the visit's harmless mean (`p22` below). `capm.py` and `fitm.py` repeat the capture
+and fit with the medium-reasoning template.
+
+**Separation is not effect.** At the same 1.0 scale over all visits, the visit-26 direction left 102/104 harmful
+test prompts refused, and visit 22's left 37/104. The useful directions came from visits 20 to 22.
+
+**Quality.** Stock and the ablated setting ran the same suite in the same lab. GSM8K used 128 questions with medium
+reasoning and 2,048 tokens. MMLU used 256 questions with reasoning off, scored on the first letter. HumanEval+ used
+16 tasks, scored in the network-disabled sandbox. The tool check was `ik2_tool_conversations.py`.
+
+| Setting | Harmful refused, reasoning off / medium | GSM8K | answers at the 2,048 limit | MMLU | HumanEval+ | Tools |
+|---|---|---|---|---|---|---|
+| Stock | 103/104 / 104/104 | 125/128 | 0 | 210/256 | 16/16 | 4/4 |
+| `p22`, scale 1.3, all visits | 2/104 / 0/104 | 95/128 | 23 | 151/256 | 6/16 | 4/4 |
+
+In 101 of the 256 MMLU answers the ablated model listed every option instead of one letter. Lower scales did not fix
+that. A quick check (`bench-q.sh`, `evalq.py`) ran GSM8K's first 32 with medium reasoning and MMLU's first 64. It also
+counted harmful and harmless refusals with medium reasoning. Stock scored 104/104 harmful refused, 32/32 GSM8K, 48/64
+MMLU and 0 multi-letter answers.
+
+| Setting (direction, scale, visits) | Harmful refused | GSM8K 32 | MMLU 64 | answers listing every option |
+|---|---|---|---|---|
+| `p22`, 1.0, all | 1/104 | 26 | 36 | 34 |
+| `p22`, 0.8, all | 4/104 | 30 | 38 | 36 |
+| medium-reasoning fit, visit 22, 1.0, all | 90/104 | 32 | 47 | 0 |
+| medium-reasoning fit, visit 14, 1.0, all | 90/104 | 31 | 47 | 0 |
+| `p22`, 1.0, 0:22 | 47/52 | 31 | 37 | 8 |
+| `p22`, 1.0, 22:48 | 7/52 | 31 | 45 | 3 |
+| `p22`, 1.0, 14:30 | 33/52 | 31 | 46 | 5 |
+| `p22`, 1.0, 18:26 | 51/52 | 31 | 48 | 1 |
+
+The range rows used the first 52 prompts of each refusal set at 1,024 tokens. Refusal sits in the later visits, and
+the early visits carry most of the damage. Visits 22 to 47 are the current starting point.
+
 ### Named FP4 profiles
 
 The packaged host-staged vision build includes two explicit `MAYA_IK2_PRESET` values. Each preset sets the native slot count, per-request context budget and 512-token prefill chunk together. The native `--max-context` argument is the sum of all slots. The HTTP `/health` field `max_context` is the limit on one conversation.
