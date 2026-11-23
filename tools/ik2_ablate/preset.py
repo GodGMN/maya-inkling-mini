@@ -6,6 +6,8 @@ cfg.pop("vision",None)
 a=cfg["args"]; a[a.index("--max-context")+1]="32768"
 cfg["model_name"]="inkling-2-mini"
 for kv in sys.argv[2:]:
-    k,v=kv.split("=",1); cfg["env"][k]=v
+    k,v=kv.split("=",1)
+    if k=="MODEL": a[a.index("--model")+1]=v   # another model file, e.g. a baked override pair
+    else: cfg["env"][k]=v
 (here/"presets").mkdir(exist_ok=True)
 (here/"presets"/(sys.argv[1]+".json")).write_text(json.dumps(cfg,indent=2)+"\n")
