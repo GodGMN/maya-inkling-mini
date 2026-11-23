@@ -59,9 +59,11 @@ void serve_sequences(Model& M, int width, int ctx, int chunk, int image_token, s
     std::thread([inbox] {
         std::string line;
         while (std::getline(std::cin, line)) {
+            const bool quit = line == "QUIT";
             std::lock_guard<std::mutex> lock(inbox->mutex);
             inbox->lines.push_back(std::move(line));
             inbox->changed.notify_one();
+            if (quit) break;
         }
         std::lock_guard<std::mutex> lock(inbox->mutex);
         inbox->eof = true;
