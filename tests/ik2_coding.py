@@ -44,8 +44,11 @@ def main():
     rows = problems(args.data)
     if args.score:
         by_id = {r["task_id"]: r for r in rows}
-        for line in args.score.read_text().splitlines():
-            rec = json.loads(line)
+        records = [json.loads(line) for line in args.score.read_text().splitlines()]
+        coding = [r for r in records if r.get("case", "code") == "code"]
+        if not coding or len({r["task_id"] for r in coding}) != len(coding):
+            p.error("expected one or more unique coding results")
+        for rec in coding:
             print(json.dumps(dict(task_id=rec["task_id"], **score(by_id[rec["task_id"]], rec["answer"], args.image))), flush=True)
         return
     if not args.url:

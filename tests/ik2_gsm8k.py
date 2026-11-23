@@ -18,21 +18,24 @@ END = "<|content_model_end_sampling|>"
 TEXT = "<|message_model|><|content_text|>"
 
 
+def score_answer(final, sample):
+    numbers = NUMBER.findall(final)
+    predicted = Decimal(numbers[-1].replace(",", "")) if numbers else None
+    expected = Decimal(sample["answer"].rsplit("####", 1)[1].strip().replace(",", ""))
+    return dict(correct=predicted == expected, expected=str(expected), predicted=str(predicted) if numbers else None)
+
+
 def score(reason, tokens, tokenizer, sample):
     if reason not in ("stop", "length"):
         raise ValueError(f"unexpected finish reason: {reason}")
     full = tokenizer.decode(tokens)
     final = full.rsplit(TEXT, 1)[1].split("<|end_message|>")[0] if TEXT in full else ""
-    numbers = NUMBER.findall(final)
-    predicted = Decimal(numbers[-1].replace(",", "")) if numbers else None
-    expected = Decimal(sample["answer"].rsplit("####", 1)[1].strip().replace(",", ""))
-    return dict(correct=predicted == expected, expected=str(expected), predicted=str(predicted) if numbers else None,
-                finish=reason, generated=len(tokens))
+    return dict(**score_answer(final, sample), finish=reason, generated=len(tokens))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model", help="GGUF for native protocol or llama.cpp tokenization")
     parser.add_argument("--data", required=True, type=Path, help="OpenAI GSM8K test.jsonl")
     parser.add_argument("--count", type=int, default=96, help="take the first N questions in file order")
     parser.add_argument("--offset", type=int, default=0, help="skip this many questions before taking --count")
@@ -40,11 +43,21 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--score", type=Path, help="server stdout from the prepared inputs")
     mode.add_argument("--llama-url", help="score the same tokenized inputs against a running llama.cpp service")
+    mode.add_argument("--chat-url", help="score final answers from the OpenAI chat endpoint with medium reasoning")
     args = parser.parse_args()
     with args.data.open() as f:
         samples = [json.loads(line) for line in f][args.offset:args.offset + args.count]
     if args.offset < 0 or len(samples) != args.count or args.count < 1:
         parser.error("invalid question count")
+    if args.chat_url:
+        from ik2_kv_quality import completion
+        for index, sample in enumerate(samples, args.offset):
+            question = sample["question"] + "\nEnd your answer with #### followed by the number."
+            result = completion(args.chat_url, [dict(role="user", content=question)], args.max_tokens, "medium")
+            print(json.dumps(dict(question=index, **score_answer(result["answer"], sample), **result)), flush=True)
+        return
+    if not args.model:
+        parser.error("--model is required for tokenized inputs")
     tok = Tokenizer.from_gguf(args.model)
     if args.score:
         tokens, results = [], []

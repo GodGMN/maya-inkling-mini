@@ -48,11 +48,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
     parser.add_argument("--mrcr", type=Path, nargs="+", help="OpenAI MRCR rows, each saved as a JSON object")
-    parser.add_argument("--mmlu", type=Path, required=True)
+    parser.add_argument("--mmlu", type=Path)
     parser.add_argument("--code", type=Path, help="repeat four HumanEval+ tasks on the long histories")
     parser.add_argument("--serial", action="store_true", help="finish one archive before starting the next")
     args = parser.parse_args()
-    questions = [json.loads(line) for line in args.mmlu.read_text().splitlines()]
+    if not args.mrcr and not args.mmlu and not args.code:
+        parser.error("supply at least one question set")
+    questions = [json.loads(line) for line in args.mmlu.read_text().splitlines()] if args.mmlu else []
     chats = []
     if args.mrcr:
         for p in args.mrcr:

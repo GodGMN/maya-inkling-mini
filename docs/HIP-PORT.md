@@ -139,6 +139,21 @@ RUN pip install --no-cache-dir numpy==2.2.6
 DOCKER
 ```
 
+### Paired short and long prompts
+
+All 16 short HumanEval+ tasks passed on both service-r3 FP8 and the two-slot FP4 build. Both used medium reasoning, greedy sampling and a 4,096-token limit. The 16 canonical functions passed the same grader, and replacing each function with one that raises an exception failed all 16. The two KV formats generated 10,565 and 11,750 tokens respectively. The longest short coding prompt fit in one prefill chunk in both configurations.
+
+Two untruncated eight-needle conversations from [OpenAI MRCR](https://huggingface.co/datasets/openai/mrcr/tree/f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d) contained 344,768 and 348,465 input tokens. Their published answers require 328 and 730 tokens in the Inkling tokenizer. The direct-answer test allows 768. Each follow-up uses the published answer in the history so the input stays identical across formats. The separate register test appends the model's own answer, and checks the number of tokens reused on every turn.
+
+```sh
+python3 tests/ik2_kv_quality.py --url "$URL" --mrcr mrcr-mid-0.json mrcr-mid-1.json \
+    --mmlu mmlu32.jsonl --code humanevalplus.jsonl > long.jsonl
+python3 tests/ik2_coding.py --data humanevalplus.jsonl --score long.jsonl
+python3 tests/ik2_slot_retrieval.py --url "$URL" --slots 2 --depth 359424 --cold > registers.jsonl
+```
+
+The MRCR files correspond to default train rows 1850 and 1870. The FP4 match ratios were 0.0180 and 0.0558. The model reproduced the eighth poem and the eighth diary entry in the respective histories. The requests asked for the seventh and fourth. Cold prefill took 370.0 seconds for the first history. These are per-example scores on selected depths, and should only be compared with replays of those same rows.
+
 ## Separate conversation caches
 
 Set `IK2_CACHE_SLOTS` in Compose or pass `--cache-slots N` to the native server. One request runs at a time. Each slot retains its token and image history, KV, convolution state and prefix checkpoints. The engine selects the longest prefix it can restore. A new conversation uses an empty slot first, then the least recently used one. A restart clears all slots. With a single slot the engine allocates no exchange buffer.
