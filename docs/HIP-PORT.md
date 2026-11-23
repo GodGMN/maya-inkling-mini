@@ -154,6 +154,13 @@ The packaged host-staged vision build includes two explicit `MAYA_IK2_PRESET` va
 
 Set `MAYA_IK2_PRESET` in `~/ai/services/inkling-2-mini/.env` to one of the filenames above and run `docker compose up -d --no-deps --pull never llama` from that directory. The new container starts with empty caches. Check `cache_slots`, `max_context` and `images` on `/health`. To explicitly select a single 393,216-token FP8 cache, set `MAYA_IK2_PRESET=ik2-mini-gfx1100-hip-host-vision.json` and `IK2_CACHE_SLOTS=1`.
 
+The running dashboard's context setting is per conversation. Previously a request for 49,152 on two caches passed 49,152 total to the engine, leaving 24,576 per conversation. The reload now passes 98,304 total and saves that value to the config. Failure restores the prior per-slot capacity. The server also reads the training limit from the exact text GGUF passed with `--model`. The stock header reports 1,048,576. The tested GPU capacities are the ones in the table above.
+
+```sh
+python3 -m unittest serve.test_dashboard.Dashboard.test_inkling_context_reload_and_rollback_with_two_caches
+curl -fsS "$URL/api/context"
+```
+
 At four slots, per-slot capacities 196,608, 192,512, 188,416, 184,320 and 180,224 all failed the resident-expert requirement. At 176,128 the server started and read three 1480×900 screenshots correctly in 1.385, 0.888 and 0.749 seconds. The minimum free VRAM sampled every 100 ms during those requests was 257.7 MiB. Both profiles use a shared 4 MiB slot-exchange buffer.
 
 Four independent registers started at 174,934 tokens apiece. All twelve early, middle and late lookups were correct, along with all four color questions. The eight text follow-ups reused 174,936 or 174,959 tokens and processed 21 each in 0.273–0.483 seconds. The image follow-ups reused 174,982 tokens and processed 62 each in 0.358–0.377 seconds. Four independent 174,980-token cold replays matched the respective warm answers, lengths and finish reasons in 120.956–121.210 seconds. Device memory peaked at 23.734 GiB, leaving 256.7 MiB. The container reported zero OOM kills. The two-slot run also reported zero OOM kills.

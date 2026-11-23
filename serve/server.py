@@ -989,8 +989,8 @@ class StrataEngine:
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
-        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
-        self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack", "--model")}
+        self.model_path = paths.get("--native") or paths.get("--pack") or paths.get("--model", "pack/full")
         self.log_path = log
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
@@ -2958,10 +2958,10 @@ class Service:
         threading.Thread(target=self._reload, args=(reload["from"], n), daemon=True).start()
         return reload
 
-    def _restart_with(self, n: int):
+    def _restart_with(self, n: int, cache_slots: int):
         if hasattr(self.engine, "set_context"):
             self.engine.stop()
-            self.engine.set_context(n)
+            self.engine.set_context(n * cache_slots)
             self.engine.restart()
         else:                                            # the mock engine: nothing to start
             time.sleep(float(os.environ.get("MAYA_MOCK_RELOAD_S", "2")))
@@ -2974,21 +2974,24 @@ class Service:
             print(f"[maya] reloading the model with a {n}-token context (was {old}) ...", flush=True)
             err = None
             t0 = time.time()
+            # Inkling reports per-conversation capacity in READY and takes the sum across caches in --max-context.
+            info = getattr(self.engine, "info", {}) or {}
+            cache_slots = int(info.get("cache_slots", 1)) if info.get("engine_kind") == "ik2" else 1
             try:
-                self._restart_with(n)
+                self._restart_with(n, cache_slots)
                 self.engine.load_s = round(time.time() - t0, 1)
             except Exception as e:  # noqa: BLE001 - any failed start: put the old context back
                 err = f"the engine did not start with a {n}-token context ({e})"
                 print(f"[maya] {err}; starting it again with {old} ...", flush=True)
                 try:
-                    self._restart_with(old)
+                    self._restart_with(old, cache_slots)
                 except Exception as e2:  # noqa: BLE001
                     err += f"; starting again with {old} failed too ({e2}) - the next request tries once more"
             places = max(1, int(getattr(self.engine, "multi", 0) or 1))   # the reloaded engine's conversations
             if places != self.fifo.capacity:
                 self.fifo.set_capacity(places)
             if err is None:
-                self._save_context(n)
+                self._save_context(n * cache_slots)
                 print(f"[maya] the model runs with a {n}-token context now", flush=True)
             with self.status_lock:
                 self.reload.update(state="failed" if err else "done", error=err, ended=time.time(),
@@ -7707,6 +7710,9 @@ def main() -> int:
         svc.model_dir = Path(args[args.index(flag) + 1]).resolve().parent
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
                          daemon=True).start()
+    elif getattr(engine, "info", {}).get("engine_kind") == "ik2" and "--model" in args[:-1]:
+        gguf = Path(cfg.get("cwd") or ".") / engine.model_path
+        threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(gguf)), daemon=True).start()
     elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder
         svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])
         svc.model_dir = Path(args[args.index("--pack") + 1]).resolve().parent

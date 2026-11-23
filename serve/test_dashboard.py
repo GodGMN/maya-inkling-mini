@@ -122,6 +122,29 @@ class Dashboard(unittest.TestCase):
         self.wait_reload()
         self.assertEqual(json.loads(self.cfg.read_text())["installer"]["as_set_up"]["context"], 32768)
 
+    def test_inkling_context_reload_and_rollback_with_two_caches(self):
+        slots = 2
+        self.cfg.write_text(json.dumps({"exe": "maya-ik2", "args": ["--max-context", "65536", "--cache-slots", "2"]}))
+        self.engine.info.update(engine_kind="ik2", cache_slots=slots)
+        self.engine.stop = lambda: None
+        self.engine.restart = lambda: None
+
+        def apply_total(total):
+            if total > 131072:
+                raise RuntimeError("context exceeds device memory")
+            self.engine.max_context = total // slots
+
+        self.engine.set_context = apply_total
+        status, _, _ = self.req("POST", "/api/context", {"max_context": 49152})
+        self.assertEqual(status, 202)
+        self.assertEqual(self.wait_reload()["context"], 49152)
+        args = json.loads(self.cfg.read_text())["args"]
+        self.assertEqual(args, ["--max-context", "98304", "--cache-slots", "2"])
+        self.req("POST", "/api/context", {"max_context": 131072})
+        result = self.wait_reload()
+        self.assertEqual((result["reload"]["state"], result["context"]), ("failed", 49152))
+        self.assertEqual(json.loads(self.cfg.read_text())["args"], args)
+
     def test_metrics_say_whether_deepseek_drafts(self):
         # DeepSeek's engine does not say it drafts with DSpark: the server does (the Monitor's Speculation), and only
         # for a DeepSeek config
