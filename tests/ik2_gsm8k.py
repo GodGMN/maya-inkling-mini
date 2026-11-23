@@ -31,6 +31,7 @@ def score(reason, tokens, tokenizer, sample):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-id", default="inkling-2-mini", help="model ID for --chat-url")
     parser.add_argument("--model", help="GGUF for native protocol or llama.cpp tokenization")
     parser.add_argument("--data", required=True, type=Path, help="OpenAI GSM8K test.jsonl")
     parser.add_argument("--count", type=int, default=96, help="take the first N questions in file order")
@@ -49,7 +50,7 @@ def main():
         from ik2_kv_quality import completion
         for index, sample in enumerate(samples, args.offset):
             question = sample["question"] + "\nEnd your answer with #### followed by the number."
-            result = completion(args.chat_url, [dict(role="user", content=question)], args.max_tokens, "medium")
+            result = completion(args.chat_url, [dict(role="user", content=question)], args.max_tokens, "medium", args.model_id)
             print(json.dumps(dict(question=index, **score_answer(result["answer"], sample), **result)), flush=True)
         return
     if not args.model:

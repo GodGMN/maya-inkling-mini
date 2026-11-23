@@ -52,6 +52,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data", type=Path, required=True)
     p.add_argument("--url")
+    p.add_argument("--model-id", default="inkling-2-mini")
     p.add_argument("--score", type=Path)
     p.add_argument("--image", default="ik2-evalplus:local", help="local Python image with numpy and timeout")
     p.add_argument("--prefix", type=Path, help="JSON list of prior chat messages")
@@ -75,7 +76,7 @@ def main():
         prompt = "Implement this Python function. Return the complete runnable Python code in one code block.\n\n" + row["prompt"]
         messages = prefix + [dict(role="user", content=prompt)]
         start = time.monotonic()
-        response = post(args.url, "/v1/chat/completions", dict(model="inkling-2-mini", messages=messages,
+        response = post(args.url, "/v1/chat/completions", dict(model=args.model_id, messages=messages,
                         temperature=0, reasoning_effort="medium", max_tokens=4096))
         choice, = response["choices"]
         print(json.dumps(dict(task_id=row["task_id"], seconds=round(time.monotonic()-start, 3),

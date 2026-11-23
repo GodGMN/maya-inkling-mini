@@ -13,8 +13,8 @@ from ik2_coding import problems
 from ik2_image_answers import setup_screenshots
 
 
-def completion(url, messages, limit, effort):
-    body = dict(model="inkling-2-mini", messages=messages, max_tokens=limit, temperature=0,
+def completion(url, messages, limit, effort, model="inkling-2-mini"):
+    body = dict(model=model, messages=messages, max_tokens=limit, temperature=0,
                 reasoning_effort=effort, stream=True)
     payload = json.dumps(body).encode()
     req = Request(url.rstrip("/") + "/v1/chat/completions", payload,
