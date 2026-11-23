@@ -5,13 +5,14 @@ import hashlib
 import json
 import random
 import time
+from pathlib import Path
 from urllib.request import urlopen
 
 from ik2_chat_growth import archive, post
 from ik2_image_answers import setup_screenshots
 
 
-def run(url, depths, serial, repeat_cold):
+def run(url, depths, serial, repeat_cold, save_controls):
     with urlopen(url + "/health", timeout=10) as response:
         slots = json.load(response)["cache_slots"]
     if slots < 2 and not serial:
@@ -27,6 +28,9 @@ def run(url, depths, serial, repeat_cold):
                     temperature=temperature, max_output_tokens=4096, reasoning={"effort": "medium"}, store=store, input=inputs)
         if previous:
             body["previous_response_id"] = previous
+        if turn == "cold" and save_controls:
+            save_controls.mkdir(parents=True, exist_ok=True)
+            (save_controls / f"chat-{chat}.json").write_text(json.dumps(body))
         start = time.monotonic()
         response = post(url, "/v1/responses", body)
         output = response["output"]
@@ -141,8 +145,9 @@ if __name__ == "__main__":
                    help="additional archive tokens per turn; at least three batches")
     p.add_argument("--serial", action="store_true", help="use one cache to run the two conversations in sequence")
     p.add_argument("--repeat-cold", action="store_true", help="evict all slots and repeat the cold controls to check deterministic replay")
+    p.add_argument("--save-controls", type=Path, help="save the exact cold request bodies for cross-model replay")
     a = p.parse_args()
     batches = [int(size) for size in a.batches.split(",")]
     if len(batches) < 3 or min(batches) < 128:
         p.error("supply at least three batches of 128 tokens or more")
-    run(a.url.rstrip("/"), batches, a.serial, a.repeat_cold)
+    run(a.url.rstrip("/"), batches, a.serial, a.repeat_cold, a.save_controls)

@@ -222,6 +222,8 @@ python3 tests/ik2_responses_growth.py "$URL" --batches 20000,80000,150000,95000 
 
 On the short FP8 control both final numbers, both screenshots and both post-compaction numbers were correct. The visible answers matched their cold replays. For the 3,490-token lookup, warm and cold generation took 1,661 and 480 tokens. At 3,693 tokens they took 194 and 199. Repeating each cold input after eviction reproduced its entire reasoning text and output count exactly. A 512-token output cap in the first pilot exhausted the reasoning budget before the first number. The recorded comparison uses 4,096. This difference in reasoning between incremental and cold execution already occurs with the stock FP8 cache.
 
+The two-slot FP4 smoke run also kept both answers correct and fully cached through sampling and image turns. Its two warm/cold lookups generated 406/355 and 1,046/358 tokens. Both independently repeated cold runs reproduced their respective reasoning and visible answers. Add `--save-controls DIRECTORY` to retain the exact cold Responses request bodies for cross-format replays.
+
 ### Teacher-forced logits on the stock IQ4_NL weights
 
 The CPU oracle used `ref/inkling2.py` on the same GGUF and the same 256-token passage. Each Radeon run used the environment in `ik2-mini-gfx1100.json` with the indicated override. The decode test feeds 32 known continuations after a 224-token prompt. Its 32 predictions cover the tail of the prefill passage, so the two rows are overlapping samples.
@@ -276,24 +278,31 @@ Two independent parcel registers each occupied 359,254 input tokens before the f
 
 On the direct-answer MRCR follow-ups FP4 scored 23/32 on MMLU and 1/4 on the short coding set embedded in those histories. Two multiple-choice answers and one coding response reached their output caps. The coding failures were a missing `typing.List` import, an unfinished answer, and a time-out in the supplied tests. The separate 16-task short coding run used medium reasoning. A comparison of short and long coding scores must account for both the archive and the reasoning setting.
 
+On nine short HTTP requests with 129 generated tokens each, median end-to-end throughput was 111.64 tok/s for one FP8 slot and 110.37 for two FP4 slots. Both servers reserved 360,448 positions per conversation and used 512-token prefill chunks. Across the six requests after the first pass through the three prompts, median time to first text was 83.66 ms and 86.48 ms respectively. At 345K the decode rates in the table above show a larger difference.
+
+```sh
+python3 tools/ik2_http_bench.py --url "$URL" --max-tokens 129 --repeats 3
+```
+
 #### Matched capability scores
 
 | Task and setting | FP8 | FP4 | Items that changed correctness |
 |---|---:|---:|---|
 | 256 MMLU, short, direct answer | 207/256 | 206/256 | 3 gains, 4 losses |
-| First 32 GSM8K, short, medium reasoning | 32/32 | 31/32 | 1 loss |
+| First 128 GSM8K, short, medium reasoning | 125/128 | 123/128 | 2 losses |
 | 16 HumanEval+, short, medium reasoning | 16/16 | 16/16 | None |
 | 32 MMLU on the 345K and 348K archives, direct answer | 24/32 | 23/32 | 1 loss |
 | 4 HumanEval+ on the same archives, direct answer | 1/4 | 1/4 | None |
 | 16 feasible/impossible programming specifications, direct answer | 9/16 | 9/16 | None |
 
-On GSM8K test item 12 both models computed that the tree breaks even after 12 years. FP8 gave the first profitable year, 13, and FP4 returned 12. Neither answer hit its cap. On the long college mathematics item 0, FP8 returned the correct letter. FP4 began reasoning in the answer and reached the eight-token cap. The feasibility questions are a local check of whether the model can recognize missing information. Both direct-answer runs recognized all eight impossible tasks and only one of the eight feasible tasks.
+On GSM8K test item 12 both models computed that the tree breaks even after 12 years. FP8 gave the first profitable year, 13, and FP4 returned 12. Neither answer hit its cap. On item 106, FP8 computed the inner volume of three boxes correctly in 551 tokens. FP4 exhausted its 4,096-token limit without a final answer. All 128 request hashes and input lengths matched. On the long college mathematics item 0, FP8 returned the correct letter. FP4 began reasoning in the answer and reached the eight-token cap. The feasibility questions are a local check of whether the model can recognize missing information. Both direct-answer runs recognized all eight impossible tasks and only one of the eight feasible tasks.
 
 Eight further eight-needle MRCR rows contained 23,365 to 60,974 input tokens. Their mean direct-answer match ratios were 0.0600 on FP8 and 0.0773 on FP4. Neither model reproduced the requested answer on any row. In five cases the generated text was identical. The rows were 1714, 1725, 1750, 1797, 1920, 1959, 1979 and 1992 in the default train split. Results and the exact inputs are in `~/ai/build/maya-ik2-hip/fp4-overnight/results/` on Prometheus.
 
 ```sh
 python3 tests/ik2_kv_quality.py --url "$URL" --mmlu mmlu256.jsonl
 python3 tests/ik2_gsm8k.py --chat-url "$URL" --data gsm8k-test.jsonl --count 32 --max-tokens 4096
+python3 tests/ik2_gsm8k.py --chat-url "$URL" --data gsm8k-test.jsonl --offset 32 --count 96 --max-tokens 4096
 python3 tests/ik2_feasibility.py --url "$URL"
 python3 tests/ik2_kv_quality.py --url "$URL" --mrcr mrcr-short/row-*.json
 ```
