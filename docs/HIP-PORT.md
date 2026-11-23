@@ -182,7 +182,14 @@ python3 tests/ik2_coding.py --data humanevalplus.jsonl --score long.jsonl
 python3 tests/ik2_slot_retrieval.py --url "$URL" --slots 2 --depth 359424 --cold > registers.jsonl
 ```
 
-The MRCR files correspond to default train rows 1850 and 1870. The FP4 match ratios were 0.0180 and 0.0558. The model reproduced the eighth poem and the eighth diary entry in the respective histories. The requests asked for the seventh and fourth. Cold prefill took 370.0 seconds for the first history. These are per-example scores on selected depths, and should only be compared with replays of those same rows.
+The MRCR files correspond to default train rows 1850 and 1870. The FP4 match ratios were 0.0180 and 0.0558. The model reproduced the eighth poem and the eighth diary entry in the respective histories. The requests asked for the seventh and fourth. FP8 returned exactly the same answer text on both rows, including both ordinal mistakes. On the 32 short MMLU questions each format scored 26/32 on precisely the same items. One incorrect letter changed to another incorrect letter.
+
+| Public eight-needle input | Cold prefill, FP8 / FP4 | Generated tokens in both | Decode tok/s, FP8 / FP4 |
+|---|---:|---:|---:|
+| 344,768 tokens | 353.1 / 370.0 s | 374 | 39.0 / 27.4 |
+| 348,465 tokens | 359.8 / 376.8 s | 536 | 38.8 / 27.1 |
+
+FP8 ran with one slot and `--serial`; FP4 alternated two slots. Both used the same native binary, chunk 512, per-slot maximum of 360,448, host-staged GPU vision and the same chat template. Each retrieval request reported zero cached tokens. The table uses server-side timings from `tests/ik2_kv_quality.py`. The two published rows alone cannot estimate full-benchmark accuracy.
 
 Two independent parcel registers each occupied 359,254 input tokens before the first answer. FP4 retrieved all six randomly chosen verification numbers at 5%, 50% and 95% of the respective archive text. Alternating the two chats reused 359,256 and 359,279 tokens on the text follow-ups. Each read 21 new tokens in 0.431–0.716 seconds. The final image questions each reused 359,302 tokens and processed 62 more. Both colors were correct, in 0.518 and 0.536 seconds. Each final text query then replayed from zero cached tokens. The cold requests took 384.256 and 384.627 seconds and matched the warm replies, generated token counts and finish reasons exactly. The highest device-wide memory sample during these turns was 23.613 GiB, leaving 380.6 MiB on the card.
 
