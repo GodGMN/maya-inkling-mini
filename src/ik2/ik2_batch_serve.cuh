@@ -46,6 +46,10 @@ void serve_sequences(Model& M, int width, int ctx, int chunk, int image_token, s
     buf.blob = W.blob; buf.tok = W.tok; buf.inv = W.inv;
     buf.sg = W.sg; buf.su = W.su; buf.wt = W.wt;
     CU(cudaHostAlloc(&buf.logits_h, (size_t)width * c.n_vocab * sizeof(float), cudaHostAllocPortable));
+    const size_t candidate_ints = (size_t)width * (2 + 2 * kCandCap);
+    buf.cand_d = dalloc<int>(candidate_ints);
+    CU(cudaHostAlloc(&buf.cand_h, candidate_ints * sizeof(int), cudaHostAllocPortable));
+    const bool use_candidates = !getenv("IK2_CAND") || std::atoi(getenv("IK2_CAND"));
     SequenceRows rows;
     rows.device_slots = dalloc<int>(width);
     FastGraph graph;
@@ -195,7 +199,7 @@ void serve_sequences(Model& M, int width, int ctx, int chunk, int image_token, s
             const size_t t = rows.slots.size();
             rows.slots.push_back(s);
             rows.buckets.push_back(decode_bucket(r.pos));
-            if (r.sampling.temp > 0) mode = OutMode::kLogits;
+            if (r.sampling.temp > 0) mode = use_candidates ? OutMode::kCand : OutMode::kLogits;
             const size_t rb = (size_t)c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
             k::decode_host(M.embd_type, M.embd + (size_t)r.token * rb, c.C, W.emb_h + t * c.C);
             W.pos_h[t] = r.pos;
@@ -230,7 +234,23 @@ void serve_sequences(Model& M, int width, int ctx, int chunk, int image_token, s
             const int s = rows.slots[t];
             BatchRequest& r = *slots[s];
             ++r.pos;
-            emit(s, mode == OutMode::kArgmax ? W.argmax_h[t] : r.pick(T == 1 ? W.logits_h : buf.logits_h + (size_t)t * c.n_vocab, c.n_vocab));
+            if (r.sampling.temp <= 0) {
+                emit(s, W.argmax_h[t]);
+                continue;
+            }
+            if (mode == OutMode::kCand) {
+                std::vector<std::pair<float, int>> candidates;
+                if (block_cands(T == 1 ? W.cand_h : buf.cand_h, t, candidates)) {
+                    emit(s, sample_from(sample_dist(candidates, r.sampling), r.rng));
+                    continue;
+                }
+                CU(cudaMemcpy(W.logits_h, W.logits + (size_t)t * c.n_rows, c.n_vocab * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+                emit(s, r.pick(W.logits_h, c.n_vocab));
+            } else {
+                const float* logits = T == 1 ? W.logits_h : buf.logits_h + (size_t)t * c.n_vocab;
+                emit(s, r.pick(logits, c.n_vocab));
+            }
         }
         std::fflush(stdout);
     }

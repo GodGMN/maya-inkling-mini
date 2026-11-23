@@ -37,7 +37,7 @@ def prompts(tokenizer):
     return result
 
 
-def run(args, engine, ids, width, concurrency, env, cancel_first=False):
+def run(args, engine, ids, width, concurrency, env, cancel_first=False, mixed=False):
     cmd = [engine, "--serve", "--model", args.model, "--max-context", str(args.ctx * width),
            "--chunk", str(args.chunk)]
     generated = [[] for _ in ids]
@@ -68,7 +68,9 @@ def run(args, engine, ids, width, concurrency, env, cancel_first=False):
                 if i is not None:
                     active.add(i)
                     tag = f" rid={i + 1}" if width > 1 else ""
-                    send(f"GEN {args.tokens} temperature=0{tag} " + ",".join(map(str, ids[i])))
+                    sampling = f"temperature=0.7 top_p=0.9 top_k=20 seed={17 + i}" if mixed and i % 2 else "temperature=0"
+                    limit = 8 + 3 * i if mixed else args.tokens
+                    send(f"GEN {limit} {sampling}{tag} " + ",".join(map(str, ids[i])))
 
             for _ in range(concurrency):
                 admit()
@@ -126,6 +128,11 @@ def main():
         failed |= exact != len(ids)
     result = run(args, args.engine, ids[:4], args.width, 2, env, cancel_first=True)
     assert result[1:] == reference[1:4], "cancellation or reuse changed a neighboring slot"
+    sample_ids = ids[:8]
+    expected = run(args, args.baseline, sample_ids, 1, 1, env, mixed=True)
+    actual = run(args, args.engine, sample_ids, args.width, min(8, args.width), env, mixed=True)
+    assert actual == expected, "mixed greedy and seeded sampling changed a request's tokens"
+    print("Cancellation, slot reuse and mixed sampling passed.", flush=True)
     raise SystemExit(failed)
 
 

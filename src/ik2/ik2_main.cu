@@ -3148,10 +3148,13 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
             CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, TCb, cudaMemcpyDeviceToDevice, g_s));
         if (rows) sequence_product(M.out_w, W.xq, T, W.logits, c.n_rows);
         else tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
-        if (out_mode == OutMode::kArgmax) {
+        if (out_mode == OutMode::kArgmax || rows) {
+            // A mixed batch still takes greedy rows' argmax before the sampler's softcap.
             k::argmax_rows(W.logits, c.n_rows, T, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
-        } else if (out_mode == OutMode::kCand) {   // (each row's candidates, as the token path's)
+            if (out_mode == OutMode::kArgmax) return;
+        }
+        if (out_mode == OutMode::kCand) {   // (each row's candidates, as the token path's)
             const size_t cs = 2 + 2 * (size_t) kCandCap;
             k::softcap(W.logits, (size_t) T * c.n_rows, c.logit_cap, g_s);
             for (int t = 0; t < T; ++t)
@@ -3200,8 +3203,8 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
     }
 }
 // row t's candidates of the last kCand window (logit, token); false: more than kept (the row's logits then)
-bool block_cands(const Model& M, int t, std::vector<std::pair<float, int>>& cd) {
-    const int* r = g_blk.cand_h + (size_t) t * (2 + 2 * kCandCap);
+bool block_cands(const int* candidates, int t, std::vector<std::pair<float, int>>& cd) {
+    const int* r = candidates + (size_t) t * (2 + 2 * kCandCap);
     if (r[0] > kCandCap) return false;
     const int* idx = r + 2;
     const float* val = (const float*) (r + 2 + kCandCap);
@@ -3340,7 +3343,7 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         fast_block(M, tk, B, P, OutMode::kCand, lo, nullptr);
         for (int j = 0; j < B; ++j) {
             std::vector<std::pair<float, int>> cd;
-            if (!block_cands(M, j, cd)) {   // (more candidates than kept: the row's logits)
+            if (!block_cands(g_blk.cand_h, j, cd)) {   // (more candidates than kept: the row's logits)
                 std::vector<float> row((size_t) c.n_vocab);
                 CU(cudaMemcpy(row.data(), dev_work(0).logits + (size_t) j * c.n_rows, (size_t) c.n_vocab * 4,
                               cudaMemcpyDeviceToHost));
