@@ -1,5 +1,6 @@
 """Prepare greedy GSM8K requests or score the final answers from maya-ik2's server protocol."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -35,6 +36,7 @@ def main():
     parser.add_argument("--model", help="GGUF for native protocol or llama.cpp tokenization")
     parser.add_argument("--data", required=True, type=Path, help="OpenAI GSM8K test.jsonl")
     parser.add_argument("--count", type=int, default=96, help="take the first N questions in file order")
+    parser.add_argument("--concurrency", type=int, default=1, help="simultaneous --chat-url requests")
     parser.add_argument("--offset", type=int, default=0, help="skip this many questions before taking --count")
     parser.add_argument("--max-tokens", type=int, default=1024)
     mode = parser.add_mutually_exclusive_group()
@@ -46,12 +48,19 @@ def main():
         samples = [json.loads(line) for line in f][args.offset:args.offset + args.count]
     if args.offset < 0 or len(samples) != args.count or args.count < 1:
         parser.error("invalid question count")
+    if args.concurrency < 1 or (args.concurrency != 1 and not args.chat_url):
+        parser.error("concurrency must be positive and requires --chat-url")
     if args.chat_url:
         from ik2_kv_quality import completion
-        for index, sample in enumerate(samples, args.offset):
+
+        def request(sample):
             question = sample["question"] + "\nEnd your answer with #### followed by the number."
             result = completion(args.chat_url, [dict(role="user", content=question)], args.max_tokens, "medium", args.model_id)
-            print(json.dumps(dict(question=index, **score_answer(result["answer"], sample), **result)), flush=True)
+            return dict(**score_answer(result["answer"], sample), **result)
+
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            for index, result in enumerate(pool.map(request, samples), args.offset):
+                print(json.dumps(dict(question=index, **result)), flush=True)
         return
     if not args.model:
         parser.error("--model is required for tokenized inputs")

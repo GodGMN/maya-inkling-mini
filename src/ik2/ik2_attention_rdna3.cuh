@@ -204,10 +204,20 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
 
 // Sixteen independent online softmax reductions per workgroup. Eight adjacent lanes cover a 128-wide
 // head for one key. Each lane reads 16 consecutive KV elements without rounding the FP32 query.
-template <class KV, bool Paged = false>
+template <class KV, bool Paged = false, bool Sequences = false>
 __global__ void rdna3_decode_split(const float* q, const float* r, const KV* kc, const KV* vc, int ring,
                                    int H, int Hkv, const int* position, float scale, const float* proj,
-                                   int dr, int extent, int window, float* scratch) {
+                                   int dr, int extent, int window, float* scratch, const int* slots = nullptr,
+                                   size_t stride = 0, int ld = 0) {
+    if constexpr (Sequences) {
+        const int t = blockIdx.z;
+        q += t * ld;
+        r += t * ld;
+        kc += slots[t] * stride;
+        vc += slots[t] * stride;
+        position += t;
+        scratch += (size_t)t * H * gridDim.y * 130;
+    }
     constexpr int lanes = 8, streams = 128 / lanes;
     const int h = blockIdx.x, split = blockIdx.y, splits = gridDim.y, tid = threadIdx.x;
     const int stream = tid / lanes, channel = (tid % lanes) * 16;

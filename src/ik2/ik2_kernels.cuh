@@ -176,7 +176,7 @@ struct LoopGate {
     float* y;
     const uint16_t* compact[3] = {}; // D, F, G if each F32 is exactly its upper 16 bits
 };
-void loop_gates(const LoopGate* gates, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s);
+void loop_gates(const LoopGate* gates, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s, bool sequences = false);
 void loop_gate(const float* x, const float* m, const float* D, const float* F, const float* G, int T, int C, int R,
                float eps, float* sc, float* y, cudaStream_t s);
 /// Sampling's candidates found on the device: of x [n] (its values within [lo, hi]: softcapped logits) every value
@@ -333,6 +333,17 @@ struct MvF16Job {
 struct MvF16Jobs { MvF16Job job[3] = {}; };
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
              cudaStream_t s);
+#ifdef STRATA_USE_HIP
+bool sequence_attention_fp8(float* q, float* r, float* gate, int ld, const float* qclip, const float* rclip,
+                            const float* keys, const float* values, uint8_t* kc, uint8_t* vc, Fp8KvLayout layout,
+                            size_t stride, const int* slots, const int* pos, int T, int H, int KV, int dr,
+                            float qcap, float rcap, float eps, float alpha, float floor, float kscale, float vscale,
+                            const float* rel, int extent, int window, int splits, const float* sink,
+                            float* scratch, float* out, cudaStream_t stream);
+#endif
+void mv_q8p_sequences(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int rows,
+                      float* y, int ldy, cudaStream_t s);
+void conv_sequences(const int* slots, int rows, const float* x, int ldx, MvConv cv, cudaStream_t s);
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
                  const MvConv& c1, cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{},
                  const MvF16Jobs& side = MvF16Jobs{});
@@ -346,7 +357,7 @@ void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStrea
 /// experts_gate_up_swiglu, experts_down and moe_combine_f32 take.
 void route_gather(const int* top, const float* w, const uint8_t* const* tab, const float* sg_t, const float* su_t,
                   const float* sd_t, int S, int K, const uint8_t** blob, int* tok, int* inv, float* sg, float* su,
-                  float* wt, cudaStream_t s);
+                  float* wt, cudaStream_t s, bool group_128_experts = false);
 /// One token's route() and route_gather() in one launch (the same values to the bit): top, w [K] and the K slots'
 /// tables.
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,

@@ -3,8 +3,8 @@ __global__ void rdna3_gate_dots(LoopGateArgs a, int C, float* scratch) {
     constexpr int rank = 64;
     const int tid = threadIdx.x, r = blockIdx.x, j = blockIdx.y;
     const auto* weights = (const uint16_t*)a.D[j] + (size_t)r * 2 * C;
-    const float* x = a.x[j];
-    const float* m = a.m[j];
+    const float* x = a.x[j] + blockIdx.z * C;
+    const float* m = a.m[j] + blockIdx.z * C;
     float ax = 0.f, am = 0.f;
     for (int c = 4 * tid; c < C; c += 512) {
         const float4 xv = *(const float4*)(x + c), mv = *(const float4*)(m + c);
@@ -23,7 +23,7 @@ __global__ void rdna3_gate_dots(LoopGateArgs a, int C, float* scratch) {
     __shared__ float2 partials[4];
     if (!(tid & 31)) partials[tid / 32] = make_float2(ax, am);
     __syncthreads();
-    float* out = scratch + j * (2 * rank + 2);
+    float* out = scratch + (j * gridDim.z + blockIdx.z) * (2 * rank + 2);
     if (!tid) {
         for (int i = 1; i < 4; ++i) { ax += partials[i].x; am += partials[i].y; }
         out[2 * r] = ax;
@@ -50,7 +50,7 @@ __global__ void rdna3_gate_apply(LoopGateArgs a, int C, float eps, const float* 
     constexpr int rank = 64, columns = 64, parts = 4;
     const int tid = threadIdx.x, column = tid % columns, part = tid / columns, j = blockIdx.y;
     const int c = blockIdx.x * columns + column;
-    const float* src = scratch + j * (2 * rank + 2);
+    const float* src = scratch + (j * gridDim.z + blockIdx.z) * (2 * rank + 2);
     __shared__ float g[rank];
     __shared__ float2 partials[parts][columns];
     if (tid < rank) {
@@ -69,6 +69,6 @@ __global__ void rdna3_gate_apply(LoopGateArgs a, int C, float eps, const float* 
     __syncthreads();
     if (!part) {
         for (int i = 1; i < parts; ++i) { forget += partials[i][column].x; gain += partials[i][column].y; }
-        a.y[j][c] = (1.f - tanhf(forget)) * a.x[j][c] + tanhf(gain) * a.m[j][c];
+        a.y[j][blockIdx.z * C + c] = (1.f - tanhf(forget)) * a.x[j][blockIdx.z * C + c] + tanhf(gain) * a.m[j][blockIdx.z * C + c];
     }
 }

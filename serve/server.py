@@ -1009,6 +1009,7 @@ class StrataEngine:
         self.multi = 0                   # READY ... multi=<n>: n conversations at once (requests tagged rid=<id>)
         self._routes: dict[int, queue.Queue] = {}       # rid -> its lines (multi)
         self._routes_lock = threading.Lock()
+        self._stdin_lock = threading.Lock()
         self._rids = itertools.count(1)
         self._tls = threading.local()                   # the request this thread is generating (pause())
         self.last = {}
@@ -1696,6 +1697,12 @@ class StrataEngine:
         except OSError:
             pass
 
+    def _multi_command(self, command):
+        # GEN lines can exceed PIPE_BUF. Keep them whole when several HTTP workers share stdin.
+        with self._stdin_lock:
+            self.proc.stdin.write(command + "\n")
+            self.proc.stdin.flush()
+
     def _generate_multi(self, ids, max_new, sampling, cancel, embeddings=None):
         """generate() on an engine that runs several conversations: this request's GEN carries rid=<id>, its lines come
         back through its own queue (_route), and STOP <id> ends it alone."""
@@ -1712,8 +1719,7 @@ class StrataEngine:
         done = False
         try:
             try:
-                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-                self.proc.stdin.flush()
+                self._multi_command(f"{head} {','.join(str(int(t)) for t in ids)}")
             except OSError:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
             heard, stall = time.monotonic(), {}
@@ -1752,8 +1758,7 @@ class StrataEngine:
                               f"and giving its place in the queue back (MAYA_REQUEST_QUIET_S={REQUEST_QUIET_S:.0f})",
                               flush=True)
                         try:
-                            self.proc.stdin.write(f"STOP {rid}\n")
-                            self.proc.stdin.flush()
+                            self._multi_command(f"STOP {rid}")
                         except OSError:
                             pass
                         done = True                        # nothing of its own to drain: later lines are dropped
@@ -1801,8 +1806,7 @@ class StrataEngine:
         finally:
             if not done:                                  # the consumer stopped early: stop this request, drain it
                 try:
-                    self.proc.stdin.write(f"STOP {rid}\n")
-                    self.proc.stdin.flush()
+                    self._multi_command(f"STOP {rid}")
                 except OSError:
                     pass
                 # The drain is bounded: an engine that does not honour the STOP (or whose DONE for this rid was
@@ -1839,7 +1843,8 @@ class StrataEngine:
             self._ask_end()
         try:
             if rid is not None:
-                self.proc.stdin.write(f"PAUSE {rid}{' keep' if keep else ''}\n")
+                self._multi_command(f"PAUSE {rid}{' keep' if keep else ''}")
+                return
             else:
                 self.proc.stdin.write("PAUSE keep\n" if keep else "PAUSE\n")
             self.proc.stdin.flush()
@@ -1851,6 +1856,9 @@ class StrataEngine:
         self._ask_end()
         if self.can_stop:
             try:
+                if self.multi:
+                    self._multi_command("STOP")
+                    return
                 self.proc.stdin.write("STOP\n")
                 self.proc.stdin.flush()
             except OSError:
@@ -1862,10 +1870,13 @@ class StrataEngine:
         wait = float(os.environ.get("MAYA_ENGINE_QUIT_S", "50") or 50)
         self._ask_end()
         try:
-            if self.can_stop:                           # a request in flight ends at its next step first: QUIT
-                self.proc.stdin.write("STOP\n")         # alone lets it run to max_tokens before the engine ends
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
+            if self.multi:
+                self._multi_command("STOP\nQUIT" if self.can_stop else "QUIT")
+            else:
+                if self.can_stop:                           # a request in flight ends at its next step first: QUIT
+                    self.proc.stdin.write("STOP\n")         # alone lets it run to max_tokens before the engine ends
+                self.proc.stdin.write("QUIT\n")
+                self.proc.stdin.flush()
             end = time.monotonic() + wait
             src = getattr(self, "lines", None)          # after start-up the pump thread owns stdout: read its queue
             while self.proc.poll() is None and time.monotonic() < end:

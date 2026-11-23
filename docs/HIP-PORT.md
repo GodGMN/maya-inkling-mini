@@ -593,7 +593,7 @@ python -m unittest serve.test_{engine_contract,fair,stop,stream_jobs,response_jo
 
 ### Slot selection
 
-Set `IK2_CACHE_SLOTS` in Compose or pass `--cache-slots N` to the native server. One request runs at a time. Each slot retains its token and image history, KV, convolution state and prefix checkpoints. The engine selects the longest prefix it can restore. A new conversation uses an empty slot first, then the least recently used one. A restart clears all slots. With a single slot the engine allocates no exchange buffer.
+Set `IK2_CACHE_SLOTS` in Compose or pass `--cache-slots N` to the native server. With the default decoder, one request runs at a time. Each slot retains its token and image history, KV, convolution state and prefix checkpoints. The engine selects the longest prefix it can restore. A new conversation uses an empty slot first, then the least recently used one. A restart clears all slots. With a single slot the engine allocates no exchange buffer.
 
 An early r4 build evicted chat A when the loop guard retried chat B from a checkpoint. The next HumanEval/62 request had to read all 345,238 input tokens again in 370.542 seconds. A divergent continuation now forks into an empty slot if available. When all slots are occupied it rewinds its matching chat in place. A cancelled prefill releases its slot for the next new chat.
 
@@ -653,6 +653,46 @@ for exe in full-direct-stop cache-slots-api; do
     radeon python3 src/tools/ik2_bench.py --engine "./$exe" --model /weight.gguf --depths 512,8192 \
         --ctx 393216 --chunk 1024 --gen 129 --repeats 3 --tokens water.force
 done
+```
+
+### Concurrent decode for short chat requests
+
+Set `IK2_BATCH` to the maximum number of active requests (2 to 32) and use the gfx1100 Maya server. The native `--max-context` is the total across those slots. For 32 conversations of 4,096 tokens each, use `--max-context 131072`. A 256-token prefill chunk keeps the sliding-window allocation small. Run the following from the repository root with the tokenizer and weights installed.
+
+```sh
+jq '.args = ["--model","models/Inkling-2-Mini-IQ4_NL.gguf","--max-context","131072","--chunk","256"]
+    | .env.IK2_BATCH = "32"' docs/inkling2-mini/ik2-mini-gfx1100.json > ik2-batch.json
+python3 serve/server.py --engine maya --config ik2-batch.json --host 127.0.0.1 --port 8088
+```
+
+The engine advertises `READY 4096 stop multi=32`. The HTTP server queues excess requests. Between decode steps the engine reads at most one prefill chunk, then predicts one token for every ready request. Each sequence has its own sampler, position, KV and convolution histories for all 48 visits. Completed and cancelled requests release their slot. Follow-up turns read their full prompt. Leave `IK2_BATCH` unset or set it to 1 for the original decoder with prefix reuse.
+
+Concurrent decode requires a single HIP GPU with resident experts and planar Q8 attention projections and output head. Speculative decoding with a drafter uses the single-request server. For the concurrent path, leave `IK2_CACHE_SLOTS` unset or use the same count as `IK2_BATCH`. Increasing the slot count reserves a sliding ring for each slot as well as its global KV.
+
+On Prometheus, the unmodified `dd139eea` server and the batch server ran the same IQ4_NL weights with FP8 KV, medium reasoning and greedy decoding. Each HTTP request had a short prompt and generated exactly 512 tokens. The client sent one simultaneous group at each concurrency, in the order shown. Aggregate tok/s divides all generated tokens by wall time from the first request until the last response. The last two columns are the median of each request's tokens divided by its own elapsed time, including queueing and prefill. Both servers had a 4,096-token per-request limit and a 256-token prefill chunk. The batch server reserved all 32 slots throughout.
+
+| Concurrent requests | Serial aggregate tok/s | Batch aggregate tok/s | Serial median request tok/s | Batch median request tok/s |
+|---:|---:|---:|---:|---:|
+| 1 | 97.43 | 84.30 | 97.43 | 84.30 |
+| 4 | 115.22 | 188.41 | 48.15 | 47.20 |
+| 8 | 115.98 | 247.14 | 26.07 | 31.02 |
+| 16 | 116.11 | 294.61 | 13.70 | 18.54 |
+| 32 | 116.14 | 327.84 | 7.04 | 10.36 |
+
+At concurrency 32 the client received 16,384 tokens in 49.975 s, compared with 141.067 s on the serial server. The single-request row was the first call after each server started and includes first-use costs. At this memory budget the serial server retained 868 MiB of FP16 prefill projections. The batch server used per-call dequantization. Changes in the active slot list, attention-depth buckets or sampling mode can require graph recapture.
+
+Across 32 different chat prompts of 33 to 47 tokens, the new binary with batching off matched all 4,096 original greedy token IDs. With 32 slots enabled, concurrency 1, 8 and 32 each matched the same 4,096 IDs, including all 128 tokens of every reply. Cancelling a request and reusing its slot preserved the other replies. Eight interleaved greedy and seeded sampling requests also reproduced their serial outputs. With a synthetic residual-projection direction enabled, four requests at prompt depths 39, 1,008, 1,269 and 1,357 matched all 128 serial predictions across the attention bucket change and sliding-ring wrap.
+
+The original server and the batch server each answered 32/32 GSM8K questions correctly with a 2,048-token limit. All final answers and finish reasons matched. An eight-worker GSM8K run also scored 32/32 while tool calls ran alongside it. OpenAI and Anthropic tool conversations passed with and without streaming in all three runs.
+
+```sh
+python3 tests/ik2_batch_decode.py --baseline /path/to/original/maya-ik2 --engine build-ik2/maya-ik2 \
+    --model models/Inkling-2-Mini-IQ4_NL.gguf --tokenizer ik2/tokenizer \
+    --preset docs/inkling2-mini/ik2-mini-gfx1100.json
+python3 tools/ik2_batch_bench.py --url http://127.0.0.1:8088
+python3 tests/ik2_gsm8k.py --chat-url http://127.0.0.1:8088 --data gsm8k-test.jsonl \
+    --count 32 --concurrency 8 --max-tokens 2048
+python3 tests/ik2_tool_conversations.py http://127.0.0.1:8088
 ```
 
 ## Multi-turn tool calls on Prometheus
