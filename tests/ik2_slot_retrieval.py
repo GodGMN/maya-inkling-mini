@@ -32,6 +32,7 @@ def main():
     p.add_argument("--server-pid", type=int)
     p.add_argument("--cold", action="store_true", help="replay the late-record queries after evicting all warm slots")
     p.add_argument("--screenshots", action="store_true", help="read a 1480×900 screenshot in each nearly full chat")
+    p.add_argument("--sampled-turn", action="store_true", help="follow the image with a seeded lookup at the service's default temperature")
     args = p.parse_args()
     if args.depth < 512 or args.slots < 1:
         p.error("positive slots and depth >=512 required")
@@ -54,7 +55,7 @@ def main():
     def turns(i):
         messages, codes = make_chat(args.url, args.depth, i)
         cached = 0
-        for t in range(4):
+        for t in range(4 + int(args.sampled_turn)):
             if t == 3:
                 if screenshots:
                     _, picture, question, expected = screenshots[i % len(screenshots)]
@@ -67,11 +68,14 @@ def main():
                            dict(type="text", text=question)]
                 messages.append(dict(role="user", content=content))
             else:
-                expected = codes[t]
+                index = 1 if t == 4 else t
+                expected = codes[index]
                 if t:
-                    label = ("cedar", "maple", "larch")[t]
+                    label = ("cedar", "maple", "larch")[index]
                     messages.append(dict(role="user", content=f"What is the {label} verification number? Reply with just the number."))
             request = dict(model="inkling-2-mini", temperature=0, reasoning_effort="none", max_tokens=32, messages=messages)
+            if t == 4:
+                request.update(temperature=1, top_p=1, seed=1429 + i)
             record = ask(args.url, request, f"register-{i}", t, cached, args.server_pid)
             answer = (record["answer"].get("content") or "").strip().lower().rstrip(".").replace(" %", "%")
             score = dict(chat=i, turn=t, expected=expected, answer=answer, correct=answer == expected)
@@ -89,7 +93,7 @@ def main():
             for _ in run:
                 pass
     else:
-        for _ in range(4):
+        for _ in range(4 + int(args.sampled_turn)):
             for run in runs:
                 next(run)
 

@@ -186,6 +186,19 @@ python3 tests/ik2_chat_growth.py "$URL" --depths 2048,0,8192
 
 The 10 GiB host-memory limit includes reclaimable file pages from the mapped weights. Across the two- and four-slot trials, sampled anonymous RAM peaked at 2.52 and 2.44 GiB respectively. The container cgroups reclaimed file pages at their limit. These host-memory numbers are separate from the device-wide VRAM readings.
 
+The corrected r4 image also served four chats through a mix of greedy decoding, screenshots and seeded sampling. All 20 answers matched at the 8K input setting and all 20 matched near the limit. Each long chat started with 174,934 tokens. Its screenshot reused 174,982 tokens and took 1.304–1.311 seconds. Each sampled follow-up added 21 tokens and took 0.305–0.315 seconds. The longest request used 175,884 of the 176,128 positions. Across startup and these requests, 62,961 device-memory readings taken about 10 ms apart found a minimum of 256.008 MiB free. There were no cgroup OOMs or container restarts.
+
+For concurrent HTTP admission, two clients at 8K and four at 4K started each turn together. All twelve follow-ups processed only 20 new tokens each. All six final replies matched a separate zero-cache replay in prompt length, generated tokens, answer and finish reason. The endpoint still has one decoding queue. `/health.cache_slots` counts resident histories while `/props.total_slots` reports simultaneous decodes.
+
+```sh
+python3 tests/ik2_slot_chats.py "$URL" --slots 2 --depth 8192 --concurrent
+python3 tests/ik2_slot_chats.py "$URL" --slots 4 --depth 4096 --concurrent
+python3 tests/ik2_slot_retrieval.py --url "$URL" --slots 4 --depth 8192 --screenshots --sampled-turn
+python3 tests/ik2_slot_retrieval.py --url "$URL" --slots 4 --depth 175104 --screenshots --sampled-turn
+# On Prometheus, run alongside the test with a fresh marker path. Touch that path to finish.
+python3 fp4-overnight/peak-sampler.py /tmp/ik2-finish-profile-001
+```
+
 ```sh
 # From ~/ai/build/maya-ik2-hip on Prometheus
 sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer \

@@ -2,6 +2,8 @@
 import argparse
 import base64
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from ik2_chat_growth import archive, ask, post
 from ik2_image_answers import png
 
@@ -19,6 +21,7 @@ def run(args):
         messages = [{"role": "system", "content": "You maintain a parcel register. Answer the question after each batch."}]
         sessions.append(dict(messages=messages, seal=seal, previous=0))
     for turn in range(3):
+        requests = []
         for index, session in enumerate(sessions):
             messages = session["messages"]
             if turn == 0:
@@ -28,7 +31,25 @@ def run(args):
                 content = "What is the current seal? Reply only with the current seal."
             messages.append({"role": "user", "content": content})
             body = dict(model="inkling-2-mini", temperature=0, reasoning_effort="none", max_tokens=48, messages=messages)
-            record = ask(url, body, f"slot-{index}", turn, session["previous"], args.server_pid)
+            requests.append((url, body, f"slot-{index}", turn, session["previous"], args.server_pid))
+
+        if args.concurrent:
+            barrier = threading.Barrier(args.slots)
+
+            def simultaneous(request):
+                barrier.wait(timeout=30)
+                return ask(*request, emit=False)
+
+            with ThreadPoolExecutor(max_workers=args.slots) as pool:
+                records = list(pool.map(simultaneous, requests))
+            for record in records:
+                print(json.dumps(record), flush=True)
+        else:
+            records = [ask(*request) for request in requests]
+
+        for index, (session, request, record) in enumerate(zip(sessions, requests, records)):
+            body = request[1]
+            messages = session["messages"]
             if record["answer"]["content"].strip() != session["seal"]:
                 evict()
                 cold = ask(url, body, "cold-mismatch", turn, 0, args.server_pid)
@@ -43,7 +64,7 @@ def run(args):
         cold = ask(url, session["request"], "cold-slot", index, 0, args.server_pid)
         if any(cold[k] != session["record"][k] for k in ("prompt", "answer", "generated", "finish")):
             raise ValueError(f"cold replay differs for desk {index}")
-    print(json.dumps(dict(slots=args.slots, depth=args.depth, verified=True)))
+    print(json.dumps(dict(slots=args.slots, depth=args.depth, concurrent=args.concurrent, verified=True)))
 
 
 def check_images(args):
@@ -73,6 +94,7 @@ if __name__ == "__main__":
     p.add_argument("--depth", type=int, required=True)
     p.add_argument("--server-pid", type=int)
     p.add_argument("--images", action="store_true", help="also alternate chats with the same text and different images")
+    p.add_argument("--concurrent", action="store_true", help="submit all chats in each round simultaneously")
     args = p.parse_args()
     if args.depth < 256 or args.slots < 1:
         p.error("supply a depth of at least 256 and a positive slot count")

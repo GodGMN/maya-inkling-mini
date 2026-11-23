@@ -33,7 +33,7 @@ def memory(pid):
                 oom_kill=int(events["oom_kill"]), vram=[int(card.read_text()) for card in cards])
 
 
-def ask(url, body, phase, turn, expected_cache, pid):
+def ask(url, body, phase, turn, expected_cache, pid, emit=True):
     start = time.monotonic()
     result = post(url, "/v1/chat/completions", body)
     choice, = result["choices"]
@@ -44,7 +44,8 @@ def ask(url, body, phase, turn, expected_cache, pid):
                   expected_cache=expected_cache, generated=usage["completion_tokens"],
                   answer=choice["message"], finish=choice["finish_reason"], seconds=round(time.monotonic()-start, 3),
                   memory=memory(pid))
-    print(json.dumps(record), flush=True)
+    if emit:
+        print(json.dumps(record), flush=True)
     if choice["finish_reason"] != "stop" or cached != expected_cache:
         raise ValueError(f"{phase} {turn}: expected stop and {expected_cache} cached, got {choice['finish_reason']} and {cached}")
     return record
