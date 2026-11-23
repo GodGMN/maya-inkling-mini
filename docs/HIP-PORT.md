@@ -603,6 +603,32 @@ The engine advertises `READY 4096 stop multi=32`. The HTTP server queues excess 
 
 Concurrent decode requires a single HIP GPU with resident experts and planar Q8 attention projections and output head. Speculative decoding with a drafter uses the single-request server. For the concurrent path, leave `IK2_CACHE_SLOTS` unset or use the same count as `IK2_BATCH`. Increasing the slot count reserves a sliding ring for each slot as well as its global KV.
 
+On Prometheus, the unmodified `dd139eea` server and the batch server ran the same IQ4_NL weights with FP8 KV, medium reasoning and greedy decoding. Each HTTP request had a short prompt and generated exactly 512 tokens. The client sent one simultaneous group at each concurrency, in the order shown. Aggregate tok/s divides all generated tokens by wall time from the first request until the last response. The last two columns are the median of each request's tokens divided by its own elapsed time, including queueing and prefill. Both servers had a 4,096-token per-request limit and a 256-token prefill chunk. The batch server reserved all 32 slots throughout.
+
+| Concurrent requests | Serial aggregate tok/s | Batch aggregate tok/s | Serial median request tok/s | Batch median request tok/s |
+|---:|---:|---:|---:|---:|
+| 1 | 97.43 | 84.30 | 97.43 | 84.30 |
+| 4 | 115.22 | 188.41 | 48.15 | 47.20 |
+| 8 | 115.98 | 247.14 | 26.07 | 31.02 |
+| 16 | 116.11 | 294.61 | 13.70 | 18.54 |
+| 32 | 116.14 | 327.84 | 7.04 | 10.36 |
+
+At concurrency 32 the client received 16,384 tokens in 49.975 s, compared with 141.067 s on the serial server. The single-request row was the first call after each server started and includes first-use costs. At this memory budget the serial server retained 868 MiB of FP16 prefill projections. The batch server used per-call dequantization. Changes in the active slot list, attention-depth buckets or sampling mode can require graph recapture.
+
+Across 32 different chat prompts of 33 to 47 tokens, the new binary with batching off matched all 4,096 original greedy token IDs. With 32 slots enabled, concurrency 1, 8 and 32 each matched the same 4,096 IDs, including all 128 tokens of every reply. Cancelling a request and reusing its slot preserved the other replies. Eight interleaved greedy and seeded sampling requests also reproduced their serial outputs. With a synthetic residual-projection direction enabled, four requests at prompt depths 39, 1,008, 1,269 and 1,357 matched all 128 serial predictions across the attention bucket change and sliding-ring wrap.
+
+The original server and the batch server each answered 32/32 GSM8K questions correctly with a 2,048-token limit. All final answers and finish reasons matched. An eight-worker GSM8K run also scored 32/32 while tool calls ran alongside it. OpenAI and Anthropic tool conversations passed with and without streaming in all three runs.
+
+```sh
+python3 tests/ik2_batch_decode.py --baseline /path/to/original/maya-ik2 --engine build-ik2/maya-ik2 \
+    --model models/Inkling-2-Mini-IQ4_NL.gguf --tokenizer ik2/tokenizer \
+    --preset docs/inkling2-mini/ik2-mini-gfx1100.json
+python3 tools/ik2_batch_bench.py --url http://127.0.0.1:8088
+python3 tests/ik2_gsm8k.py --chat-url http://127.0.0.1:8088 --data gsm8k-test.jsonl \
+    --count 32 --concurrency 8 --max-tokens 2048
+python3 tests/ik2_tool_conversations.py http://127.0.0.1:8088
+```
+
 ## Multi-turn tool calls on Prometheus
 
 Run `python3 tests/ik2_tool_conversations.py http://127.0.0.1:PORT` against each listening server. The packaged gfx1100 Maya image (`gfx1100-08aad41`) and the incumbent llama.cpp image (`server-rocm-inkling-1427-r2`, port 8085) each passed all four conversations. On both the OpenAI and Anthropic APIs, in streaming and non-streaming mode, the first assistant turn called the same tool twice with distinct IDs and desk arguments. The client returned results in reverse order. Every final answer associated Larch with VX-731 and Birch with PK-284. The llama.cpp answers sometimes added a heading. Raw responses are in `maya-tools.jsonl` and `llama-tools.jsonl` in the Prometheus build directory.
