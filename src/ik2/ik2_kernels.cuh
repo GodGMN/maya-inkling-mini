@@ -17,16 +17,25 @@ namespace ik2::k {
 
 // A positive capacity wraps token-major rows. Global FP8 pages store sixteen tokens per KV head.
 struct Fp8KvLayout {
-    constexpr Fp8KvLayout(int ring_capacity) : ring_capacity(ring_capacity), paged(false) {}
+    constexpr Fp8KvLayout(int ring_capacity) : ring_capacity(ring_capacity), paged(false), fp4(false) {}
     const int ring_capacity;
     const bool paged;
+    const bool fp4;
 #ifdef STRATA_USE_HIP
-    static constexpr Fp8KvLayout global_pages() { return Fp8KvLayout(); }
+    static constexpr Fp8KvLayout global_pages() { return Fp8KvLayout(true, false); }
+    static constexpr Fp8KvLayout global_fp4() { return Fp8KvLayout(false, true); }
 private:
-    constexpr Fp8KvLayout() : ring_capacity(0), paged(true) {}
+    constexpr Fp8KvLayout(bool pages, bool packed) : ring_capacity(0), paged(pages), fp4(packed) {}
 #endif
 };
 
+
+// E2M1 cache block. The FP16 scale applies to 32 consecutive channels within a KV head.
+struct Fp4KvBlock {
+    uint16_t scale;
+    uint8_t pairs[16];
+};
+static_assert(sizeof(Fp4KvBlock) == 18);
 
 /// y = x * rsqrt(mean(x^2) + eps) * w per row of D (w null: no weight).  x and y may alias.
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s);

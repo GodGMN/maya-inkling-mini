@@ -262,8 +262,10 @@ struct Layer {
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
     int kv_cap = 0;
     bool paged_kv = false;
+    bool fp4_kv = false;
     k::Fp8KvLayout fp8_layout() const {
 #ifdef STRATA_USE_HIP
+        if (fp4_kv) return k::Fp8KvLayout::global_fp4();
         if (paged_kv) return k::Fp8KvLayout::global_pages();
 #endif
         return sliding ? kv_cap : 0;
@@ -476,15 +478,21 @@ bool g_dense_q8 = false;
 // The KV cache in FP16 (IK2_KV=fp8: E4M3, half the bytes).  Against ref/inkling2.py over 48 tokens FP16 kept every
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
-enum class KVPrecision { f16, fp8, fp8_global };
+enum class KVPrecision { f16, fp8, fp8_global, fp4_global };
 KVPrecision g_kv_precision = KVPrecision::f16;
-bool fp8_kv(bool sliding) {
-    return g_kv_precision == KVPrecision::fp8 || (!sliding && g_kv_precision == KVPrecision::fp8_global);
+bool byte_cache(bool sliding) {
+    return g_kv_precision == KVPrecision::fp8 || g_kv_precision == KVPrecision::fp4_global || (!sliding && g_kv_precision == KVPrecision::fp8_global);
+}
+size_t kv_row_bytes(size_t elements, bool sliding) {
+    if (!sliding && g_kv_precision == KVPrecision::fp4_global)
+        return elements / 32 * sizeof(k::Fp4KvBlock);
+    return elements * (byte_cache(sliding) ? 1 : sizeof(uint16_t));
 }
 const char* kv_format_name() {
     switch (g_kv_precision) {
         case KVPrecision::f16: return "f16";
         case KVPrecision::fp8: return "fp8";
+        case KVPrecision::fp4_global: return "fp4-global";
         case KVPrecision::fp8_global: return "fp8-global";
     }
     std::abort();
@@ -1681,7 +1689,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     // Long prefill revisits a whole global K/V span. Migrate it in bulk before
     // the flash kernel so warps never have to fault it in one page at a time.
     if (g_kv_managed && !Ly.sliding && T > 8 && pos0 + T > 196608) {
-        const size_t bytes = (size_t)(pos0 + T) * KD * (Ly.kc8 ? 1 : 2);
+        const size_t bytes = (size_t)(pos0 + T) * kv_row_bytes(KD, Ly.sliding);
         CU(cudaMemPrefetchAsync(Ly.kc8 ? (void*)Ly.kc8 : (void*)Ly.kc, bytes, Ly.dev, g_s));
         CU(cudaMemPrefetchAsync(Ly.kc8 ? (void*)Ly.vc8 : (void*)Ly.vc, bytes, Ly.dev, g_s));
     }
@@ -3884,7 +3892,7 @@ int big_begin(const Model& M, Work& W, ExpertCache& EC, int n, int ctx_end, BigS
     const Config& c = M.c;
     // the attention's scratch for 256 queries against the whole context: few, large GEMMs (the default ~400 MB left
     // room for only ~20 queries a step at 100k tokens) - also lent for a short prompt at the end of a long context
-    const size_t lg_want = (g_flash && !fp8_kv(false) && c.D == 128) ? 0 : (size_t) c.H * 256 * (size_t) ctx_end;
+    const size_t lg_want = (g_flash && !byte_cache(false) && c.D == 128) ? 0 : (size_t) c.H * 256 * (size_t) ctx_end;
     const bool long_ctx = lg_want > W.lg_cap;
     if (n <= W.T_sup && !long_ctx) return W.T_sup;
     int p = -1;
@@ -4093,7 +4101,7 @@ void replace_expert_pools(Model& M, bool managed) {
     CU(cudaStreamSynchronize(g_cs));
     if (!managed) {
         // Give back the global pages first so regular cudaMalloc has room.
-        const size_t row_bytes = (size_t)M.c.KV * M.c.D * (fp8_kv(false) ? 1 : 2);
+        const size_t row_bytes = kv_row_bytes((size_t)M.c.KV * M.c.D, false);
         for (auto& v : M.V) {
             if (M.L[v.l].sliding) continue;
             const size_t bytes = (size_t)std::min(tier_depth, v.kv_cap) * row_bytes;
@@ -4150,7 +4158,7 @@ void place_decode(Model& M, int depth) {
     Work& W = dev_work(0);
     ExpertCache& ec = dev_cache(0);
     const int elements = M.c.KV * M.c.D;
-    const int token_bytes = elements * (fp8_kv(false) ? 1 : 2);
+    const int token_bytes = kv_row_bytes(elements, false);
     size_t live = 0;
     for (const auto& v : M.V) {
         if (!M.L[v.l].sliding) live += (size_t)2 * std::min(v.kv_cap, depth + kPlacementInterval) * token_bytes;
@@ -4375,7 +4383,10 @@ int main(int argc, char** argv) {
         if (kv == "f16" || kv == "fp16") g_kv_precision = KVPrecision::f16;
         else if (kv == "fp8" || kv == "e4m3") g_kv_precision = KVPrecision::fp8;
         else if (kv == "fp8-global") g_kv_precision = KVPrecision::fp8_global;
-        else die("unknown IK2_KV=" + kv + " (expected f16, fp8 or fp8-global)");
+#ifdef STRATA_USE_HIP
+        else if (kv == "fp4-global") g_kv_precision = KVPrecision::fp4_global;
+#endif
+        else die("unknown IK2_KV=" + kv + " (expected f16, fp8, fp8-global or gfx1100 fp4-global)");
     }
     if (getenv("IK2_TRACE") && *getenv("IK2_TRACE")) {
         g_trace = std::fopen(getenv("IK2_TRACE"), "wb");
@@ -4584,7 +4595,7 @@ int main(int argc, char** argv) {
         for (int l = 0; l < c.n_layer; ++l) {
             const size_t cap = c.sliding[l] ? (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : (size_t) ctx;
             if (!g_kv_managed || c.sliding[l])
-                kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (fp8_kv(c.sliding[l]) ? 1 : 2) * 2;
+                kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * kv_row_bytes(c.KV * c.D, c.sliding[l]) * 2;
         }
         kv_b *= (size_t)cache_slots;
         size_t fr0 = 0, tot0 = 0;
@@ -4815,7 +4826,9 @@ int main(int argc, char** argv) {
     // the visits of a token and their state (FP8 E4M3 or FP16 KV; sliding layers ring-buffered in both CLI and --serve)
     const bool paged_kv = getenv("IK2_PAGED_KV") && atoi(getenv("IK2_PAGED_KV"));
 #ifdef STRATA_USE_HIP
-    if (paged_kv && (!fp8_kv(false) || c.D != 128)) die("IK2_PAGED_KV requires global E4M3 KV with 128-wide heads");
+    if (g_kv_precision == KVPrecision::fp4_global && (paged_kv || c.D != 128))
+        die("fp4-global requires token-major KV and 128-wide heads");
+    if (paged_kv && (!byte_cache(false) || c.D != 128)) die("IK2_PAGED_KV requires global E4M3 KV with 128-wide heads");
 #else
     if (paged_kv) die("IK2_PAGED_KV requires the gfx1100 backend");
 #endif
@@ -4826,13 +4839,14 @@ int main(int argc, char** argv) {
         else if (v < c.core0 + c.n_pass * n_core) Vi.l = c.core0 + (v - c.core0) % n_core, Vi.pass = (v - c.core0) / n_core;
         else Vi.l = v - (c.n_pass - 1) * n_core;
         Layer& Ly = M.L[Vi.l];
+        Ly.fp4_kv = !Ly.sliding && g_kv_precision == KVPrecision::fp4_global;
         Ly.paged_kv = paged_kv && !Ly.sliding;
         use_dev(Ly.dev);
         Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
-        if (fp8_kv(Ly.sliding)) {
+        if (byte_cache(Ly.sliding)) {
             const size_t slots = Ly.paged_kv ? ((size_t)Vi.kv_cap + 15) / 16 * 16 : Vi.kv_cap;
-            Vi.kc8 = kv_alloc<uint8_t>(slots * KD, Ly.sliding);
-            Vi.vc8 = kv_alloc<uint8_t>(slots * KD, Ly.sliding);
+            Vi.kc8 = kv_alloc<uint8_t>(slots * kv_row_bytes(KD, Ly.sliding), Ly.sliding);
+            Vi.vc8 = kv_alloc<uint8_t>(slots * kv_row_bytes(KD, Ly.sliding), Ly.sliding);
         } else {
             Vi.kc = kv_alloc<uint16_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
             Vi.vc = kv_alloc<uint16_t>((size_t)Vi.kv_cap * KD, Ly.sliding);
@@ -4856,7 +4870,7 @@ int main(int argc, char** argv) {
     if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;
     {
         size_t kv_bytes = 0;
-        for (const auto& Vi : M.V) kv_bytes += (size_t) Vi.kv_cap * KD * (Vi.kc8 ? 1 : 2) * 2;
+        for (const auto& Vi : M.V) kv_bytes += (size_t) Vi.kv_cap * kv_row_bytes(KD, M.L[Vi.l].sliding) * 2;
         std::printf("kv cache: %s%s (%.2f GiB across %d layer%s)\n", kv_format_name(),
                     paged_kv ? ", 16-token global pages" : "",
                     kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
@@ -5113,7 +5127,7 @@ int main(int argc, char** argv) {
     if (cache_slots > 1) {
         for (const Visit& v : M.V) {
             const size_t page = M.L[v.l].paged_kv ? 16 : 1;
-            const size_t row = KD * (v.kc8 ? 1 : sizeof(uint16_t));
+            const size_t row = kv_row_bytes(KD, M.L[v.l].sliding);
             slot_storage.add(v.kc8 ? (void*)v.kc8 : (void*)v.kc, v.kv_cap, row, page);
             slot_storage.add(v.vc8 ? (void*)v.vc8 : (void*)v.vc, v.kv_cap, row, page);
             for (auto* h : {v.h_k, v.h_v}) slot_storage.add(h, 1, 3 * KD * sizeof(float));
@@ -5173,7 +5187,7 @@ int main(int argc, char** argv) {
         const size_t rows = g_fast_want ? std::min<size_t>(Tm, Work::kRelbRows) : Work::kRelbRows;
         W.relb = work_alloc<float>(rows * c.H * W.relb_ext);
     }
-    if (fp8_kv(false) && !(flash_only && g_fast_want)) {
+    if (byte_cache(false) && !(flash_only && g_fast_want)) {
         W.kv_tmp_cap = std::min(ctx, 32768);
         W.kv_k16 = work_alloc<uint16_t>((size_t)W.kv_tmp_cap * KD);
         W.kv_v16 = work_alloc<uint16_t>((size_t)W.kv_tmp_cap * KD);
@@ -5455,7 +5469,7 @@ int main(int argc, char** argv) {
             std::vector<float*> h;   // [layer * 4 + conv]
             std::vector<std::vector<uint8_t>> kv_k, kv_v;
         };
-        const size_t kv_elem_b = fp8_kv(true) ? 1 : 2;
+        const size_t kv_elem_b = byte_cache(true) ? 1 : 2;
         struct Conversation {
             std::vector<int> hist;
             std::vector<uint64_t> hist_sig;

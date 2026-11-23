@@ -21,7 +21,7 @@ __device__ __forceinline__ AttnHalf16 cache_fragment(const KV* ptr) {
     return out;
 }
 
-template <bool Prefill, bool Block = false, int Waves = 1, bool StageKV = (Waves > 1), bool Paged = false, class KV>
+template <bool Prefill, bool Block = false, int Waves = 1, bool StageKV = (Waves > 1), bool Paged = false, bool Packed = false, class KV>
 __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc, const KV* vc, int ring,
                                int H, int Hkv, const int* pos, int qpos, float qscale, const float* proj,
                                int dr, int extent, int window, float* scratch, int Tq, int q_ld, const float* bias, int r_ld = 0) {
@@ -54,6 +54,20 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
         else query_reg[d] = fragment;
     }
     if constexpr (Waves == 1) __syncthreads();
+    auto fragment = [](const KV* cache, size_t offset) {
+        if constexpr (Packed) {
+            const auto& block = reinterpret_cast<const Fp4KvBlock*>(cache)[offset / 32];
+            const float scale = h2f(block.scale);
+            AttnHalf16 result;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const unsigned pair = block.pairs[(offset % 32) / 2 + j];
+                result[2*j] = (_Float16)(fp4_value(pair & 15) * scale);
+                result[2*j+1] = (_Float16)(fp4_value(pair >> 4) * scale);
+            }
+            return result;
+        } else return cache_fragment(cache + offset);
+    };
     float m = -INFINITY, sum = 0;
     AttnFloat8 out[8] = {};
     for (int key = (Paged ? start / 16 * 16 : start) + 16 * split; key < end; key += 16 * splits) {
@@ -69,10 +83,10 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
                 const size_t src = Paged ? page + t * 128 + d * 16 :
                     (size_t)(ring ? kp % ring : kp) * kd + kv_head * 128 + d * 16;
                 AttnHalf16 k = {};
-                if (kp < end) k = cache_fragment(kc + src);
+                if (kp < end) k = fragment(kc, src);
                 keys[t][d] = k;
                 if constexpr (Paged) {
-                    AttnHalf16 v = cache_fragment(vc + page + f * 16);
+                    AttnHalf16 v = fragment(vc, page + f * 16);
                     if (key + 16 > end) {
 #pragma unroll
                         for (int i = 0; i < 16; ++i) if (key + i >= end) v[i] = 0;
@@ -80,7 +94,7 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
                     columns[f] = v;
                 } else {
                     AttnHalf16 v = {};
-                    if (kp < end) v = cache_fragment(vc + src);
+                    if (kp < end) v = fragment(vc, src);
 #pragma unroll
                     for (int i = 0; i < 16; ++i)
                         reinterpret_cast<_Float16*>(columns)[(d * 16 + i) * 16 + t] = v[i];
@@ -92,7 +106,7 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
         for (int d = 0; d < 8; ++d) {
             if constexpr (!StageKV) {
                 AttnHalf16 k = {};
-                if (key_l < end) k = cache_fragment(kc + (Paged ? page + l * 128 : off) + d * 16);
+                if (key_l < end) k = fragment(kc, (Paged ? page + l * 128 : off) + d * 16);
                 dot = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(k, Waves > 1 ? query_reg[d] : query[l][d], dot);
             } else {
                 dot = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(keys[l][d], Waves > 1 ? query_reg[d] : query[l][d], dot);
@@ -102,7 +116,7 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
 #pragma unroll
             for (int d = hi; d < 8; d += 2) {
                 AttnHalf16 v = {};
-                if (key_l < end) v = cache_fragment(vc + off + d * 16);
+                if (key_l < end) v = fragment(vc, off + d * 16);
                 __builtin_memcpy(&values[l][d * 16], &v, sizeof(v));
             }
             __syncthreads();
@@ -157,7 +171,7 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
         for (int d = 0; d < 8; ++d) {
             AttnHalf16 value;
             if constexpr (Paged && !StageKV) {
-                value = cache_fragment(vc + page + (16 * d + l) * 16);
+                value = fragment(vc, page + (16 * d + l) * 16);
                 if (key + 16 > end) {
 #pragma unroll
                     for (int t = 0; t < 16; ++t) if (key + t >= end) value[t] = 0;
