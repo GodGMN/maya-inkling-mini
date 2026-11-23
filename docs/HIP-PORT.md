@@ -184,6 +184,17 @@ python3 tests/ik2_tool_conversations.py "$ROUTER" --model "$MODEL_ID"
 
 With the final physical layer replaced, the native adapter and the independent weight edit agreed on the top token at all 12 prompt positions and three teacher-forced decode steps. The largest per-position logit RMS errors were 0.000986 and 0.0000651, respectively. Disabling the adapter increased RMS error to at least 0.1445. An earlier version of the test reshaped three decode rows as four. An early-layer version agreed on every top token but exceeded its logit tolerance after downstream layers. The final-layer fixture isolates the projection, and `--adapter` checks the actual adapter against CPU matrix products at every adapted visit. For a rank-16 adapter on 20 physical layers, the test compared 128 output channels on four input tokens across all 44 adapted visits. The worst relative L2 error was 0.0000322 against the full CPU projection and 0.000638 relative to the adapter contribution alone.
 
+With the same 393,216-token FP8 preset on both services, the base and an attention-output rank-16 adapter each answered GSM8K test rows 128 through 135 correctly (8/8). Their median native decode rates on those requests were 120.15 and 70.50 tok/s. The two additional FP32 products run on every adapted layer visit. This sample measured arithmetic and decode speed. It was too small to establish general capability parity.
+
+On Prometheus, the comparison driver and per-request timings are in `~/ai/build/maya-ik2-hip/unbound-test/`. With the respective model active, run:
+
+```sh
+python3 paired.py 8085 inkling-2-mini
+python3 paired.py 8086 "$MODEL_ID"
+```
+
+Through the LAN router, all four streaming and non-streaming OpenAI and Anthropic tool conversations completed both calls and used both results. Pi's read-only agent fetched a random code from a local fixture and returned it exactly. A two-color image request also passed. The Responses API continued a stored response with `previous_response_id`. A separate GET by response ID returned HTTP 502 on the shared router and 200 at the service port on the host.
+
 ### Named FP4 profiles
 
 The packaged host-staged vision build includes two explicit `MAYA_IK2_PRESET` values. Each preset sets the native slot count, per-request context budget and 512-token prefill chunk together. The native `--max-context` argument is the sum of all slots. The HTTP `/health` field `max_context` is the limit on one conversation.
