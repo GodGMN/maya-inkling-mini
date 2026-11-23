@@ -15,7 +15,8 @@
 
 namespace ik2::k {
 
-// A positive capacity wraps token-major rows. Global FP8 pages store sixteen tokens per KV head.
+// A positive capacity wraps token-major rows. Global E4M3 pages hold sixteen tokens per KV head.
+// Packed global E2M1 uses token-major rows of Fp4KvBlock.
 struct Fp8KvLayout {
     constexpr Fp8KvLayout(int ring_capacity) : ring_capacity(ring_capacity), paged(false), fp4(false) {}
     const int ring_capacity;
@@ -28,7 +29,6 @@ private:
     constexpr Fp8KvLayout(bool pages, bool packed) : ring_capacity(0), paged(pages), fp4(packed) {}
 #endif
 };
-
 
 // E2M1 cache block. The FP16 scale applies to 32 consecutive channels within a KV head.
 struct Fp4KvBlock {

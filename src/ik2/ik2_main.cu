@@ -259,7 +259,7 @@ struct Layer {
     std::vector<const uint8_t*> tab_h;             // (tab_blob on the host: a short prompt's groups)
     // the state: of the visit being run (bind_visit)
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
-    uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
+    uint8_t *kc8 = nullptr, *vc8 = nullptr;        // E4M3 or packed E2M1 storage. kv_row_bytes() gives the bytes per token.
     int kv_cap = 0;
     bool paged_kv = false;
     bool fp4_kv = false;
@@ -481,7 +481,8 @@ bool g_dense_q8 = false;
 enum class KVPrecision { f16, fp8, fp8_global, fp4_global };
 KVPrecision g_kv_precision = KVPrecision::f16;
 bool byte_cache(bool sliding) {
-    return g_kv_precision == KVPrecision::fp8 || g_kv_precision == KVPrecision::fp4_global || (!sliding && g_kv_precision == KVPrecision::fp8_global);
+    return g_kv_precision == KVPrecision::fp8 || g_kv_precision == KVPrecision::fp4_global ||
+           (!sliding && g_kv_precision == KVPrecision::fp8_global);
 }
 size_t kv_row_bytes(size_t elements, bool sliding) {
     if (!sliding && g_kv_precision == KVPrecision::fp4_global)
@@ -4823,7 +4824,7 @@ int main(int argc, char** argv) {
             if (l == c.core1 - 1) M.lp_query_all = dev_f32(lp_all);
         }
     }
-    // the visits of a token and their state (FP8 E4M3 or FP16 KV; sliding layers ring-buffered in both CLI and --serve)
+    // Each visit owns its KV. Sliding layers use ring buffers in both CLI and server mode.
     const bool paged_kv = getenv("IK2_PAGED_KV") && atoi(getenv("IK2_PAGED_KV"));
 #ifdef STRATA_USE_HIP
     if (g_kv_precision == KVPrecision::fp4_global && (paged_kv || c.D != 128))

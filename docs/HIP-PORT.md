@@ -141,6 +141,29 @@ RUN pip install --no-cache-dir numpy==2.2.6
 DOCKER
 ```
 
+### Named FP4 profiles
+
+The packaged host-staged vision build includes two explicit `MAYA_IK2_PRESET` values. Each preset sets the native slot count, per-request context budget and 512-token prefill chunk together. The native `--max-context` argument is the sum of all slots. The HTTP `/health` field `max_context` is the limit on one conversation.
+
+| Preset | Slots | Context per slot | Aggregate positions | Allocated per cache |
+|---|---:|---:|---:|---:|
+| `ik2-mini-gfx1100-fp4-2.json` | 2 | 360,448 | 720,896 | 3,291.7 MiB |
+| `ik2-mini-gfx1100-fp4-4.json` | 4 | 176,128 | 704,512 | 1,671.7 MiB |
+
+At four slots, per-slot capacities 196,608, 192,512, 188,416, 184,320 and 180,224 all failed the resident-expert requirement. At 176,128 the server started and read three 1480×900 screenshots correctly in 1.385, 0.888 and 0.749 seconds. The minimum free VRAM sampled every 100 ms during those requests was 257.7 MiB. Both profiles use a shared 4 MiB slot-exchange buffer.
+
+```sh
+# From ~/ai/build/maya-ik2-hip on Prometheus
+sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer \
+    hyperion/maya-ik2:gfx1100-service-r4 vision-cpu/bin/maya-vision \
+    vision-resident/maya-vision vision-hip/bin/maya-vision
+docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 --entrypoint python3 \
+    hyperion/maya-ik2:gfx1100-service-r4 -m unittest serve.test_inkling2_frontend \
+    serve.test_responses serve.test_responses_tools serve.test_responses_schema
+```
+
+The image's engine SHA256 was `f08cbeb153f26ea7e1fcf219a1f61fdca50aba7c737b19541d77dadbac822454`, matching the GPU tests. The packaged Python suites ran 74 tests with three skips and zero failures.
+
 ### Teacher-forced logits on the stock IQ4_NL weights
 
 The CPU oracle used `ref/inkling2.py` on the same GGUF and the same 256-token passage. Each Radeon run used the environment in `ik2-mini-gfx1100.json` with the indicated override. The decode test feeds 32 known continuations after a 224-token prompt. Its 32 predictions cover the tail of the prefill passage, so the two rows are overlapping samples.
