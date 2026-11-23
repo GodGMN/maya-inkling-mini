@@ -203,6 +203,18 @@ python3 tests/ik2_compare_quality.py fp8-long-code-score.jsonl fp4-long-code-sco
 
 The first FP4 direct-answer archive run predates request hashing. Its generator used the same message bodies, output limits and JSON encoding, and all paired input token counts matched. Later runs report how many hashes matched.
 
+### Growing stored Responses conversations
+
+`tests/ik2_responses_growth.py` sends only each new batch and the previous response ID. It repeats the same instructions on every request. Each chat receives a lot-to-depot mapping and, in a later batch, a depot-to-number mapping. The final question requires both. It then tests normal-temperature sampling, a same-effort screenshot and a rewritten summary. The cold control explicitly evicts all native slots and replays the complete input, including the model's earlier reasoning. Short runs can repeat each cold control to check reproducibility.
+
+```sh
+python3 tests/ik2_responses_growth.py "$URL" --batches 512,1024,1536 --serial --repeat-cold
+python3 tests/ik2_responses_growth.py "$URL" --batches 20000,80000,150000,95000 --serial
+# Omit --serial to interleave both stored conversations on the two-slot profile.
+```
+
+On the short FP8 control both final numbers, both screenshots and both post-compaction numbers were correct. The visible answers matched their cold replays. For the 3,490-token lookup, warm and cold generation took 1,661 and 480 tokens. At 3,693 tokens they took 194 and 199. Repeating each cold input after eviction reproduced its entire reasoning text and output count exactly. A 512-token output cap in the first pilot exhausted the reasoning budget before the first number. The recorded comparison uses 4,096. This difference in reasoning between incremental and cold execution already occurs with the stock FP8 cache.
+
 ### Teacher-forced logits on the stock IQ4_NL weights
 
 The CPU oracle used `ref/inkling2.py` on the same GGUF and the same 256-token passage. Each Radeon run used the environment in `ik2-mini-gfx1100.json` with the indicated override. The decode test feeds 32 known continuations after a 224-token prompt. Its 32 predictions cover the tail of the prefill passage, so the two rows are overlapping samples.
