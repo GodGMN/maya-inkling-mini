@@ -365,6 +365,8 @@ Two additional clients submitted the full archives at the same time on the fixed
 
 The 8,192-output-token FP8 control exposed a separate reporting error. It read the full 344,768-token prompt from scratch, then reported 344,395 cache hits. On the final native stop token the client-facing generator closed before its retry statistics were merged. The last retry's cache count and prefill time replaced the original read. Maya now saves each native completion record while its generator drains and calculates usage once for the whole HTTP request. A scripted cold request previously reported 47 cache hits and a 1 ms prefill. The corrected response reports zero hits and the first native call's 12,345 ms fixture time, and sums all four native decode times. The combined local regression run covered 386 tests with one skip. The packaged request and SDK suite covered 145 tests with three optional SDK skips.
 
+The corrected FP8 image replayed the same cold request on Prometheus. It reported 344,768 new tokens, zero cached, 354.784 s of prefill and 7,191 generated tokens. At the higher budget it returned four lines of verse with a 0.2115 official match ratio. FP4 exhausted all 8,192 output tokens without a final answer. Neither recovered the requested poem. Run `python3 long-budget.py` from the archived evaluation drivers after starting each matched profile. The measured responses are `fp8-guard-deep-8192.jsonl` and `fp4-guard-deep-8192.jsonl`.
+
 ```sh
 python -m unittest serve.test_loop_guard serve.test_inkling2_frontend \
     serve.test_responses serve.test_responses_tools serve.test_responses_schema
@@ -704,7 +706,7 @@ curl -NsS http://127.0.0.1:18085/v1/chat/completions -H 'Content-Type: applicati
 
 ## Run the packaged image on Prometheus
 
-The image includes the gfx1100 engine, the tokenizer, the Python server and the CPU and HIP image encoders. The default HIP encoder keeps the original FP16 image weights in host RAM. The service reserves 393,216 context positions in total and defaults to medium reasoning effort. Mount the directory containing `Inkling-2-Mini-IQ4_NL.gguf` and `mmproj-F16.gguf`.
+The image includes the gfx1100 engine, tokenizer, Python server and CPU and HIP image encoders. The default configuration reserves 393,216 positions for one FP8 conversation and uses medium reasoning effort. The HIP encoder keeps its original FP16 projector weights in host RAM. Mount the directory containing `Inkling-2-Mini-IQ4_NL.gguf` and `mmproj-F16.gguf`.
 
 Run from the Prometheus build directory to package the existing binaries. Buildx uses at most four CPUs and 6 GiB of RAM.
 
@@ -728,7 +730,9 @@ docker compose up -d --no-deps --pull never llama
 curl -fsS http://127.0.0.1:8085/health
 ```
 
-For multiple serial conversations set `IK2_CACHE_SLOTS=2`, `3` or `4` in the Compose project's `.env` before recreating the container. The total context is divided evenly. Use the default of one slot for a conversation that grows to 300K. The default uses 1,024-token prefill chunks with one or two slots and 512 with three or four. To select CPU vision, set `MAYA_IK2_PRESET=ik2-mini-gfx1100.json`. Use `ik2-mini-gfx1100-text.json` for text only.
+Choose the cache in the Compose project's `.env`, then recreate the container. With the default FP8 preset, `IK2_CACHE_SLOTS=2` gives two 196,608-token conversations. Three or four slots divide the same 393,216 positions evenly. The packaged FP4 presets give each conversation more room. Set `MAYA_IK2_PRESET=ik2-mini-gfx1100-fp4-2.json` for two 360,448-token conversations or `MAYA_IK2_PRESET=ik2-mini-gfx1100-fp4-4.json` for four at 176,128 each. The filenames set the slot count too. Changing profiles discards the previous caches. [Measured capacities and profile selection](#named-fp4-profiles)
+
+The FP8 preset uses 1,024-token prefill chunks with one or two slots and 512 with three or four. Both FP4 presets use 512. To select CPU vision, set `MAYA_IK2_PRESET=ik2-mini-gfx1100.json`. Use `ik2-mini-gfx1100-text.json` for text only.
 
 ## CUDA and HIP differences in the initial scalar port
 
