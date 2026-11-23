@@ -44,6 +44,15 @@ def raw(f: GGUFFile, base: pathlib.Path, t) -> np.ndarray:
     return np.memmap(base, "u1", "r", f.data_start + t.offset, (n // vals * size,))
 
 
+def raw_any(f: GGUFFile, base: pathlib.Path, t) -> np.ndarray:
+    """A tensor's bytes whatever its type (sized from the next tensor's offset or the file's end)."""
+    offs = sorted(x.offset for x in f.tensors)
+    i = offs.index(t.offset)
+    end = offs[i + 1] if i + 1 < len(offs) else os.path.getsize(base) - f.data_start
+    n = t.expected_bytes() or end - t.offset
+    return np.memmap(base, "u1", "r", f.data_start + t.offset, (n,))
+
+
 def dequant(buf: np.ndarray, ty: int, n: int) -> np.ndarray:
     if ty == F32:
         return np.frombuffer(buf.tobytes(), "<f4", n).copy()
@@ -114,6 +123,42 @@ def write_gguf(path: pathlib.Path, tensors: list, kv: bytes = b"", n_kv: int = 0
     tmp.rename(path)
 
 
+def kv_block(path: pathlib.Path) -> tuple[bytes, int, int]:
+    """The base file's metadata as raw bytes (copied verbatim), its count, and general.alignment."""
+    sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    with open(path, "rb") as fh:
+        head = fh.read(1 << 26)
+    magic, ver, n_t, n_kv = struct.unpack_from("<4sIQQ", head, 0)
+    assert magic == b"GGUF" and ver == 3
+    pos, align = 24, 32
+
+    def string(p):
+        n = struct.unpack_from("<Q", head, p)[0]
+        return head[p + 8:p + 8 + n].decode("utf-8", "replace"), p + 8 + n
+
+    def value(p, ty):
+        if ty == 8:
+            return string(p)[1]
+        if ty == 9:
+            sub, n = struct.unpack_from("<IQ", head, p)
+            p += 12
+            if sub in sizes:
+                return p + n * sizes[sub]
+            for _ in range(n):
+                p = value(p, sub)
+            return p
+        return p + sizes[ty]
+
+    for _ in range(n_kv):
+        key, pos = string(pos)
+        ty = struct.unpack_from("<I", head, pos)[0]
+        pos += 4
+        if key == "general.alignment":
+            align = struct.unpack_from("<I", head, pos)[0]
+        pos = value(pos, ty)
+    return head[24:pos], n_kv, align
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("base", type=pathlib.Path)
@@ -123,10 +168,8 @@ def main() -> int:
     ap.add_argument("--writers", default="attn,ffn")
     ap.add_argument("--mode", choices=("conv", "r"), default="conv")
     ap.add_argument("--scale", type=float, default=1.0)
-    ap.add_argument("--full", action="store_true", help="not supported yet: the override shard only")
+    ap.add_argument("--full", action="store_true", help="a whole GGUF (OUTDIR/model.gguf) instead of an override shard")
     a = ap.parse_args()
-    if a.full:
-        raise SystemExit("--full: not written yet; load the override shard pair")
     f = GGUFFile(a.base)
     arch = f.metadata.get("general.architecture", "")
     if arch != "inkling2_loop" or "blk.0.attn_post_conv.weight" not in {t.name for t in f.tensors}:
@@ -166,6 +209,13 @@ def main() -> int:
             out.append((t.name, list(t.shape), Q8_0, data))
             print(f"{t.name}: {t.type_name} -> Q8_0, basis {U.shape[0]}, component left after Q8 {left:.4f}", flush=True)
     a.outdir.mkdir(parents=True, exist_ok=True)
+    if a.full:   # every tensor in the base's order, the edited ones replaced; the metadata copied verbatim
+        kv, n_kv, align = kv_block(a.base)
+        edited = {x[0]: x for x in out}
+        whole = [edited.get(t.name) or (t.name, list(t.shape), t.type_id, raw_any(f, a.base, t)) for t in f.tensors]
+        write_gguf(a.outdir / "model.gguf", whole, kv, n_kv, align)
+        print("wrote", a.outdir / "model.gguf")
+        return 0
     write_gguf(a.outdir / "weights-00002-of-00002.gguf", out)
     first = a.outdir / "weights-00001-of-00002.gguf"
     if first.is_symlink() or first.exists():
