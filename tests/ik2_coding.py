@@ -3,6 +3,7 @@ import argparse
 import json
 import random
 import re
+import secrets
 import subprocess
 import time
 from pathlib import Path
@@ -20,7 +21,8 @@ def score(row, answer, image):
     text = answer.strip()
     blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", text, re.DOTALL)
     program = blocks[-1] if blocks else text
-    script = program + "\n" + row["test"] + "\ncheck(" + row["entry_point"] + ")\n"
+    marker = secrets.token_hex(16)
+    script = program + "\n" + row["test"] + "\ncheck(" + row["entry_point"] + ")\n" + f"print({marker!r})\n"
     command = ["docker", "run", "--rm", "-i", "--network=none", "--read-only", "--cap-drop=ALL",
                "--security-opt=no-new-privileges", "--memory=256m", "--memory-swap=256m",
                "--pids-limit=32", "--cpus=1", "--user=65534:65534", "-e", "OPENBLAS_NUM_THREADS=1",
@@ -28,7 +30,9 @@ def score(row, answer, image):
     result = subprocess.run(command, input=script, text=True, capture_output=True, timeout=45)
     if result.returncode in (125, 126, 127) or "ModuleNotFoundError: No module named 'numpy'" in result.stderr:
         raise RuntimeError(result.stderr[-1000:])
-    return dict(passed=result.returncode == 0, returncode=result.returncode, detail=result.stderr[-400:])
+    completed = result.stdout.splitlines()[-1:] == [marker]
+    detail = "exited before completing tests" if result.returncode == 0 and not completed else result.stderr[-400:]
+    return dict(passed=result.returncode == 0 and completed, returncode=result.returncode, detail=detail)
 
 
 def main():

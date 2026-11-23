@@ -154,6 +154,10 @@ python3 tests/ik2_slot_retrieval.py --url "$URL" --slots 2 --depth 359424 --cold
 
 The MRCR files correspond to default train rows 1850 and 1870. The FP4 match ratios were 0.0180 and 0.0558. The model reproduced the eighth poem and the eighth diary entry in the respective histories. The requests asked for the seventh and fourth. Cold prefill took 370.0 seconds for the first history. These are per-example scores on selected depths, and should only be compared with replays of those same rows.
 
+Two independent parcel registers each occupied 359,254 input tokens before the first answer. FP4 retrieved all six randomly chosen verification numbers at 5%, 50% and 95% of the respective archive text. Alternating the two chats reused 359,256 and 359,279 tokens on the text follow-ups. Each read 21 new tokens in 0.431–0.716 seconds. The final image questions each reused 359,302 tokens and processed 62 more. Both colors were correct, in 0.518 and 0.536 seconds. The highest device-wide memory sample during these turns was 23.613 GiB, leaving 380.6 MiB on the card.
+
+On the direct-answer MRCR follow-ups FP4 scored 23/32 on MMLU and 1/4 on the short coding set embedded in those histories. Two multiple-choice answers and one coding response reached their output caps. The coding failures were a missing `typing.List` import, an unfinished answer, and a time-out in the supplied tests. The separate 16-task short coding run used medium reasoning. A comparison of short and long coding scores must account for both the archive and the reasoning setting.
+
 ## Separate conversation caches
 
 Set `IK2_CACHE_SLOTS` in Compose or pass `--cache-slots N` to the native server. One request runs at a time. Each slot retains its token and image history, KV, convolution state and prefix checkpoints. The engine selects the longest prefix it can restore. A new conversation uses an empty slot first, then the least recently used one. A restart clears all slots. With a single slot the engine allocates no exchange buffer.
