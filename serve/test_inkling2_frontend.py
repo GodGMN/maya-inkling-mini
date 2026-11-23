@@ -206,6 +206,30 @@ class Serving(unittest.TestCase):
         self.assertTrue(tok.decode(eng.prompts[-1]).endswith(END + MODEL + TEXT))
         self.assertEqual(svc.loop_guard_counts["thinking_closed"], 1)
 
+    def test_guard_retries_report_the_first_native_prefill(self):
+        block = "Compare calendar invitations in both time zones. " * 5
+        svc, eng, _ = service(MODEL + THINK + block, block, block, "July." + END)
+        generate, reports = eng.generate, []
+
+        def timed(ids, max_new, sampling, cancel, embeddings=None):
+            generated = 0
+            try:
+                for token in generate(ids, max_new, sampling, cancel, embeddings):
+                    generated += 1
+                    yield token
+            finally:
+                eng.last = dict(prompt_tokens=len(ids), generated=generated, decode_ms=2 * generated,
+                                reused=len(ids) - 2 if reports else 0, prompt_ms=1 if reports else 12345)
+                reports.append(eng.last)
+
+        eng.generate = timed
+        got = answer(svc, {"messages": ASK})
+        self.assertEqual(got["content"], "July.")
+        self.assertEqual(len(reports), 4)
+        timings = got["done"]["timings"]
+        self.assertEqual((timings["cache_n"], timings["prompt_ms"]), (0, 12345))
+        self.assertEqual(timings["predicted_ms"], sum(r["decode_ms"] for r in reports))
+
     def test_repeated_typed_calls_keep_all_arguments(self):
         args = {"city": "San Cristobal de La Laguna", "days": 2}
         svc, eng, _ = service(call("get_weather", args) * 3)

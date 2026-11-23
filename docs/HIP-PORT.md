@@ -357,15 +357,18 @@ The Inkling guard now follows those segment tokens, including a tool header alre
 
 Three scripted requests failed before the change. They cover a reasoning passage that naturally resolves, a persistent reasoning loop followed by a final answer, and repeated legitimate tool calls with identical JSON. A fourth checks that visible answer loops still stop. The following command passed all 144 tests on the development host. The packaged image ran the same suite with three optional SDK skips.
 
-With both fixes in the image, all 20 follow-ups on the 344,768- and 348,465-token archives retained their base prefix. The 16 deep MMLU answers were correct. HumanEval/130 repeated a 153-token block four times during reasoning. After two retries the server closed thinking at token 2,775. The model returned a Python function. Its memoized implementation exhausted the 256 MiB CPU grader, giving 3/4 deep coding passes. The first FP8 run passed all four.
+With both fixes in the image, all 20 follow-ups on the 344,768- and 348,465-token archives retained their base prefix in both formats. FP4 scored 16/16 on deep MMLU and FP8 scored 15/16. Both produced final letters on all 16 questions. FP8 missed college mathematics item 1. On HumanEval/130, FP4 repeated a 153-token block four times during reasoning. After two retries the server closed thinking at token 2,775. The model returned a Python function. Its memoized implementation exhausted the 256 MiB CPU grader, giving 3/4 deep coding passes. FP8 passed all four on both server versions. All 22 request-body hashes matched across the corrected runs.
 
 The published test calls the function repeatedly with inputs around one million. The FP4-generated inner function captures its own memo dictionary and references itself. The same unmodified test also triggered a cgroup OOM kill at 512 MiB and 1 GiB. As a diagnostic, forcing Python to collect cycles **between** test inputs let the function pass every assertion at a 192.6 MiB peak. FP8's iterative function passed the original test at a 97.5 MiB peak in the 256 MiB grader. The diagnostic does not count toward the score.
 
 Two additional clients submitted the full archives at the same time on the fixed FP4 server. They returned `ALDER-17` and `ASPEN-29` after 4.876 and 10.271 seconds, with 344,768 and 348,465 cached input tokens. The exact requests and diagnostic commands are in `fp4-overnight/results/` on Prometheus.
 
+The 8,192-output-token FP8 control exposed a separate reporting error. It read the full 344,768-token prompt from scratch, then reported 344,395 cache hits. On the final native stop token the client-facing generator closed before its retry statistics were merged. The last retry's cache count and prefill time replaced the original read. Maya now saves each native completion record while its generator drains and calculates usage once for the whole HTTP request. A scripted cold request previously reported 47 cache hits and a 1 ms prefill. The corrected response reports zero hits and the first native call's 12,345 ms fixture time, and sums all four native decode times. The combined local regression run covered 386 tests with one skip. The packaged request and SDK suite covered 145 tests with three optional SDK skips.
+
 ```sh
 python -m unittest serve.test_loop_guard serve.test_inkling2_frontend \
     serve.test_responses serve.test_responses_tools serve.test_responses_schema
+python -m unittest serve.test_inkling2_frontend.Serving.test_guard_retries_report_the_first_native_prefill
 python3 tests/ik2_coding.py --data humanevalplus.jsonl --score fp4-guard-deep.jsonl
 python3 grade-tri-memory.py
 python3 grade-tri-memory.py --collect

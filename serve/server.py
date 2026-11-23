@@ -4356,7 +4356,7 @@ class Service:
             c[{loop_guard.PENALTY: "penalised", loop_guard.CLOSE_THINKING: "thinking_closed",
                loop_guard.STOP: "stopped"}[act.kind]] += 1
 
-    def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat, guard=None) -> Iterator[int | None]:
+    def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat, calls, guard=None) -> Iterator[int | None]:
         """engine.generate(), in fair slices (MAYA_FAIR_SLICE_S): once this answer has been decoding that long and
         another request waits for the engine, the engine stops here, the FIFO goes to the next request and this one
         queues behind it.  Back in turn, it goes on with prompt + what it already wrote as the new prompt: the
@@ -4373,7 +4373,6 @@ class Service:
         of its own ends and the request's own sampling follows; or the answer ends there (LOOP_STOP).  Until then the
         engine calls and their sampling are the ones without it."""
         produced, cur, left, smp = [], list(ids), max_new, sampling
-        segments = []                                   # each slice's DONE (engine.last), summed at the end
         sent = 0                                        # produced[:sent] went to the caller (the guard holds the rest)
         # the thinking budget closed at a sentence's or line's end (THINK_GRACE, #613): past `soft` tokens of
         # reasoning, the first token that ends one is followed by the end of the thinking - this call stops there and
@@ -4439,7 +4438,7 @@ class Service:
                     self.fifo.unclaim_yield()           # (it ends, or goes on some other way: no place given up)
                 fresh = getattr(self.engine, "last", None)
                 if fresh is not None and fresh is not last0:
-                    segments.append(fresh)
+                    calls.append(fresh)
             if closed:                                  # the budget, at a sentence's or line's end: the thinking ends
                 later = len(produced) - soft
                 canon = self._closed_as_rendered(ids, produced, think_end)
@@ -4515,11 +4514,6 @@ class Service:
                 self.engine.restart()
             cur, left = list(ids) + produced, max_new - len(produced)
             smp = self._resumed_sampling(sampling, produced)   # (the thinking budget counts from where it got to)
-        if len(segments) > 1:                           # the request's figures, over all its slices
-            self.engine.last = merge_calls(segments)
-        lastd = getattr(self.engine, "last", None)
-        if isinstance(lastd, dict) and (lastd.get("prompt_tokens") or 0) > len(ids):
-            self.engine.last = own_prompt_figures(lastd, len(ids))   # (the first call's DONE was not seen)
         if guard is not None and not cancel.is_set():   # the end: what the guard still held back
             while sent < len(produced):
                 sent += 1
@@ -4599,10 +4593,9 @@ class Service:
                     lp_wait.clear()
             return evs
         emb = getattr(self.embeddings, "path", None)
-        # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
-        # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
-        engine_last0 = getattr(self.engine, "last", None)
-        calls: list[dict] = []                          # each finished engine call's DONE (segments()), merged at the end
+        # Save each native DONE while draining its generator. A stop token can close the outer
+        # response before a slice yields again, and another queued request has its own counters.
+        calls: list[dict] = []
         counted, my_started, my_first, queued = False, time.time(), None, False
         stat = RequestStat()                            # this request's live figures
         stat.spec_off = request_spec_off(sampling)
@@ -4639,7 +4632,6 @@ class Service:
                     counted = hold[1] = True
                     my_started = self.status["started"]
                     self.last_request_at = time.time()
-                before = getattr(self.engine, "last", None)
                 last_print = time.time()
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
@@ -4710,7 +4702,8 @@ class Service:
                                 guard = loop_guard.ToolSafeGuard(self.think_end_id, parser.state == "reasoning",
                                                                  piece=self._guard_piece())
                         guards[:] = [guard] if guard is not None else []
-                        sliced, got = self._sliced(prompt, left, sampling, cancel, emb, hold, stat, guard), 0
+                        first_call = len(calls)
+                        sliced, got = self._sliced(prompt, left, sampling, cancel, emb, hold, stat, calls, guard), 0
                         try:
                             for t in sliced:
                                 got += t is not None
@@ -4719,6 +4712,7 @@ class Service:
                         except ValueError as e:
                             if again or got or NONFINITE not in str(e):
                                 raise
+                            del calls[first_call:]
                             print(f"[maya] the engine's numbers went non-finite before the answer started ({e}): "
                                   "running the request again from token 0", flush=True)
                         finally:
@@ -4730,11 +4724,7 @@ class Service:
                     engine rejected prompt + max_new + CTX_SLACK > context)."""
                     while True:
                         room = self.context_room(len(seg["prompt"]))
-                        l0 = getattr(self.engine, "last", None)
                         yield from attempts(seg["prompt"], max(1, min(max_new - n, room)))
-                        got = getattr(self.engine, "last", None)
-                        if got is not None and got is not l0:   # (its DONE: the request's figures merge every call's)
-                            calls.append(got)
                         if seg["next"] is None or cancel.is_set() or self.stopping:
                             return
                         seg["prompt"], seg["next"], seg["ids"] = seg["next"], None, []
@@ -4985,15 +4975,9 @@ class Service:
             with self.status_lock:
                 self.current_requests.discard(stat)
                 if counted:
-                    # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect);
-                    # over all its engine calls (#1058: a continuation's DONE alone read the whole answer as cached)
-                    last_obj, last = getattr(self.engine, "last", None), {}
-                    if last_obj is not engine_last0:
-                        if last_obj is not None and (not calls or calls[-1] is not last_obj):
-                            calls.append(last_obj)      # (the last call, closed before segments() saw its end)
-                        last = merge_calls(calls) if calls else dict(last_obj or {})
-                        if (last.get("prompt_tokens") or 0) > len(ids):
-                            last = own_prompt_figures(last, len(ids))
+                    last = merge_calls(calls)
+                    if (last.get("prompt_tokens") or 0) > len(ids):
+                        last = own_prompt_figures(last, len(ids))
                     started = my_started
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
@@ -5024,8 +5008,7 @@ class Service:
                     book = (len(ids), last.get("reused") or 0, n)
                     t["prompt_ms"] += last.get("prompt_ms") or 0.0
                     t["decode_ms"] += last.get("decode_ms") or 0.0
-                    fresh = getattr(self.engine, "last", None)
-                    if fresh is not None and fresh is not before:      # the engine's clock for THIS request
+                    if calls:
                         timings = request_timings(len(ids), n, last)
                         self.last_timings = dict(timings, at=int(time.time())) if timings else None
                     self.last_request_at = time.time()
