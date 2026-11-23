@@ -189,11 +189,33 @@ The MRCR files correspond to default train rows 1850 and 1870. The FP4 match rat
 | 344,768 tokens | 353.1 / 370.0 s | 374 | 39.0 / 27.4 |
 | 348,465 tokens | 359.8 / 376.8 s | 536 | 38.8 / 27.1 |
 
-FP8 ran with one slot and `--serial`; FP4 alternated two slots. Both used the same native binary, chunk 512, per-slot maximum of 360,448, host-staged GPU vision and the same chat template. Each retrieval request reported zero cached tokens. The table uses server-side timings from `tests/ik2_kv_quality.py`. The two published rows alone cannot estimate full-benchmark accuracy.
+The FP8 server ran with one slot and `--serial`. The FP4 server alternated two slots. Both used the same native binary, chunk 512, per-slot maximum of 360,448, host-staged GPU vision and the same chat template. Each retrieval request reported zero cached tokens. The table uses server-side timings from `tests/ik2_kv_quality.py`. The two published rows alone cannot estimate full-benchmark accuracy.
 
 Two independent parcel registers each occupied 359,254 input tokens before the first answer. FP4 retrieved all six randomly chosen verification numbers at 5%, 50% and 95% of the respective archive text. Alternating the two chats reused 359,256 and 359,279 tokens on the text follow-ups. Each read 21 new tokens in 0.431–0.716 seconds. The final image questions each reused 359,302 tokens and processed 62 more. Both colors were correct, in 0.518 and 0.536 seconds. Each final text query then replayed from zero cached tokens. The cold requests took 384.256 and 384.627 seconds and matched the warm replies, generated token counts and finish reasons exactly. The highest device-wide memory sample during these turns was 23.613 GiB, leaving 380.6 MiB on the card.
 
 On the direct-answer MRCR follow-ups FP4 scored 23/32 on MMLU and 1/4 on the short coding set embedded in those histories. Two multiple-choice answers and one coding response reached their output caps. The coding failures were a missing `typing.List` import, an unfinished answer, and a time-out in the supplied tests. The separate 16-task short coding run used medium reasoning. A comparison of short and long coding scores must account for both the archive and the reasoning setting.
+
+#### Matched capability scores
+
+| Task and setting | FP8 | FP4 | Items that changed correctness |
+|---|---:|---:|---|
+| 256 MMLU, short, direct answer | 207/256 | 206/256 | 3 gains, 4 losses |
+| First 32 GSM8K, short, medium reasoning | 32/32 | 31/32 | 1 loss |
+| 16 HumanEval+, short, medium reasoning | 16/16 | 16/16 | None |
+| 32 MMLU on the 345K and 348K archives, direct answer | 24/32 | 23/32 | 1 loss |
+| 4 HumanEval+ on the same archives, direct answer | 1/4 | 1/4 | None |
+| 16 feasible/impossible programming specifications, direct answer | 9/16 | 9/16 | None |
+
+On GSM8K test item 12 both models computed that the tree breaks even after 12 years. FP8 gave the first profitable year, 13, and FP4 returned 12. Neither answer hit its cap. On the long college mathematics item 0, FP8 returned the correct letter. FP4 began reasoning in the answer and reached the eight-token cap. The feasibility questions are a local check of whether the model can recognize missing information. Both direct-answer runs recognized all eight impossible tasks and only one of the eight feasible tasks.
+
+Eight further eight-needle MRCR rows contained 23,365 to 60,974 input tokens. Their mean direct-answer match ratios were 0.0600 on FP8 and 0.0773 on FP4. Neither model reproduced the requested answer on any row. In five cases the generated text was identical. The rows were 1714, 1725, 1750, 1797, 1920, 1959, 1979 and 1992 in the default train split. Results and the exact inputs are in `~/ai/build/maya-ik2-hip/fp4-overnight/results/` on Prometheus.
+
+```sh
+python3 tests/ik2_kv_quality.py --url "$URL" --mmlu mmlu256.jsonl
+python3 tests/ik2_gsm8k.py --chat-url "$URL" --data gsm8k-test.jsonl --count 32 --max-tokens 4096
+python3 tests/ik2_feasibility.py --url "$URL"
+python3 tests/ik2_kv_quality.py --url "$URL" --mrcr mrcr-short/row-*.json
+```
 
 ## Separate conversation caches
 
