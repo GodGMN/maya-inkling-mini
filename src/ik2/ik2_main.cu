@@ -5557,6 +5557,7 @@ int main(int argc, char** argv) {
             slot.hist.clear();
             slot.hist_sig.clear();
             slot.last.clear();
+            slot.used = 0;
         };
         auto parse_ints = [](const std::string& t) {
             std::vector<int> v;
@@ -5726,24 +5727,25 @@ int main(int argc, char** argv) {
                 active_slot = selected;
             }
             if (restore >= 0 && cache_slots > 1) {
-                auto victim = std::min_element(conversations.begin(), conversations.end(),
-                                                [](const Conversation& a, const Conversation& b) { return a.used < b.used; });
-                const int target = (int)(victim - conversations.begin());
-                if (target != selected) {
+                // Keep both descendants when there is space. With every slot occupied,
+                // rewind the matching chat in place so its retry cannot evict a different chat.
+                auto empty = std::find_if(conversations.begin(), conversations.end(),
+                                          [](const Conversation& c) { return c.hist.empty(); });
+                if (empty != conversations.end()) {
+                    const int target = (int)(empty - conversations.begin());
                     auto& source = conversations[selected];
                     auto& checkpoint = source.snaps[restore];
                     slot_storage.preserve(selected, target, source.hist.size());
                     snap_copy(checkpoint, false);
                     L = checkpoint.pos;
-                    victim->hist.assign(source.hist.begin(), source.hist.begin() + L);
-                    victim->hist_sig.assign(source.hist_sig.begin(), source.hist_sig.begin() + std::min(L, source.hist_sig.size()));
-                    victim->last.clear();
-                    for (auto& sn : victim->snaps) sn.pos = -1;
+                    empty->hist.assign(source.hist.begin(), source.hist.begin() + L);
+                    empty->hist_sig.assign(source.hist_sig.begin(), source.hist_sig.begin() + std::min(L, source.hist_sig.size()));
+                    empty->last.clear();
+                    for (auto& sn : empty->snaps) sn.pos = -1;
                     active_slot = target;
                 }
             }
             auto& slot = conversations[active_slot];
-            slot.used = ++request_order;
             auto& hist = slot.hist;
             auto& hist_sig = slot.hist_sig;
             auto& last = slot.last;
@@ -5849,6 +5851,7 @@ int main(int argc, char** argv) {
                 snap_copy(sn, true);
             }
             place_decode(M, (int)ids.size());
+            slot.used = ++request_order;
             const double t1 = now();
             if (getenv("IK2_STATS"))
                 std::printf("prefill stats: %zu tokens run, %llu expert copies (%.1f GiB) in %.2f s; experts that ran 1 / 2 / 3-7 / 8+ "

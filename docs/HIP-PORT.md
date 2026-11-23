@@ -351,6 +351,22 @@ python -m unittest serve.test_loop_guard serve.test_inkling2_frontend \
 
 Set `IK2_CACHE_SLOTS` in Compose or pass `--cache-slots N` to the native server. One request runs at a time. Each slot retains its token and image history, KV, convolution state and prefix checkpoints. The engine selects the longest prefix it can restore. A new conversation uses an empty slot first, then the least recently used one. A restart clears all slots. With a single slot the engine allocates no exchange buffer.
 
+An early r4 build evicted chat A when the loop guard retried chat B from a checkpoint. The next HumanEval/62 request had to read all 345,238 input tokens again in 370.542 seconds. A divergent continuation now forks into an empty slot if available. When all slots are occupied it rewinds its matching chat in place. A cancelled prefill releases its slot for the next new chat.
+
+On the 7900 XTX the old executable lost all 1,799 live tokens of the other chat on a rewind and all 1,795 on a prefill cancellation. With the fix, both chats survived the rewind and each matched eight independent cold predictions in FP8, FP4, and FP4 with the official MTP drafter. The fixed cancellation test retained all 1,795 tokens and matched all eight cold predictions.
+
+```sh
+# From /work in maya-ik2-gfx1100, with the usual gfx1100 preset environment
+IK2_KV=fp4-global python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 \
+    --model /weight.gguf --tokens water.force --fork-slots
+IK2_KV=fp8 python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 \
+    --model /weight.gguf --tokens water.force --fork-slots
+IK2_KV=fp4-global IK2_DRAFT_ADAPT=0 IK2_DRAFT_WIDTH=2 python3 src/tests/ik2_prefix_cache.py \
+    --engine ./build-ik2/maya-ik2 --model /weight.gguf --tokens water.force --draft mtp.safetensors --fork-slots
+IK2_KV=fp4-global python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 \
+    --model /weight.gguf --tokens water.force --cancel-prefill
+```
+
 All 18 follow-ups across the three settings reused every previously processed token. Each needed 20 new tokens. The nine final replies matched their independent zero-cache controls on prompt length, assistant message, finish reason and generated token count. No cgroup OOM kills occurred. Memory below is the highest device-wide reading sampled after a request. All runs used 1,024-token prefill chunks. The two-, three- and four-slot servers included the CPU vision encoder. The one-slot row uses the timings from the growing conversation and the device reading from the full-context CPU vision profile.
 
 | Slots | Context per slot | Final prompt per chat | Warm follow-up, seconds | Final cold control, seconds | Device VRAM, GiB |
