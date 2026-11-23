@@ -1471,6 +1471,47 @@ void use_dev(int d) {
     g_s = g_dev[d].s, g_cs = g_dev[d].cs, g_ev = g_dev[d].ev, g_blas = g_dev[d].blas;
 }
 
+// IK2_ABLATE=FILE: a direction r (the model's hidden size of raw little-endian floats, made unit length at load) that
+// every residual state loses once a write has joined it, y <- y - s r (r . y), s = IK2_ABLATE_SCALE (default 1): the
+// normed embedding (pictures included) and each layer visit's attention and MoE results, on every path (prefill, the
+// resident token, the block window).  The block bank, the loop's kept stream and its messages are copies of those
+// states, so none of them holds r either.  The post convs' histories keep the raw outputs; projecting the sum after
+// the conv is what keeps the stream exact.  One GPU only.  Unset: no launch, the paths as before.
+std::vector<float*> g_abl_r;   // a device's copy of r; empty: off
+float g_abl_s = 1.0f;
+// IK2_ABLATE_VISITS=LO:HI: only the writes of visits LO .. HI-1 (the embedding only when LO is 0); default all.
+// IK2_ABLATE_MEAN=FILE: 1 + 2 n_visit floats - the embedding's, then each visit's attention and MoE state's target
+// component c (the mean over answered harmless prompts): y <- y - s r (r . y - c) instead of to 0.
+int g_abl_lo = 0, g_abl_hi = 1 << 30;
+std::vector<float> g_abl_c;
+int g_abl_vis = -1;   // the visit being run (set by each path's visit loop)
+
+__global__ void ablate_rows_kernel(float* __restrict__ y, const float* __restrict__ r, float s, float c, int C) {
+    float* row = y + (size_t) blockIdx.x * C;
+    __shared__ float part[256];
+    float d = 0.0f;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) d += row[i] * r[i];
+    part[threadIdx.x] = d;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+        if (threadIdx.x < w) part[threadIdx.x] += part[threadIdx.x + w];
+        __syncthreads();
+    }
+    const float k = s * (part[0] - c);
+    for (int i = threadIdx.x; i < C; i += blockDim.x) row[i] -= k * r[i];
+}
+
+// rows y[0 .. T) ([T][C], on the current GPU's stream); kind 0 the embedding, 1 a visit's attention state, 2 its
+// MoE state (the visit: g_abl_vis)
+void abl(float* y, int T, int C, int kind) {
+    if (g_abl_r.empty() || T <= 0) return;
+    if (kind == 0 ? g_abl_lo > 0 : (g_abl_vis < g_abl_lo || g_abl_vis >= g_abl_hi)) return;
+    const int site = kind == 0 ? 0 : 1 + 2 * g_abl_vis + (kind - 1);
+    const float c = g_abl_c.empty() ? 0.0f : g_abl_c.at((size_t) site);
+    ablate_rows_kernel<<<T, 256, 0, g_s>>>(y, g_abl_r[g_cur], g_abl_s, c, C);
+    CU(cudaGetLastError());
+}
+
 // (kCand: sampling's candidates - the resident token path finds the largest logits on the device, g_cand; any other
 // path gives the logits as kLogits does and leaves g_cand.n at -1)
 enum class OutMode { kNone, kArgmax, kLogits, kCand };
@@ -1873,6 +1914,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     } else {
         k::conv4_res(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, h_in, r_out, g_s);
     }
+    abl(r_out, T, C, 1);
 }
 
 // A layer-major prefill pass of many tokens uses nearly every expert of a layer, so the ones not in VRAM can be
@@ -2202,6 +2244,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
     t_exp += now() - te0;
     conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
     k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, r_in, h_out, g_s);
+    abl(h_out, T, C, 2);
 }
 
 void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, const float* h_in, Work& W,
@@ -2397,10 +2440,12 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
     const int P_full = full_splits[attention_bucket];
     CU(cudaMemcpyAsync(W.tmp, W.emb_h, Cb, cudaMemcpyHostToDevice, g_s));
     k::rms(W.tmp, M.embd_norm, 1, C, c.eps, W.h, g_s);
+    abl(W.h, 1, C, 0);
     CU(cudaMemcpyAsync(W.pos, W.pos_h, 4, cudaMemcpyHostToDevice, g_s));
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
     int nb = 0, nb_pre = 0, n_bank = 0;
     for (int vis = 0; vis < c.n_visit; ++vis) {
+        g_abl_vis = vis;
         const int l = M.V[vis].l;
         Layer& Ly = bind_visit(M, vis);
         // a looped core's passes (as forward()'s)
@@ -2566,6 +2611,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
         } else {
             mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : W.h, W.r});
         }
+        abl(W.r, 1, C, 1);
         if (first) ++nb;
         // the MoE: its input, the router and the picks' tables on the device, the experts
         {
@@ -2649,6 +2695,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
             }
         }
         k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
+        abl(W.h, 1, C, 2);
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head
@@ -2798,10 +2845,12 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
     CU(cudaMemcpyAsync(W.tmp, g_blk.emb_h, TCb, cudaMemcpyHostToDevice, g_s));
     k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
+    abl(W.h, T, C, 0);
     CU(cudaMemcpyAsync(W.pos, g_blk.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
     int nb = 0, nb_pre = 0, n_bank = 0;
     for (int vis = 0; vis < c.n_visit; ++vis) {
+        g_abl_vis = vis;
         const int l = M.V[vis].l;
         Layer& Ly = bind_visit(M, vis);
         const float* msg = nullptr;
@@ -2919,6 +2968,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         if (Ly.attn_lora.rank) add_attention_lora(Ly, W.o, T, W.attn_lora_tmp, W.tmp);
         k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first ? nullptr : W.h, C, W.r, C,
                       Ly.rec_old[2], Ly.rec_x[2], g_s);
+        abl(W.r, T, C, 1);
         if (first) ++nb;
         // the MoE: its input, the router, the picks grouped by expert on the device, the experts
         {
@@ -2972,6 +3022,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         k::moe_combine_f32(W.y32, g_blk.inv, g_blk.wt, T, c.K, C, W.tmp, false, g_s);
         k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
                       g_s);
+        abl(W.h, T, C, 2);
     }
     if (out_mode == OutMode::kNone) return;
     {   // the head: every token's logits
@@ -3276,6 +3327,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         CU(cudaMemcpyAsync(W.tmp, W.emb_h, (size_t) T * C * 4, cudaMemcpyHostToDevice, g_s));
         k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
         place_pictures(W.h, T, pos0, C, g_s);
+        abl(W.h, T, C, 0);
         for (int t = 0; t < T; ++t) W.pos_h[t] = pos0 + t;
         CU(cudaMemcpyAsync(W.pos, W.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
         if (input_copy) CU(cudaEventRecord(input_copy, g_s));
@@ -3285,6 +3337,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
     // Record the last token once per completed layer visit, including fused HIP prefill.
     static const char* capture_path = std::getenv("IK2_CAPTURE_PREFILL_RESIDUALS");
+    static const char* capture_attn_path = std::getenv("IK2_CAPTURE_ATTN_RESIDUALS");   // the state after a visit's attention
     const bool capture = capture_path && T > 1 && out_mode != OutMode::kNone;
     auto capture_visit = [&](int visit) {
         const int32_t header[] = {visit, pos0 + T - 1, C};
@@ -3308,6 +3361,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
 
     int nb_pre = 0, n_bank = 0;   // (a looped core: the blocks before it, the states of the pass before's bank)
     for (int vis = 0; vis < c.n_visit; ++vis) {
+        g_abl_vis = vis;
         if (capture && vis) capture_visit(vis - 1);
         const int l = M.V[vis].l;   // (the layer: its weights, its experts in the cache; the state is the visit's)
         Layer& Ly = bind_visit(M, vis);
@@ -3360,6 +3414,16 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 CU(cudaMemcpyAsync(g_taps + (size_t) tap * g_taps_ld * C, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
         }
         run_layer_attn(M, Ly, l, T, pos0, W.h, W.pos, nb, 0, W.r, W, msg);
+        if (capture_attn_path && T > 1 && out_mode != OutMode::kNone) {
+            const int32_t header[] = {vis, pos0 + T - 1, C};
+            std::vector<float> last(C);
+            CU(cudaMemcpyAsync(last.data(), W.r + (size_t)(T - 1) * C, C * sizeof(float), cudaMemcpyDeviceToHost, g_s));
+            CU(cudaStreamSynchronize(g_s));
+            FILE* file = std::fopen(capture_attn_path, "ab");
+            if (!file || std::fwrite(header, sizeof(header), 1, file) != 1 ||
+                std::fwrite(last.data(), sizeof(float), C, file) != (size_t) C || std::fclose(file))
+                die("cannot write attention residual capture");
+        }
         if (!dump.empty() && Ly.attn_lora.rank) {
             const std::string prefix = "blk." + std::to_string(vis) + ".lora.";
             dump_f(prefix + "input", W.o, (size_t) T * Ly.wo.K);
@@ -3395,6 +3459,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         if (dump.empty() && !g_prof && !g_trace && g_pop.empty() && resident_wmma_prefill(c, Ly, T, W)) {
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            abl(W.h, T, C, 2);
             continue;
         }
 #endif
@@ -3519,6 +3584,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            abl(W.h, T, C, 2);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -3609,6 +3675,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            abl(W.h, T, C, 2);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -3662,6 +3729,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            abl(W.h, T, C, 2);
             g_pf.lap(g_pf.rest);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
@@ -3859,6 +3927,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             t_exp += now() - te0;
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            abl(W.h, T, C, 2);
             g_pf.lap(g_pf.rest);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
@@ -4022,6 +4091,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
             CU(cudaMemcpyAsync(W.tmp, W.emb_h, (size_t) ts * C * 4, cudaMemcpyHostToDevice, g_s));
             k::rms(W.tmp, M.embd_norm, ts, C, c.eps, W.h + (size_t) off * C, g_s);
             place_pictures(W.h + (size_t) off * C, ts, pos0 + off, C, g_s);
+            abl(W.h + (size_t) off * C, ts, C, 0);
             if (off + ts < T) CU(cudaStreamSynchronize(g_s));   // (W.emb_h reused on next iteration)
         }
         for (int t = 0; t < T; ++t) W.pos_h[t] = pos0 + t;
@@ -4052,6 +4122,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
         for (int ll = 0; ll < depth; ++ll) prefetch(ll, ll + 1);
     int nb = 0;
     for (int vis = 0; vis < c.n_visit; ++vis) {   // (no loop here: a looped model's prompts go through forward())
+        g_abl_vis = vis;
         const int l = M.V[vis].l;
         Layer& Ly = bind_visit(M, vis);
         g_pf.start();
@@ -4576,6 +4647,39 @@ int main(int argc, char** argv) {
     }
     g_ep = n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"));
     g_tp = n_gpu == 2 && !g_ep && getenv("IK2_TP") && std::atoi(getenv("IK2_TP"));
+    if (const char* p = getenv("IK2_ABLATE"); p && *p) {
+        if (n_gpu != 1) die("IK2_ABLATE: one GPU only");
+        std::vector<float> r((size_t) c.C);
+        FILE* f = std::fopen(p, "rb");
+        if (!f) die(std::string("IK2_ABLATE: cannot read ") + p);
+        const size_t got = std::fread(r.data(), sizeof(float), r.size() + 1, f);
+        std::fclose(f);
+        if (got != r.size()) die("IK2_ABLATE: " + std::string(p) + " is not " + std::to_string(c.C) + " floats");
+        double n2 = 0.0;
+        for (float x : r) n2 += (double) x * x;
+        if (!(n2 > 0.0) || !std::isfinite(n2)) die("IK2_ABLATE: a zero or non-finite direction");
+        for (float& x : r) x = (float) (x / std::sqrt(n2));
+        if (getenv("IK2_ABLATE_SCALE")) g_abl_s = (float) std::atof(getenv("IK2_ABLATE_SCALE"));
+        if (!(g_abl_s > 0.0f) || !std::isfinite(g_abl_s)) die("IK2_ABLATE_SCALE: a positive number");
+        g_abl_r.resize(1);
+        CU(cudaSetDevice(0));
+        CU(cudaMalloc(&g_abl_r[0], r.size() * sizeof(float)));
+        CU(cudaMemcpy(g_abl_r[0], r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice));
+        if (const char* v = getenv("IK2_ABLATE_VISITS"); v && *v) {
+            if (std::sscanf(v, "%d:%d", &g_abl_lo, &g_abl_hi) != 2 || g_abl_lo < 0 || g_abl_hi <= g_abl_lo)
+                die("IK2_ABLATE_VISITS: LO:HI");
+        }
+        if (const char* m = getenv("IK2_ABLATE_MEAN"); m && *m) {
+            g_abl_c.resize(1 + 2 * (size_t) c.n_visit);
+            FILE* fm = std::fopen(m, "rb");
+            if (!fm) die(std::string("IK2_ABLATE_MEAN: cannot read ") + m);
+            const size_t gm = std::fread(g_abl_c.data(), sizeof(float), g_abl_c.size() + 1, fm);
+            std::fclose(fm);
+            if (gm != g_abl_c.size()) die("IK2_ABLATE_MEAN: not 1 + 2 n_visit floats");
+        }
+        std::fprintf(stderr, "ablate: %s, scale %g, visits %d:%d%s\n", p, (double) g_abl_s, g_abl_lo, g_abl_hi,
+                     g_abl_c.empty() ? "" : ", mean targets");
+    }
     if (dual()) {
         int p01 = 0, p10 = 0;
         CU(cudaDeviceCanAccessPeer(&p01, 0, 1));
