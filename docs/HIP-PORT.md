@@ -121,6 +121,8 @@ docker exec -w /work -e IK2_FLASH_WAVES=4 -e IK2_ATTN_STAGED=1 -e IK2_DECODE_SUB
 
 The binary built from `4d384de` passed the Radeon suite. The independent CPU tests cover clipped K, RMS-normalized V, empty blocks, nibble decoding, causal prefill, scalar decode, WMMA decode and block verification. The GPU vision profile kept the 1,024-image-token host-staged encoder loaded. With two caches, 393,216 tokens per slot failed the resident-expert check at both 512- and 256-token prefill chunks. At chunk 512, 385,024, 376,832 and 368,640 also failed. The server started at 360,448 per slot with 3,291.7 MiB per cache and a 4 MiB exchange buffer. The three screenshot requests returned 39%, 43%, and 55% in 0.785, 0.844, and 0.741 s on this configuration.
 
+The extended kernel suite also passed FP4 causal prefill and decode at 392,957 keys against a double-precision sparse-attention calculation. Its four marked keys lay near 5%, 50%, 95% and the final position. The test filled the three trailing padded rows with large values to expose an incorrect attention mask. Across 768 prefill outputs the largest error used 5% of the test tolerance. The 384 decode outputs also passed. Run the same `ik2_kernels_test` command above.
+
 The trial used the service-r3 image with the new executable mounted over `/opt/maya/build-ik2/maya-ik2`. Set `IK2_CACHE_SLOTS=2` in the container environment. In a copy of the host-staged GPU vision preset, set `env.IK2_KV` to `fp4-global`, `--max-context` to twice the per-slot capacity, and `--chunk` to the tested chunk. Start with `MAYA_IK2_PRESET` pointing to the mounted preset. The established all-resident expert requirement and 256 MiB loader reserve remain in force.
 
 ```sh

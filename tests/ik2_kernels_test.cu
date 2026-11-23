@@ -1641,17 +1641,38 @@ void test_rdna3_deep_attention() {
     auto* out = dev_n<float>(query.size());
     const size_t scratch_n = std::max(k::attn_decode_mma_scratch(H, splits), size_t(T * H * 130 * 16));
     auto* scratch = dev_n<float>(scratch_n);
-    for (int format : {1, 2}) {
+    std::vector<k::Fp4KvBlock> packed_k(size_t(padded) * D / 32), packed_v(packed_k.size());
+    for (int i = 0; i < 4; ++i) {
+        const size_t head = size_t(marks[i]) * D / 32;
+        packed_k[head].scale = f2h_host((16.f + 2 * i) / 4.f);
+        packed_k[head].pairs[0] = 6; // code 6 is +4; other channels are zero.
+        for (int d = 0; d < D; d += 2) {
+            auto& block = packed_v[head + d / 32];
+            block.scale = f2h_host(1.f);
+            const int lo = d & (1 << i) ? 2 : 10;
+            const int hi = (d + 1) & (1 << i) ? 2 : 10;
+            block.pairs[(d % 32) / 2] = lo | (hi << 4);
+        }
+    }
+    for (size_t block = size_t(n) * D / 32; block < packed_k.size(); ++block) {
+        packed_k[block].scale = f2h_host(64.f);
+        std::memset(packed_k[block].pairs, 0x77, sizeof(packed_k[block].pairs));
+        packed_v[block] = packed_k[block];
+    }
+    const char* prefill_names[] = {"393K linear causal prefill", "393K paged causal prefill", "393K FP4 causal prefill"};
+    const char* decode_names[] = {"393K linear decode", "393K paged decode", "393K FP4 decode"};
+    for (int format : {1, 2, 3}) {
         const auto layout = test_fp8_layout(format, 0);
-        auto* dk = dev(format == 2 ? page_cache(keys, 1, false) : keys);
-        auto* dv = dev(format == 2 ? page_cache(values, 1, true) : values);
+        auto* dk = format == 3 ? reinterpret_cast<uint8_t*>(dev(packed_k)) :
+                   dev(format == 2 ? page_cache(keys, 1, false) : keys);
+        auto* dv = format == 3 ? reinterpret_cast<uint8_t*>(dev(packed_v)) :
+                   dev(format == 2 ? page_cache(values, 1, true) : values);
         k::attn_flash_fp8(dq, H * D, dk, dv, layout, H, 1, D, T, n - T, 1.f, 1.f, zero, 1, n,
                           zero, out, H * D, scratch, scratch_n, 16, nullptr);
-        expect(format == 1 ? "393K linear causal prefill" : "393K paged causal prefill",
-               host(out, query.size()), expected, 2e-3, 5e-5);
+        expect(prefill_names[format - 1], host(out, query.size()), expected, 2e-3, 5e-5);
         k::attn_decode_mma_fp8(dq + H * D, zero, zero, dk, dv, layout, H, 1, pos, 0, splits, 1.f, 1.f,
                                zero, 16, 1, n, scratch, out, nullptr, nullptr, nullptr);
-        expect(format == 1 ? "393K linear decode" : "393K paged decode", host(out, H * D),
+        expect(decode_names[format - 1], host(out, H * D),
                std::vector<double>(expected.begin() + H * D, expected.end()), 2e-3, 5e-5);
         CU(cudaFree(dk)); CU(cudaFree(dv));
     }
