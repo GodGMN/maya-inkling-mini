@@ -130,6 +130,48 @@ void test_rms() {
     cudaFree(dx), cudaFree(dw), cudaFree(dy);
 }
 
+// the refusal ablation's projection: against a double reference, the component left along r, rows independent of T
+void test_project_out() {
+    const int T = 9, D = 2304;
+    auto x = fvec((size_t) T * D, 4.0f), r = fvec(D);
+    double n2 = 0;
+    for (float v : r) n2 += (double) v * v;
+    for (float& v : r) v = (float) (v / std::sqrt(n2));
+    float* dr = dev(r);
+    const float cases[][2] = {{1.0f, 0.0f}, {1.3f, 0.0f}, {0.8f, 0.0f}, {1.0f, 2.5f}};
+    for (const auto& sc : cases) {
+        float* dy = dev(x);
+        k::project_out(dy, dr, sc[0], sc[1], T, D, 0);
+        std::vector<double> want((size_t) T * D);
+        for (int t = 0; t < T; ++t) {
+            double d = 0;
+            for (int e = 0; e < D; ++e) d += (double) r[e] * x[(size_t) t * D + e];
+            for (int e = 0; e < D; ++e) want[(size_t) t * D + e] = x[(size_t) t * D + e] - sc[0] * (d - sc[1]) * r[e];
+        }
+        const auto got = host(dy, want.size());
+        char name[64];
+        std::snprintf(name, sizeof name, "project_out (s %.1f, c %.1f)", sc[0], sc[1]);
+        expect(name, got, want, 2e-5, 1e-4);
+        if (sc[0] == 1.0f) {   // what is left along r: c
+            double worst = 0;
+            for (int t = 0; t < T; ++t) {
+                double d = 0;
+                for (int e = 0; e < D; ++e) d += (double) r[e] * got[(size_t) t * D + e];
+                worst = std::max(worst, std::fabs(d - sc[1]));
+            }
+            expect_true("project_out leaves c along r", worst <= 1e-3);
+        }
+        float* d1 = dev(std::vector<float>(x.begin() + (size_t) 4 * D, x.begin() + (size_t) 5 * D));   // row 4 alone
+        k::project_out(d1, dr, sc[0], sc[1], 1, D, 0);
+        const auto one = host(d1, D);
+        expect_true("project_out row bits do not depend on T",
+                    std::memcmp(one.data(), got.data() + (size_t) 4 * D, (size_t) D * sizeof(float)) == 0);
+        cudaFree(dy), cudaFree(d1);
+    }
+    k::project_out(nullptr, dr, 1.0f, 0.0f, 0, D, 0);   // T 0: nothing
+    cudaFree(dr);
+}
+
 void test_l2clip() {
     const int rows = 7, th_cases = 2;
     for (int c = 0; c < 3; ++c) {
@@ -3419,6 +3461,7 @@ int main() {
     std::printf("ik2_kernels_test on %s (sm_%d%d)\n", p.name, p.major, p.minor);
 #endif
     test_rms();
+    test_project_out();
     test_l2clip();
     test_conv();
     test_attn_res(9, 4608);

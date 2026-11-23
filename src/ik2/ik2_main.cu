@@ -1486,21 +1486,6 @@ int g_abl_lo = 0, g_abl_hi = 1 << 30;
 std::vector<float> g_abl_c;
 int g_abl_vis = -1;   // the visit being run (set by each path's visit loop)
 
-__global__ void ablate_rows_kernel(float* __restrict__ y, const float* __restrict__ r, float s, float c, int C) {
-    float* row = y + (size_t) blockIdx.x * C;
-    __shared__ float part[256];
-    float d = 0.0f;
-    for (int i = threadIdx.x; i < C; i += blockDim.x) d += row[i] * r[i];
-    part[threadIdx.x] = d;
-    __syncthreads();
-    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
-        if (threadIdx.x < w) part[threadIdx.x] += part[threadIdx.x + w];
-        __syncthreads();
-    }
-    const float k = s * (part[0] - c);
-    for (int i = threadIdx.x; i < C; i += blockDim.x) row[i] -= k * r[i];
-}
-
 // rows y[0 .. T) ([T][C], on the current GPU's stream); kind 0 the embedding, 1 a visit's attention state, 2 its
 // MoE state (the visit: g_abl_vis)
 void abl(float* y, int T, int C, int kind) {
@@ -1508,8 +1493,7 @@ void abl(float* y, int T, int C, int kind) {
     if (kind == 0 ? g_abl_lo > 0 : (g_abl_vis < g_abl_lo || g_abl_vis >= g_abl_hi)) return;
     const int site = kind == 0 ? 0 : 1 + 2 * g_abl_vis + (kind - 1);
     const float c = g_abl_c.empty() ? 0.0f : g_abl_c.at((size_t) site);
-    ablate_rows_kernel<<<T, 256, 0, g_s>>>(y, g_abl_r[g_cur], g_abl_s, c, C);
-    CU(cudaGetLastError());
+    k::project_out(y, g_abl_r[g_cur], g_abl_s, c, T, C, g_s);
 }
 
 // (kCand: sampling's candidates - the resident token path finds the largest logits on the device, g_cand; any other

@@ -39,6 +39,9 @@ static_assert(sizeof(Fp4KvBlock) == 18);
 
 /// y = x * rsqrt(mean(x^2) + eps) * w per row of D (w null: no weight).  x and y may alias.
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s);
+/// rows y[0 .. T) ([T][D]) each lose a direction: y <- y - s r (r . y - c) (r unit length; c 0: the component goes,
+/// else it is moved to c).  A block a row, a fixed-order sum, so a row's bits do not depend on T.  Refusal ablation.
+void project_out(float* y, const float* r, float s, float c, int T, int D, cudaStream_t st);
 /// rms of n <= 3 vectors [D] in one launch, each with its own weights: y[i] = rms(x[i]) * w[i] (y may be x).
 struct RmsJobs {
     const float* x[3];

@@ -5503,6 +5503,25 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
 
 }  // namespace
 
+__global__ void project_out_kernel(float* __restrict__ y, const float* __restrict__ r, float s, float c, int D) {
+    float* row = y + (size_t) blockIdx.x * D;
+    __shared__ float part[256];
+    float d = 0.0f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) d += row[i] * r[i];
+    part[threadIdx.x] = d;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+        if (threadIdx.x < w) part[threadIdx.x] += part[threadIdx.x + w];
+        __syncthreads();
+    }
+    const float k = s * (part[0] - c);
+    for (int i = threadIdx.x; i < D; i += blockDim.x) row[i] -= k * r[i];
+}
+void project_out(float* y, const float* r, float s, float c, int T, int D, cudaStream_t st) {
+    if (T <= 0) return;
+    project_out_kernel<<<T, 256, 0, st>>>(y, r, s, c, D);
+    check("project_out");
+}
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s) {
     if (rows <= 0) return;
     rms_impl_kernel<false, true><<<rows, kBlk, 0, s>>>(x, w, D, eps, nullptr, y);
