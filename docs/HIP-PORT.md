@@ -141,6 +141,32 @@ RUN pip install --no-cache-dir numpy==2.2.6
 DOCKER
 ```
 
+### Teacher-forced logits on the stock IQ4_NL weights
+
+The CPU oracle used `ref/inkling2.py` on the same GGUF and the same 256-token passage. Each Radeon run used the environment in `ik2-mini-gfx1100.json` with the indicated override. The decode test feeds 32 known continuations after a 224-token prompt. Its 32 predictions cover the tail of the prefill passage, so the two rows are overlapping samples.
+
+| Input | CPU top-1 matches, FP8 | CPU top-1 matches, FP4 | Mean KL from CPU, FP8 | Mean KL from CPU, FP4 | FP8/FP4 top-1 matches |
+|---|---:|---:|---:|---:|---:|
+| 256 prefill positions | 250/256 | 252/256 | 0.002041 | 0.004161 | 250/256 |
+| 32 forced decode positions | 30/32 | 32/32 | 0.002114 | 0.004454 | 30/32 |
+
+FP4 put more probability on a different part of the vocabulary even when the most likely token agreed. Over the 255 next-token targets in the full passage, perplexity was 3.9677 on the CPU, 3.9678 with FP8 and 3.9419 with FP4. On the 31 scored targets in the forced tail, those values were 2.5071, 2.5316 and 2.6072. This single passage measures numerical drift and supplies no independent estimate of benchmark accuracy.
+
+Use the existing `heldout-teacher.{all,prompt,force}` and `heldout-teacher-ref.npy` fixture with the deployed Radeon environment in the GPU container, from `/work`:
+
+```sh
+for kv in fp8 fp4-global; do
+    IK2_KV="$kv" IK2_PREFILL_LOGITS_OUT="$kv-pp.f32" ./build-ik2/maya-ik2 \
+        --model /weight.gguf --ctx 1024 --chunk 64 --tokens @heldout-teacher.all --gen 0
+    IK2_KV="$kv" IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="$kv-tg.f32" ./build-ik2/maya-ik2 \
+        --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
+    oracle-env/bin/python src/tools/ik2_compare_decode.py "$kv-pp.f32" --ref heldout-teacher-ref.npy \
+        --tokens heldout-teacher.all --vocab 200058 --prompt-length 256 --prefill
+    oracle-env/bin/python src/tools/ik2_compare_decode.py "$kv-tg.f32" --ref heldout-teacher-ref.npy \
+        --tokens heldout-teacher.all --vocab 200058 --prompt-length 224 --gen 33
+done
+```
+
 ### Paired short and long prompts
 
 The deployment decision uses the stock FP8 model as the control. A two-slot default needs correct cold replays, prefix reuse, working vision, at least 256 MiB of sampled device headroom, and comparable answers on the same short and deep prompts. A reproducible loss of a long-distance record that FP8 recovers is grounds to keep FP8 as the default. The scored tasks below are local paired samples, including when they use public benchmark questions.
