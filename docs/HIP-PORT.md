@@ -339,6 +339,21 @@ Eight further eight-needle MRCR rows contained 23,365 to 60,974 input tokens. Th
 
 On the first medium-effort run of row 1714 (23,365 tokens), FP8 copied the requested seventh article verbatim. FP4 copied the eighth verbatim. Both emitted the correct identifying prefix and finished within 4,096 output tokens. The evaluator records each exact match against the previous articles as well as the official string-similarity score. Use `--require-cached-archive` for the multi-turn MMLU and coding checks to fail immediately if a follow-up rereads its archive.
 
+#### Same slots, different KV precision
+
+The deployment comparison uses one FP8 slot and two FP4 slots. To separate precision from slot count, the release image also ran both formats with **two 65,536-token slots**, 512-token prefill chunks, the same stock IQ4_NL file, GPU vision, greedy sampling, medium effort and a 4,096-token output limit. The two configuration files matched after removing `env.IK2_KV`, with SHA-256 `9fd0f224192f6540c5ea12511d3776b85a6f694ad19e5de46b46e72de92c3714` over the remaining settings. All four request hashes matched.
+
+| Cold request | FP8 | FP4 global |
+|---|---|---|
+| MRCR row 1714, 23,365 tokens, asked for the seventh entry | Copied the seventh verbatim | Copied the eighth verbatim |
+| MRCR row 1797, 34,253 tokens, asked for the fourth entry | Copied the fourth verbatim | Reached 4,096 output tokens without a final answer |
+| GSM8K item 12, expected 13 | 13 | 12 |
+| GSM8K item 106, expected 72 | 72 | Reached 4,096 output tokens without a final answer |
+
+On the larger two-slot profile, a separate FP4 retry of row 1797 still had no final answer at 8,192 tokens. At that budget GSM8K item 106 returned 108 after 7,418 tokens. Across the eight 23K–61K MRCR questions, each format reached 0.99 string similarity on four questions. The successful questions differed. The repeated loss of records that FP8 recovered is the reason FP8 remains the default.
+
+From the checkout root, `python3 "$E/crossover.py"` runs the two isolated configurations on an idle Prometheus with the live service stopped. Set `E` to the archived `results` directory or a working copy of it. The paired responses are in `crossover-{fp8,fp4}-{retrieval,gsm}.jsonl`. The broader comparison uses `python3 "$E/final-pairs.py" stock`.
+
 ```sh
 python3 tests/ik2_kv_quality.py --url "$URL" --mmlu mmlu256.jsonl
 python3 tests/ik2_gsm8k.py --chat-url "$URL" --data gsm8k-test.jsonl --count 32 --max-tokens 4096
@@ -363,9 +378,11 @@ The published test calls the function repeatedly with inputs around one million.
 
 Two additional clients submitted the full archives at the same time on the fixed FP4 server. They returned `ALDER-17` and `ASPEN-29` after 4.876 and 10.271 seconds, with 344,768 and 348,465 cached input tokens. The exact requests and diagnostic commands are in `fp4-overnight/results/` on Prometheus.
 
+After the request accounting change, both FP8 and FP4 reproduced all 22 of their previous deep answers on the release image. Each profile reported zero cache hits on the two cold inputs and retained the full archive on all 20 follow-ups. A second pair of concurrent FP4 clients recovered the same two codes in 4.844 and 10.273 seconds. The server passed the four OpenAI/Anthropic tool conversations and the strict OpenAI Responses SDK check, with zero container restarts and zero cgroup OOM kills. The raw records are `fp4-accounting-{deep,concurrent,tools,responses}.jsonl`. The two-client replay uses `python3 "$E/concurrent-archives.py"` from the checkout root with the test archives resident. Set `E` to the archived `results` directory.
+
 The 8,192-output-token FP8 control exposed a separate reporting error. It read the full 344,768-token prompt from scratch, then reported 344,395 cache hits. On the final native stop token the client-facing generator closed before its retry statistics were merged. The last retry's cache count and prefill time replaced the original read. Maya now saves each native completion record while its generator drains and calculates usage once for the whole HTTP request. A scripted cold request previously reported 47 cache hits and a 1 ms prefill. The corrected response reports zero hits and the first native call's 12,345 ms fixture time, and sums all four native decode times. The combined local regression run covered 386 tests with one skip. The packaged request and SDK suite covered 145 tests with three optional SDK skips.
 
-The corrected FP8 image replayed the same cold request on Prometheus. It reported 344,768 new tokens, zero cached, 354.784 s of prefill and 7,191 generated tokens. At the higher budget it returned four lines of verse with a 0.2115 official match ratio. FP4 exhausted all 8,192 output tokens without a final answer. Neither recovered the requested poem. Run `python3 long-budget.py` from the archived evaluation drivers after starting each matched profile. The measured responses are `fp8-guard-deep-8192.jsonl` and `fp4-guard-deep-8192.jsonl`.
+The corrected FP8 image replayed the same cold request on Prometheus. It reported 344,768 new tokens, zero cached, 354.784 s of prefill and 7,191 generated tokens. At the higher budget it returned four lines of verse with a 0.2115 official match ratio. FP4 exhausted all 8,192 output tokens without a final answer. Neither recovered the requested poem. From the checkout root, run `python3 "$E/long-budget.py"` against each matched profile. The measured responses are `fp8-guard-deep-8192.jsonl` and `fp4-guard-deep-8192.jsonl`.
 
 ```sh
 python -m unittest serve.test_loop_guard serve.test_inkling2_frontend \
@@ -374,6 +391,12 @@ python -m unittest serve.test_inkling2_frontend.Serving.test_guard_retries_repor
 python3 tests/ik2_coding.py --data humanevalplus.jsonl --score fp4-guard-deep.jsonl
 python3 grade-tri-memory.py
 python3 grade-tri-memory.py --collect
+```
+
+The broader CPU regression run covered 527 tests with 22 skips and zero failures, including fair queueing, stop tokens, streaming and stored responses. The command uses Bash brace expansion and the development machine’s OpenAI SDK test environment.
+
+```sh
+python -m unittest serve.test_{engine_contract,fair,stop,stream_jobs,response_jobs,response_store,savings,think_budget,tools,logprobs,prompt_memo,server,model_api,multi,inkling2_frontend,loop_guard,responses,responses_tools,responses_schema}
 ```
 
 ### Slot selection
