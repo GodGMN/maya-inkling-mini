@@ -3283,6 +3283,19 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     int nb = 0;
     const size_t TC = (size_t) T * C;
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
+    // Record the last token once per completed layer visit, including fused HIP prefill.
+    static const char* capture_path = std::getenv("IK2_CAPTURE_PREFILL_RESIDUALS");
+    const bool capture = capture_path && T > 1 && out_mode != OutMode::kNone;
+    auto capture_visit = [&](int visit) {
+        const int32_t header[] = {visit, pos0 + T - 1, C};
+        std::vector<float> last(C);
+        CU(cudaMemcpyAsync(last.data(), W.h + (size_t)(T - 1) * C, C * sizeof(float), cudaMemcpyDeviceToHost, g_s));
+        CU(cudaStreamSynchronize(g_s));
+        FILE* file = std::fopen(capture_path, "ab");
+        if (!file || std::fwrite(header, sizeof(header), 1, file) != 1 ||
+            std::fwrite(last.data(), sizeof(float), C, file) != (size_t) C || std::fclose(file))
+            die("cannot write prefill residual capture");
+    };
     auto dump_f = [&](const std::string& name, const float* d, size_t n) {
         if (dump.empty()) return;
         std::vector<float> h(n);
@@ -3295,6 +3308,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
 
     int nb_pre = 0, n_bank = 0;   // (a looped core: the blocks before it, the states of the pass before's bank)
     for (int vis = 0; vis < c.n_visit; ++vis) {
+        if (capture && vis) capture_visit(vis - 1);
         const int l = M.V[vis].l;   // (the layer: its weights, its experts in the cache; the state is the visit's)
         Layer& Ly = bind_visit(M, vis);
         if (Ly.dev != g_cur) {   // the next GPU's layers: the stream and the block states go along
@@ -3853,6 +3867,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         g_pf.lap(g_pf.rest);
         dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
     }
+    if (capture) capture_visit(c.n_visit - 1);
     run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
     if (input_copy) CU(cudaEventSynchronize(input_copy));
 #undef W
