@@ -152,6 +152,18 @@ The packaged host-staged vision build includes two explicit `MAYA_IK2_PRESET` va
 
 At four slots, per-slot capacities 196,608, 192,512, 188,416, 184,320 and 180,224 all failed the resident-expert requirement. At 176,128 the server started and read three 1480×900 screenshots correctly in 1.385, 0.888 and 0.749 seconds. The minimum free VRAM sampled every 100 ms during those requests was 257.7 MiB. Both profiles use a shared 4 MiB slot-exchange buffer.
 
+Four independent registers started at 174,934 tokens apiece. All twelve early, middle and late lookups were correct, along with all four color questions. The eight text follow-ups reused 174,936 or 174,959 tokens and processed 21 each in 0.273–0.483 seconds. The image follow-ups reused 174,982 tokens and processed 62 each in 0.358–0.377 seconds. Four independent 174,980-token cold replays matched the respective warm answers, lengths and finish reasons in 120.956–121.210 seconds. Device memory peaked at 23.734 GiB, leaving 256.7 MiB. The container reported zero OOM kills. The two-slot run also reported zero OOM kills.
+
+```sh
+python3 tests/ik2_slot_retrieval.py --url "$URL" --slots 4 --depth 175104 --cold > four-registers.jsonl
+pid=$(docker inspect -f '{{.State.Pid}}' ik2-fp4-trial)
+cg=/sys/fs/cgroup$(cut -d: -f3 "/proc/$pid/cgroup")
+cat "$cg/memory.events" "$cg/memory.peak"
+cat /sys/class/drm/card0/device/mem_info_vram_{total,used}
+```
+
+The 10 GiB host-memory limit includes reclaimable file pages from the mapped weights. Across the two- and four-slot trials, sampled anonymous RAM peaked at 2.52 and 2.44 GiB respectively. The container cgroups reclaimed file pages at their limit. These host-memory numbers are separate from the device-wide VRAM readings.
+
 ```sh
 # From ~/ai/build/maya-ik2-hip on Prometheus
 sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer \
@@ -162,7 +174,7 @@ docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 --entry
     serve.test_responses serve.test_responses_tools serve.test_responses_schema
 ```
 
-The image's engine SHA256 was `f08cbeb153f26ea7e1fcf219a1f61fdca50aba7c737b19541d77dadbac822454`, matching the GPU tests. The packaged Python suites ran 74 tests with three skips and zero failures.
+The image's engine SHA256 was `f08cbeb153f26ea7e1fcf219a1f61fdca50aba7c737b19541d77dadbac822454`, matching the GPU tests. The packaged Python suites ran 74 tests with three skips and zero failures. All 74 passed on the development host with OpenAI SDK 3.57.0, jsonschema 4.26.0 and Jinja2 3.1.2. The shipped image includes jsonschema and skips the three optional SDK tests. An initial host run used SDK 2.24.0 without jsonschema and failed structured-output and namespace checks. A fresh Python 3.14 environment also lacked Jinja2. The complete run used the existing Python 3.11 SDK environment.
 
 ### Teacher-forced logits on the stock IQ4_NL weights
 
