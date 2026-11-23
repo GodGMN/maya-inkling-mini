@@ -58,6 +58,8 @@ def main():
     parser.add_argument("--reasoning-effort", choices=("none", "medium"), default="none",
                         help="allow 4,096 output tokens per request with medium reasoning")
     parser.add_argument("--screenshots", action="store_true", help="finish each archive with a setup screenshot")
+    parser.add_argument("--screenshot-effort", choices=("none", "medium"), default="none",
+                        help="reasoning effort for the screenshot; match the text turns to reuse their prefix")
     parser.add_argument("--serial", action="store_true", help="finish one archive before starting the next")
     args = parser.parse_args()
     if not args.mrcr and not args.mmlu and not args.code and not args.screenshots:
@@ -103,7 +105,8 @@ def main():
             data = base64.b64encode(picture).decode()
             content = [dict(type="image_url", image_url=dict(url="data:image/png;base64," + data)),
                        dict(type="text", text=question)]
-            result = completion(args.url, messages + [dict(role="user", content=content)], 256, "none")
+            limit = 4096 if args.screenshot_effort == "medium" else 256
+            result = completion(args.url, messages + [dict(role="user", content=content)], limit, args.screenshot_effort)
             answer = result["answer"].strip().replace(" %", "%").rstrip(".")
             yield dict(case="screenshot", chat=i, expected=expected, correct=answer == expected, **result)
 
