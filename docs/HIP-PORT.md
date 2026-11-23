@@ -224,6 +224,21 @@ On the short FP8 control both final numbers, both screenshots and both post-comp
 
 The two-slot FP4 smoke run also kept both answers correct and fully cached through sampling and image turns. Its two warm/cold lookups generated 406/355 and 1,046/358 tokens. Both independently repeated cold runs reproduced their respective reasoning and visible answers. Add `--save-controls DIRECTORY` to retain the exact cold Responses request bodies for cross-format replays.
 
+In the full run, two independent Responses chains grew past 345K. FP8 ran them in sequence on one cache. FP4 alternated between two resident caches on every turn. Each new request reused every preceding token that had reached the engine. The service generated different reasoning lengths between formats, so their absolute prefix lengths diverged even though the user batches were identical.
+
+| FP4 request | Chat A cached | Chat B cached | New input in each chat |
+|---|---:|---:|---:|
+| First batch | 0 | 0 | 20,127 |
+| Second batch | 21,540 | 20,872 | 80,099 |
+| Third batch | 102,029 | 101,148 | 150,012 |
+| Join lot and depot records | 252,122 | 251,243 | 95,027 |
+| Sampled follow-up | 347,400 | 346,532 | 13 |
+| 1480×900 screenshot | 347,531 | 346,697 | 876 |
+| Rewritten summary | 0 | 0 | 60 |
+| Follow-up after compaction | 164 | 195 | 20 |
+
+Both profiles answered the two-hop questions, read 39% and 43% from the screenshots, and recovered both codes after compaction. The two warm image requests took 3.829 and 4.377 seconds for FP8, and 4.881 and 5.248 seconds for FP4, including medium-effort reasoning. Cold replays of the FP8 lookups at 345,717 and 345,685 tokens produced the same final answers in 360.553 and 357.783 seconds. Both FP4 replays also matched, at 347,149 and 346,270 tokens in 376.699 and 380.167 seconds. Warm and cold reasoning differed on all four comparisons. On FP4, the first lookup generated 252 tokens warm and 345 cold, the second 263 warm and 481 cold.
+
 ### Teacher-forced logits on the stock IQ4_NL weights
 
 The CPU oracle used `ref/inkling2.py` on the same GGUF and the same 256-token passage. Each Radeon run used the environment in `ik2-mini-gfx1100.json` with the indicated override. The decode test feeds 32 known continuations after a 224-token prompt. Its 32 predictions cover the tail of the prefill passage, so the two rows are overlapping samples.
