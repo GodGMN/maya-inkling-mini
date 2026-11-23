@@ -189,6 +189,18 @@ docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 --entry
 
 The image's engine SHA256 was `f08cbeb153f26ea7e1fcf219a1f61fdca50aba7c737b19541d77dadbac822454`, matching the GPU tests. The packaged Python suites ran 74 tests with three skips and zero failures. All 74 passed on the development host with OpenAI SDK 3.57.0, jsonschema 4.26.0 and Jinja2 3.1.2. The shipped image includes jsonschema and skips the three optional SDK tests. An initial host run used SDK 2.24.0 without jsonschema and failed structured-output and namespace checks. A fresh Python 3.14 environment also lacked Jinja2. The complete run used the existing Python 3.11 SDK environment.
 
+### Repeating the paired checks
+
+Save each server's JSONL output separately. Compare question IDs, expected answers, input token counts and available request-body SHA256s with the following commands. The report lists the specific gains and losses. For MRCR it averages the published prefix-sensitive string similarity. HumanEval+ requires executing the returned programs against the supplied tests before comparing scores.
+
+```sh
+python3 tests/ik2_compare_quality.py fp8-mmlu256.jsonl fp4-mmlu256.jsonl
+python3 tests/ik2_compare_quality.py fp8-medium.jsonl fp4-medium.jsonl
+python3 tests/ik2_compare_quality.py fp8-long-code-score.jsonl fp4-long-code-score.jsonl
+```
+
+The first FP4 direct-answer archive run predates request hashing. Its generator used the same message bodies, output limits and JSON encoding, and all paired input token counts matched. Later runs report how many hashes matched.
+
 ### Teacher-forced logits on the stock IQ4_NL weights
 
 The CPU oracle used `ref/inkling2.py` on the same GGUF and the same 256-token passage. Each Radeon run used the environment in `ik2-mini-gfx1100.json` with the indicated override. The decode test feeds 32 known continuations after a 224-token prompt. Its 32 predictions cover the tail of the prefill passage, so the two rows are overlapping samples.
