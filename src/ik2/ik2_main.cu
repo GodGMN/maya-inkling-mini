@@ -15,7 +15,7 @@
 //     own cache and PCIe link), else the layers are split between them.
 //
 //   maya-ik2 --model FIRST-SHARD.gguf --serve [--max-context 262144] [--cache-gb 60] [--gpus 1] [--threads 8]
-//            [--eos a,b]
+//            [--eos a,b] [--lora attn-output-adapter.gguf]
 //   maya-ik2 --model FIRST-SHARD.gguf --tokens 1,2,3|@FILE [--gen N] [--chunk 2048] [--dump DIR]
 // --serve: Maya's engine protocol on stdin / stdout (serve/server.py's StrataEngine: INFO / READY, GEN, PP, T, DONE,
 // STOP); --serve-ik2 the older @-line one.  --dump: each layer's output (blk.L.out) and the log-probabilities of every
@@ -25,7 +25,7 @@
 #include "ik2_cpu_deep.hpp"
 #include "ik2_draft.hpp"
 #include "ik2_kernels.cuh"
-#include "strata/artifact/gguf_reader.hpp"
+#include "ik2_lora.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -224,11 +224,19 @@ struct Mat {
     int type = 0, N = 0, K = 0; // RTX PRO 6000 (16 against 21 ms a token), for 4 GiB more VRAM
 };
 
+// GGUF stores A as [input, rank] and B as [rank, output], fastest dimension first.
+struct AttentionLora {
+    float *a = nullptr, *b = nullptr;
+    int rank = 0;
+    float scale = 0;
+};
+
 struct Layer {
     int dev = 0;   // the GPU it runs on (--gpus: the layers in equal runs)
     bool sliding;
     // FP16 [out][in] (fused projections on !g_dense_q8, or when quant types match on g_dense_q8)
     Mat wq, wk, wv, wr, wgate, wo;
+    AttentionLora attn_lora;
     Mat wqkvrg, wqrg, wk_dyn, wv_dyn;
     uint16_t *sink16 = nullptr;                    // F16 [H][C] (used in g_dense_q8; fused in !g_dense_q8)
     uint16_t *router16 = nullptr;                  // F16 [E][C]
@@ -586,6 +594,16 @@ Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
     k::decode_f16(m.type, g_stage, (size_t) N * Kd, m.f16, g_s);
     CU(cudaStreamSynchronize(g_s));
     return m;
+}
+
+void add_attention_lora(const Layer& layer, const float* x, int tokens, float* low, float* out) {
+    const AttentionLora& lora = layer.attn_lora;
+    const int in = layer.wo.K, n = layer.wo.N, rank = lora.rank;
+    const float one = 1, zero = 0;
+    CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, rank, tokens, in,
+                   &one, lora.a, in, x, in, &zero, low, rank));
+    CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, n, tokens, rank,
+                   &lora.scale, lora.b, rank, low, rank, &one, out, n));
 }
 
 struct SegPack {
@@ -1275,6 +1293,7 @@ struct Work {
     uint16_t *x16, *xk16, *xv16, *xq16_sup = nullptr;
     uint16_t *kv_k16 = nullptr, *kv_v16 = nullptr;
     int kv_tmp_cap = 0;
+    float* attn_lora_tmp = nullptr;
     int* pos;
     cudaEvent_t prefill_inputs_copied;
     float* rlog;
@@ -1844,8 +1863,9 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             ts += Tq;
         }
     }
-    k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && T == 1, g_s);
+    k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, (g_dense_q8 && T == 1) || Ly.attn_lora.rank, g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
+    if (Ly.attn_lora.rank) add_attention_lora(Ly, W.o, T, W.attn_lora_tmp, W.tmp);
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
     if (l % c.block == 0) {
         CU(cudaMemcpyAsync(blk(nb), h_in, TC * 4, cudaMemcpyDeviceToDevice, g_s));
@@ -2539,7 +2559,13 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
         // stream joins the blocks and starts again)
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
-        mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : W.h, W.r});
+        if (Ly.attn_lora.rank) {
+            mv1(Ly.wo, W.o, W.tmp);
+            add_attention_lora(Ly, W.o, 1, W.attn_lora_tmp, W.tmp);
+            k::conv4_res(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, 1, C, first ? nullptr : W.h, W.r, g_s);
+        } else {
+            mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : W.h, W.r});
+        }
         if (first) ++nb;
         // the MoE: its input, the router and the picks' tables on the device, the experts
         {
@@ -2890,6 +2916,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
         tile_rows(Ly.wo, 0, C, W.x16, T, W.tmp, C);
+        if (Ly.attn_lora.rank) add_attention_lora(Ly, W.o, T, W.attn_lora_tmp, W.tmp);
         k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first ? nullptr : W.h, C, W.r, C,
                       Ly.rec_old[2], Ly.rec_x[2], g_s);
         if (first) ++nb;
@@ -3319,6 +3346,11 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 CU(cudaMemcpyAsync(g_taps + (size_t) tap * g_taps_ld * C, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
         }
         run_layer_attn(M, Ly, l, T, pos0, W.h, W.pos, nb, 0, W.r, W, msg);
+        if (!dump.empty() && Ly.attn_lora.rank) {
+            const std::string prefix = "blk." + std::to_string(vis) + ".lora.";
+            dump_f(prefix + "input", W.o, (size_t) T * Ly.wo.K);
+            dump_f(prefix + "output", W.tmp, TC);
+        }
         dump_f("blk." + std::to_string(vis) + ".attn_out", W.r, TC);
         if (l % c.block == 0) ++nb;
         // the MoE
@@ -4315,7 +4347,7 @@ void embed_row(Model& M, int t, float* raw, float* out) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, toks, dump, draft_path;
+    std::string model, toks, dump, draft_path, lora_path;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
     int cache_slots = getenv("IK2_CACHE_SLOTS") ? std::atoi(getenv("IK2_CACHE_SLOTS")) : 1;
     bool serve = false, serve_maya = true;   // (--serve: Maya's engine protocol; --serve-ik2: the @-line one)
@@ -4345,6 +4377,7 @@ int main(int argc, char** argv) {
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--gpus") n_gpu = std::atoi(next().c_str());
         else if (a == "--draft") draft_path = next();
+        else if (a == "--lora") lora_path = next();
         else if (a == "--serve") serve = true;
         else if (a == "--serve-ik2") serve = true, serve_maya = false;
         else if (a == "--eos") {
@@ -4653,6 +4686,17 @@ int main(int argc, char** argv) {
             for (auto& x : w) x *= 1.0f / std::sqrt(9.0f);
         return w;
     };
+    std::unique_ptr<strata::GgufFile> lora_file;
+    std::vector<ik2::LoraPair> lora_pairs;
+    int max_lora_rank = 0;
+    if (!lora_path.empty()) {
+        try {
+            lora_file = std::make_unique<strata::GgufFile>(lora_path);
+            lora_pairs = ik2::attention_lora_pairs(*lora_file, arch ? arch->s : "", c.n_layer, HD, C);
+        } catch (const std::exception& e) {
+            die("--lora " + lora_path + ": " + e.what());
+        }
+    }
     std::printf("layout: %s\n", rw ? "GGUF_shard_rewrite tensor layout" : "llama.cpp PR #32187");
     struct ExpJob {
         int l;
@@ -4725,6 +4769,16 @@ int main(int argc, char** argv) {
             }
         }
         Ly.wo = load_mat(S, b + "attn_output.weight", (int) C, (int) HD);
+        if (lora_file && lora_pairs[l].rank) {
+            const auto& pair = lora_pairs[l];
+            auto upload = [&](const strata::TensorInfo& t) {
+                float* dst = dalloc<float>(t.elements());
+                CU(cudaMemcpy(dst, lora_file->tensor_data(t), t.elements() * sizeof(float), cudaMemcpyHostToDevice));
+                return dst;
+            };
+            Ly.attn_lora = {upload(*pair.a), upload(*pair.b), pair.rank, pair.scale};
+            max_lora_rank = std::max(max_lora_rank, pair.rank);
+        }
         Ly.router16 = load_f16(S, b + "ffn_gate_inp.weight", (size_t) c.E * C);
         Ly.probs_b = load_f32(S, b + "exp_probs_b.bias", c.E);
         Ly.ffn_norm = load_f32(S, b + "ffn_norm.weight", C);
@@ -4858,6 +4912,11 @@ int main(int argc, char** argv) {
         Vi.h_mlp = dalloc<float>(3 * C);
     }
     c.n_rows = (int) (S.info("output.weight")->elements() / C);
+    if (lora_file) {
+        std::fprintf(stderr, "loaded LoRA %s: %zu attention output projections, max rank %d\n",
+                     lora_path.c_str(), lora_file->tensors().size() / 2, max_lora_rank);
+        lora_file.reset();
+    }
     M.out_w = load_mat(S, "output.weight", c.n_rows, (int) C);
     if (g_dense_q8) {   // (a layer's largest; the head's logits go a token at a time over its blocks)
         g_w16_n = (2 * HD + 2 * KD + (size_t) c.H * c.d_rel) * C;
@@ -5157,6 +5216,7 @@ int main(int argc, char** argv) {
     const size_t Tm = W.Tm, S8 = Tm * c.K;
     const size_t T_buf = std::max(Tm, (size_t) W.T_sup), S_buf = T_buf * c.K;
     W.blk_ld = T_buf;
+    if (max_lora_rank) W.attn_lora_tmp = work_alloc<float>(T_buf * max_lora_rank);
     for (float** p : {&W.h, &W.r, &W.tmp})
         *p = work_alloc<float>(T_buf * C);
     for (float** p : {&W.res, &W.a, &W.xq, &W.xk, &W.xv})
