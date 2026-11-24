@@ -215,6 +215,13 @@ void serve_sequences(Model& M, int width, int ctx, int chunk, int image_token, s
             else fast_block_launches(M, W, T, mode, buf, &rows);
         };
         CU(cudaMemcpyAsync(rows.device_slots, rows.slots.data(), T * sizeof(int), cudaMemcpyHostToDevice, g_s));
+        if (g_abl_tokens >= 0 && g_abl_srow && T <= kAblRows) {   // each row's ablation strength by its generated tokens
+            for (int t = 0; t < T; ++t) {
+                const BatchRequest& r = *slots[rows.slots[t]];
+                g_abl_srow_h[t] = r.pos - (int) r.ids.size() < g_abl_tokens ? g_abl_s : 0.0f;
+            }
+            CU(cudaMemcpyAsync(g_abl_srow, g_abl_srow_h, T * sizeof(float), cudaMemcpyHostToDevice, g_s));
+        }
         if (g_graph) {
             if (!graph.exec || graph_slots != rows.slots || graph_buckets != rows.buckets || graph_mode != mode) {
                 if (graph.exec) {

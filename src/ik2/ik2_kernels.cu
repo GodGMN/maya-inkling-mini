@@ -5564,7 +5564,8 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
 
 }  // namespace
 
-__global__ void project_out_kernel(float* __restrict__ y, const float* __restrict__ r, float s, float c, int D) {
+__global__ void project_out_kernel(float* __restrict__ y, const float* __restrict__ r, float s, float c, int D,
+                                   const float* __restrict__ srow) {
     float* row = y + (size_t) blockIdx.x * D;
     __shared__ float part[256];
     float d = 0.0f;
@@ -5575,12 +5576,12 @@ __global__ void project_out_kernel(float* __restrict__ y, const float* __restric
         if (threadIdx.x < w) part[threadIdx.x] += part[threadIdx.x + w];
         __syncthreads();
     }
-    const float k = s * (part[0] - c);
+    const float k = (srow ? srow[blockIdx.x] : s) * (part[0] - c);
     for (int i = threadIdx.x; i < D; i += blockDim.x) row[i] -= k * r[i];
 }
-void project_out(float* y, const float* r, float s, float c, int T, int D, cudaStream_t st) {
+void project_out(float* y, const float* r, float s, float c, int T, int D, cudaStream_t st, const float* srow) {
     if (T <= 0) return;
-    project_out_kernel<<<T, 256, 0, st>>>(y, r, s, c, D);
+    project_out_kernel<<<T, 256, 0, st>>>(y, r, s, c, D, srow);
     check("project_out");
 }
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s) {

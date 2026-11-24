@@ -168,6 +168,20 @@ void test_project_out() {
                     std::memcmp(one.data(), got.data() + (size_t) 4 * D, (size_t) D * sizeof(float)) == 0);
         cudaFree(dy), cudaFree(d1);
     }
+    {   // per-row strengths: row t takes srow[t] (0 leaves it as it was)
+        std::vector<float> srow(T);
+        for (int t = 0; t < T; ++t) srow[t] = t % 3 == 0 ? 0.0f : 1.0f + 0.1f * t;
+        float *dy = dev(x), *ds = dev(srow);
+        k::project_out(dy, dr, 9.0f, 0.0f, T, D, 0, ds);
+        std::vector<double> want((size_t) T * D);
+        for (int t = 0; t < T; ++t) {
+            double d = 0;
+            for (int e = 0; e < D; ++e) d += (double) r[e] * x[(size_t) t * D + e];
+            for (int e = 0; e < D; ++e) want[(size_t) t * D + e] = x[(size_t) t * D + e] - srow[t] * d * r[e];
+        }
+        expect("project_out (per-row strengths)", host(dy, want.size()), want, 2e-5, 1e-4);
+        cudaFree(dy), cudaFree(ds);
+    }
     k::project_out(nullptr, dr, 1.0f, 0.0f, 0, D, 0);   // T 0: nothing
     cudaFree(dr);
 }

@@ -1485,15 +1485,31 @@ float g_abl_s = 1.0f;
 int g_abl_lo = 0, g_abl_hi = 1 << 30;
 std::vector<float> g_abl_c;
 int g_abl_vis = -1;   // the visit being run (set by each path's visit loop)
+// IK2_ABLATE_PREFILL_ONLY=1: project only while a prompt is read (forward / forward_prefill_sup), not on the tokens
+// a request generates (the resident token and block paths)
+bool g_abl_decode = true;
+bool g_abl_in_decode = false;
+// IK2_ABLATE_DECODE_TOKENS=N (the batch server): on generated tokens, project only a request's first N; each decode
+// row's strength is read from g_abl_srow (set by the scheduler before every step, so recorded graphs follow it)
+int g_abl_tokens = -1;
+constexpr int kAblRows = 256;
+float* g_abl_srow = nullptr;     // device [kAblRows]
+float* g_abl_srow_h = nullptr;   // pinned mirror
+struct AblDecodeScope {   // marks a decode path for its duration
+    bool was = g_abl_in_decode;
+    AblDecodeScope() { g_abl_in_decode = true; }
+    ~AblDecodeScope() { g_abl_in_decode = was; }
+};
 
 // rows y[0 .. T) ([T][C], on the current GPU's stream); kind 0 the embedding, 1 a visit's attention state, 2 its
 // MoE state (the visit: g_abl_vis)
 void abl(float* y, int T, int C, int kind) {
-    if (g_abl_r.empty() || T <= 0) return;
+    if (g_abl_r.empty() || T <= 0 || (g_abl_in_decode && !g_abl_decode)) return;
     if (kind == 0 ? g_abl_lo > 0 : (g_abl_vis < g_abl_lo || g_abl_vis >= g_abl_hi)) return;
     const int site = kind == 0 ? 0 : 1 + 2 * g_abl_vis + (kind - 1);
     const float c = g_abl_c.empty() ? 0.0f : g_abl_c.at((size_t) site);
-    k::project_out(y, g_abl_r[g_cur], g_abl_s, c, T, C, g_s);
+    k::project_out(y, g_abl_r[g_cur], g_abl_s, c, T, C, g_s,
+                   g_abl_in_decode && g_abl_tokens >= 0 && T <= kAblRows ? g_abl_srow : nullptr);
 }
 
 // (kCand: sampling's candidates - the resident token path finds the largest logits on the device, g_cand; any other
@@ -2468,6 +2484,7 @@ void decode_attention(const Config& c, const Layer& Ly, int attention_bucket, fl
 }
 
 void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_bucket) {
+    AblDecodeScope abl_decode;
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     const size_t Cb = (size_t) C * 4;
@@ -2925,6 +2942,7 @@ void sequence_attention(Model& M, Work& W, int vis, bool sep, const SequenceRows
 
 void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& buf = g_blk,
                          const SequenceRows* rows = nullptr) {
+    AblDecodeScope abl_decode;
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel, S = T * c.K;
     const size_t TC = (size_t) T * C, TCb = TC * 4;
@@ -4779,6 +4797,8 @@ int main(int argc, char** argv) {
         CU(cudaSetDevice(0));
         CU(cudaMalloc(&g_abl_r[0], r.size() * sizeof(float)));
         CU(cudaMemcpy(g_abl_r[0], r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice));
+        g_abl_decode = !(getenv("IK2_ABLATE_PREFILL_ONLY") && std::atoi(getenv("IK2_ABLATE_PREFILL_ONLY")));
+        if (const char* n = getenv("IK2_ABLATE_DECODE_TOKENS"); n && *n) g_abl_tokens = std::max(0, std::atoi(n));
         if (const char* v = getenv("IK2_ABLATE_VISITS"); v && *v) {
             if (std::sscanf(v, "%d:%d", &g_abl_lo, &g_abl_hi) != 2 || g_abl_lo < 0 || g_abl_hi <= g_abl_lo)
                 die("IK2_ABLATE_VISITS: LO:HI");
@@ -4791,8 +4811,12 @@ int main(int argc, char** argv) {
             std::fclose(fm);
             if (gm != g_abl_c.size()) die("IK2_ABLATE_MEAN: not 1 + 2 n_visit floats");
         }
-        std::fprintf(stderr, "ablate: %s, scale %g, visits %d:%d%s\n", p, (double) g_abl_s, g_abl_lo, g_abl_hi,
-                     g_abl_c.empty() ? "" : ", mean targets");
+        CU(cudaMalloc(&g_abl_srow, kAblRows * sizeof(float)));
+        CU(cudaMallocHost(&g_abl_srow_h, kAblRows * sizeof(float)));
+        for (int i = 0; i < kAblRows; ++i) g_abl_srow_h[i] = g_abl_s;   // (until a scheduler says otherwise: all)
+        CU(cudaMemcpy(g_abl_srow, g_abl_srow_h, kAblRows * sizeof(float), cudaMemcpyHostToDevice));
+        std::fprintf(stderr, "ablate: %s, scale %g, visits %d:%d%s%s, decode tokens %d\n", p, (double) g_abl_s, g_abl_lo,
+                     g_abl_hi, g_abl_c.empty() ? "" : ", mean targets", g_abl_decode ? "" : ", prompt only", g_abl_tokens);
     }
     if (dual()) {
         int p01 = 0, p10 = 0;
