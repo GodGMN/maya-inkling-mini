@@ -5565,23 +5565,30 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
 }  // namespace
 
 __global__ void project_out_kernel(float* __restrict__ y, const float* __restrict__ r, float s, float c, int D,
-                                   const float* __restrict__ srow) {
+                                   const float* __restrict__ srow, bool keep_norm) {
     float* row = y + (size_t) blockIdx.x * D;
-    __shared__ float part[256];
-    float d = 0.0f;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) d += row[i] * r[i];
+    __shared__ float part[256], part2[256];
+    float d = 0.0f, n2 = 0.0f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) d += row[i] * r[i], n2 += row[i] * row[i];
     part[threadIdx.x] = d;
+    part2[threadIdx.x] = n2;
     __syncthreads();
     for (int w = blockDim.x / 2; w > 0; w >>= 1) {
-        if (threadIdx.x < w) part[threadIdx.x] += part[threadIdx.x + w];
+        if (threadIdx.x < w) part[threadIdx.x] += part[threadIdx.x + w], part2[threadIdx.x] += part2[threadIdx.x + w];
         __syncthreads();
     }
     const float k = (srow ? srow[blockIdx.x] : s) * (part[0] - c);
-    for (int i = threadIdx.x; i < D; i += blockDim.x) row[i] -= k * r[i];
+    float g = 1.0f;   // |y|^2 after: |y|^2 - 2 k (r . y) + k^2 (r unit)
+    if (keep_norm) {
+        const float after = part2[0] - 2.0f * k * part[0] + k * k;
+        g = after > 1e-30f ? sqrtf(part2[0] / after) : 1.0f;
+    }
+    for (int i = threadIdx.x; i < D; i += blockDim.x) row[i] = (row[i] - k * r[i]) * g;
 }
-void project_out(float* y, const float* r, float s, float c, int T, int D, cudaStream_t st, const float* srow) {
+void project_out(float* y, const float* r, float s, float c, int T, int D, cudaStream_t st, const float* srow,
+                 bool keep_norm) {
     if (T <= 0) return;
-    project_out_kernel<<<T, 256, 0, st>>>(y, r, s, c, D, srow);
+    project_out_kernel<<<T, 256, 0, st>>>(y, r, s, c, D, srow, keep_norm);
     check("project_out");
 }
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s) {

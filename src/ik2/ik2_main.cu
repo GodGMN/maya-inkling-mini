@@ -1492,6 +1492,7 @@ bool g_abl_in_decode = false;
 // IK2_ABLATE_DECODE_TOKENS=N (the batch server): on generated tokens, project only a request's first N; each decode
 // row's strength is read from g_abl_srow (set by the scheduler before every step, so recorded graphs follow it)
 int g_abl_tokens = -1;
+bool g_abl_keep_norm = false;   // IK2_ABLATE_KEEP_NORM=1: each state keeps its length
 constexpr int kAblRows = 256;
 float* g_abl_srow = nullptr;     // device [kAblRows]
 float* g_abl_srow_h = nullptr;   // pinned mirror
@@ -1509,7 +1510,7 @@ void abl(float* y, int T, int C, int kind) {
     const int site = kind == 0 ? 0 : 1 + 2 * g_abl_vis + (kind - 1);
     const float c = g_abl_c.empty() ? 0.0f : g_abl_c.at((size_t) site);
     k::project_out(y, g_abl_r[g_cur], g_abl_s, c, T, C, g_s,
-                   g_abl_in_decode && g_abl_tokens >= 0 && T <= kAblRows ? g_abl_srow : nullptr);
+                   g_abl_in_decode && g_abl_tokens >= 0 && T <= kAblRows ? g_abl_srow : nullptr, g_abl_keep_norm);
 }
 
 // (kCand: sampling's candidates - the resident token path finds the largest logits on the device, g_cand; any other
@@ -4799,6 +4800,7 @@ int main(int argc, char** argv) {
         CU(cudaMemcpy(g_abl_r[0], r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice));
         g_abl_decode = !(getenv("IK2_ABLATE_PREFILL_ONLY") && std::atoi(getenv("IK2_ABLATE_PREFILL_ONLY")));
         if (const char* n = getenv("IK2_ABLATE_DECODE_TOKENS"); n && *n) g_abl_tokens = std::max(0, std::atoi(n));
+        g_abl_keep_norm = getenv("IK2_ABLATE_KEEP_NORM") && std::atoi(getenv("IK2_ABLATE_KEEP_NORM"));
         if (const char* v = getenv("IK2_ABLATE_VISITS"); v && *v) {
             if (std::sscanf(v, "%d:%d", &g_abl_lo, &g_abl_hi) != 2 || g_abl_lo < 0 || g_abl_hi <= g_abl_lo)
                 die("IK2_ABLATE_VISITS: LO:HI");

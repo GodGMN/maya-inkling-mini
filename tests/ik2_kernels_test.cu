@@ -182,6 +182,22 @@ void test_project_out() {
         expect("project_out (per-row strengths)", host(dy, want.size()), want, 2e-5, 1e-4);
         cudaFree(dy), cudaFree(ds);
     }
+    {   // norm-preserving: the projection, then each row back to its length
+        float* dy = dev(x);
+        k::project_out(dy, dr, 1.0f, 0.0f, T, D, 0, nullptr, true);
+        std::vector<double> want((size_t) T * D);
+        for (int t = 0; t < T; ++t) {
+            double d = 0, n0 = 0, n1 = 0;
+            for (int e = 0; e < D; ++e) d += (double) r[e] * x[(size_t) t * D + e], n0 += (double) x[(size_t) t * D + e] * x[(size_t) t * D + e];
+            for (int e = 0; e < D; ++e) {
+                want[(size_t) t * D + e] = x[(size_t) t * D + e] - d * r[e];
+                n1 += want[(size_t) t * D + e] * want[(size_t) t * D + e];
+            }
+            for (int e = 0; e < D; ++e) want[(size_t) t * D + e] *= std::sqrt(n0 / n1);
+        }
+        expect("project_out (norm kept)", host(dy, want.size()), want, 2e-5, 1e-4);
+        cudaFree(dy);
+    }
     k::project_out(nullptr, dr, 1.0f, 0.0f, 0, D, 0);   // T 0: nothing
     cudaFree(dr);
 }
