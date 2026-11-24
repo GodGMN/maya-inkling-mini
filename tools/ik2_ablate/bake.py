@@ -78,6 +78,35 @@ def quant_q8(x: np.ndarray) -> np.ndarray:
     return out.reshape(-1)
 
 
+IQ4NL_MID = (IQ4NL_VALUES[1:] + IQ4NL_VALUES[:-1]) / 2
+
+
+def quant_iq4nl(x: np.ndarray) -> np.ndarray:
+    """IQ4_NL blocks of 32 (fp16 scale, 16 bytes: values j and j + 16 in a byte's low and high nibble), as llama.cpp's
+    quantize_row_iq4_nl: 15 trial scales around amax / -127, the nearest level each, the least-squares scale."""
+    blk = x.reshape(-1, 32).astype(np.float32)
+    m = np.take_along_axis(blk, np.abs(blk).argmax(axis=1)[:, None], axis=1)   # the signed value of largest size
+    best_err = np.full(len(blk), np.inf, np.float32)
+    best_q = np.zeros(blk.shape, np.uint8)
+    best_d = np.zeros(len(blk), np.float32)
+    safe = np.where(m == 0, 1.0, m)
+    for t in range(-7, 8):
+        inv = (t + IQ4NL_VALUES[0]) / safe                       # 1 / d for this trial
+        q = np.searchsorted(IQ4NL_MID, blk * inv).astype(np.uint8)
+        v = IQ4NL_VALUES[q]
+        sq = (v * v).sum(axis=1)
+        d = np.where(sq > 0, (blk * v).sum(axis=1) / np.where(sq > 0, sq, 1), 0).astype(np.float32)
+        d = d.astype(np.float16).astype(np.float32)
+        err = ((blk - d[:, None] * v) ** 2).sum(axis=1)
+        take = err < best_err
+        best_err[take], best_d[take], best_q[take] = err[take], d[take], q[take]
+    best_d[m[:, 0] == 0] = 0
+    out = np.empty((len(blk), 18), np.uint8)
+    out[:, :2] = best_d.astype(np.float16).view(np.uint8).reshape(-1, 2)
+    out[:, 2:] = best_q[:, :16] | (best_q[:, 16:] << 4)
+    return out.reshape(-1)
+
+
 def basis(r: np.ndarray, taps: np.ndarray | None) -> np.ndarray:
     """The orthonormal rows the writer's output must not reach: r alone, or span{a_j * r}."""
     if taps is None:
@@ -168,6 +197,7 @@ def main() -> int:
     ap.add_argument("--writers", default="attn,ffn")
     ap.add_argument("--mode", choices=("conv", "r"), default="conv")
     ap.add_argument("--scale", type=float, default=1.0)
+    ap.add_argument("--keep-type", action="store_true", help="re-quantize IQ4_NL tensors as IQ4_NL (else Q8_0)")
     ap.add_argument("--full", action="store_true", help="a whole GGUF (OUTDIR/model.gguf) instead of an override shard")
     a = ap.parse_args()
     f = GGUFFile(a.base)
@@ -201,13 +231,15 @@ def main() -> int:
             for e in range(E):
                 w = dequant(buf[e * per:(e + 1) * per], type_id(t), C * K).reshape(C, K)
                 w2 = edit_rows(w, U, a.scale)
-                q = quant_q8(w2)
-                back = dequant(q, Q8_0, C * K).reshape(C, K)
+                oty = IQ4_NL if (a.keep_type and type_id(t) == IQ4_NL) else Q8_0
+                q = quant_iq4nl(w2) if oty == IQ4_NL else quant_q8(w2)
+                back = dequant(q, oty, C * K).reshape(C, K)
                 left = max(left, float(np.linalg.norm(U @ back) / max(1e-12, np.linalg.norm(U @ w))))
                 blocks.append(q)
             data = np.concatenate(blocks)
-            out.append((t.name, list(t.shape), Q8_0, data))
-            print(f"{t.name}: {t.type_name} -> Q8_0, basis {U.shape[0]}, component left after Q8 {left:.4f}", flush=True)
+            oname = "IQ4_NL" if oty == IQ4_NL else "Q8_0"
+            out.append((t.name, list(t.shape), oty, data))
+            print(f"{t.name}: {t.type_name} -> {oname}, basis {U.shape[0]}, component left after quantization {left:.4f}", flush=True)
     a.outdir.mkdir(parents=True, exist_ok=True)
     if a.full:   # every tensor in the base's order, the edited ones replaced; the metadata copied verbatim
         kv, n_kv, align = kv_block(a.base)
