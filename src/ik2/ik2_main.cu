@@ -4798,7 +4798,7 @@ int main(int argc, char** argv) {
         if (!(n2 > 0.0) || !std::isfinite(n2)) die("IK2_ABLATE: a zero or non-finite direction");
         for (float& x : r) x = (float) (x / std::sqrt(n2));
         if (getenv("IK2_ABLATE_SCALE")) g_abl_s = (float) std::atof(getenv("IK2_ABLATE_SCALE"));
-        if (!(g_abl_s > 0.0f) || !std::isfinite(g_abl_s)) die("IK2_ABLATE_SCALE: a positive number");
+        if (!(g_abl_s >= 0.0f) || !std::isfinite(g_abl_s)) die("IK2_ABLATE_SCALE: 0 or a positive number");
         g_abl_r.resize(1);
         CU(cudaSetDevice(0));
         CU(cudaMalloc(&g_abl_r[0], r.size() * sizeof(float)));
