@@ -5577,7 +5577,7 @@ __global__ void project_out_kernel(float* __restrict__ y, const float* __restric
         if (threadIdx.x < w) part[threadIdx.x] += part[threadIdx.x + w], part2[threadIdx.x] += part2[threadIdx.x + w];
         __syncthreads();
     }
-    const float k = (srow ? srow[blockIdx.x] : s) * (part[0] - c);
+    const float k = (srow ? srow[blockIdx.x] * s : s) * (part[0] - c);
     float g = 1.0f;   // |y|^2 after: |y|^2 - 2 k (r . y) + k^2 (r unit)
     if (keep_norm) {
         const float after = part2[0] - 2.0f * k * part[0] + k * k;

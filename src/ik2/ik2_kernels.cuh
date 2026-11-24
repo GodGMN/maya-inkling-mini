@@ -41,7 +41,7 @@ static_assert(sizeof(Fp4KvBlock) == 18);
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s);
 /// rows y[0 .. T) ([T][D]) each lose a direction: y <- y - s r (r . y - c) (r unit length; c 0: the component goes,
 /// else it is moved to c).  A block a row, a fixed-order sum, so a row's bits do not depend on T.  Refusal ablation.
-/// srow (device, T floats) when given: row t's own s instead (a request's strength by its generated tokens).
+/// srow (device, T floats) when given: row t's strength is srow[t] * s (a request's on/off by its generated tokens).
 /// keep_norm: then each row is rescaled to the length it had (norm-preserving ablation).
 void project_out(float* y, const float* r, float s, float c, int T, int D, cudaStream_t st, const float* srow = nullptr,
                  bool keep_norm = false);

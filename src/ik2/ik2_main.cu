@@ -1493,6 +1493,9 @@ bool g_abl_in_decode = false;
 // row's strength is read from g_abl_srow (set by the scheduler before every step, so recorded graphs follow it)
 int g_abl_tokens = -1;
 bool g_abl_keep_norm = false;   // IK2_ABLATE_KEEP_NORM=1: each state keeps its length
+// IK2_ABLATE_VISIT_SCALES=LO:HI:S[,LO:HI:S...]: visits LO .. HI-1 use strength S (others IK2_ABLATE_SCALE; the
+// embedding too); overrides IK2_ABLATE_VISITS
+std::vector<float> g_abl_vs;
 constexpr int kAblRows = 256;
 float* g_abl_srow = nullptr;     // device [kAblRows]
 float* g_abl_srow_h = nullptr;   // pinned mirror
@@ -1509,7 +1512,9 @@ void abl(float* y, int T, int C, int kind) {
     if (kind == 0 ? g_abl_lo > 0 : (g_abl_vis < g_abl_lo || g_abl_vis >= g_abl_hi)) return;
     const int site = kind == 0 ? 0 : 1 + 2 * g_abl_vis + (kind - 1);
     const float c = g_abl_c.empty() ? 0.0f : g_abl_c.at((size_t) site);
-    k::project_out(y, g_abl_r[g_cur], g_abl_s, c, T, C, g_s,
+    const float s = kind != 0 && !g_abl_vs.empty() ? g_abl_vs.at((size_t) g_abl_vis) : g_abl_s;
+    if (s == 0.0f) return;
+    k::project_out(y, g_abl_r[g_cur], s, c, T, C, g_s,
                    g_abl_in_decode && g_abl_tokens >= 0 && T <= kAblRows ? g_abl_srow : nullptr, g_abl_keep_norm);
 }
 
@@ -4801,6 +4806,21 @@ int main(int argc, char** argv) {
         g_abl_decode = !(getenv("IK2_ABLATE_PREFILL_ONLY") && std::atoi(getenv("IK2_ABLATE_PREFILL_ONLY")));
         if (const char* n = getenv("IK2_ABLATE_DECODE_TOKENS"); n && *n) g_abl_tokens = std::max(0, std::atoi(n));
         g_abl_keep_norm = getenv("IK2_ABLATE_KEEP_NORM") && std::atoi(getenv("IK2_ABLATE_KEEP_NORM"));
+        if (const char* v = getenv("IK2_ABLATE_VISIT_SCALES"); v && *v) {
+            g_abl_vs.assign((size_t) c.n_visit, 0.0f);
+            std::string spec = v;
+            for (size_t at = 0; at < spec.size();) {
+                const size_t end = std::min(spec.find(',', at), spec.size());
+                int lo = 0, hi = 0;
+                float sv = 0.0f;
+                if (std::sscanf(spec.substr(at, end - at).c_str(), "%d:%d:%f", &lo, &hi, &sv) != 3 || lo < 0 ||
+                    hi > c.n_visit || lo >= hi)
+                    die("IK2_ABLATE_VISIT_SCALES: LO:HI:S[,LO:HI:S...]");
+                for (int i = lo; i < hi; ++i) g_abl_vs[(size_t) i] = sv;
+                at = end + 1;
+            }
+            g_abl_lo = 0, g_abl_hi = c.n_visit;   // (the scales say which visits)
+        }
         if (const char* v = getenv("IK2_ABLATE_VISITS"); v && *v) {
             if (std::sscanf(v, "%d:%d", &g_abl_lo, &g_abl_hi) != 2 || g_abl_lo < 0 || g_abl_hi <= g_abl_lo)
                 die("IK2_ABLATE_VISITS: LO:HI");
@@ -4815,7 +4835,7 @@ int main(int argc, char** argv) {
         }
         CU(cudaMalloc(&g_abl_srow, kAblRows * sizeof(float)));
         CU(cudaMallocHost(&g_abl_srow_h, kAblRows * sizeof(float)));
-        for (int i = 0; i < kAblRows; ++i) g_abl_srow_h[i] = g_abl_s;   // (until a scheduler says otherwise: all)
+        for (int i = 0; i < kAblRows; ++i) g_abl_srow_h[i] = 1.0f;   // (until a scheduler says otherwise: all)
         CU(cudaMemcpy(g_abl_srow, g_abl_srow_h, kAblRows * sizeof(float), cudaMemcpyHostToDevice));
         std::fprintf(stderr, "ablate: %s, scale %g, visits %d:%d%s%s, decode tokens %d\n", p, (double) g_abl_s, g_abl_lo,
                      g_abl_hi, g_abl_c.empty() ? "" : ", mean targets", g_abl_decode ? "" : ", prompt only", g_abl_tokens);
