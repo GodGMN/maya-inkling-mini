@@ -3,11 +3,16 @@
   <img src="assets/tintero-wordmark.png" alt="Tintero" width="300">
 </picture></h1>
 
-Tintero is a local inference server for [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini). It runs the full quantized model on one 24 GB Radeon RX 7900 XTX. Point a chat client or coding agent at its OpenAI-compatible API to work with long documents, make tool calls, or ask questions about screenshots.
+Tintero is a local inference server for [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini). It runs the full quantized model on one 24 GB Radeon RX 7900 XTX.
 
-On the 7900 XTX, Tintero generated **117 tokens per second** after a 512-token prompt. For longer conversations, one chat can use **393,216 tokens** of context, or three chats can each use **131,072**. [Measurements and hardware configuration](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
+The Docker image runs stock Inkling by default. Set `IK2_ABLATE_MODE=on` to use the abliterated version with the same weights. On the RX 7900 XTX, it generated 114.6 tokens/s with the flag on and 118.6 tokens/s with it off.
+
+[![RX 7900 XTX: one chat generates 117.1 tokens/s after a 512-token prompt. Total batched throughput reaches 327.8 tokens/s across 32 streams.](docs/assets/rx7900xtx-speed.svg)](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
 
 ## Quick start on RX 7900 XTX
+
+> [!TIP]
+> Using a coding agent? Send it this README and ask: “Set up Tintero on this machine and verify it with the test request below.”
 
 This starts a text-only server on Linux. You’ll need the ROCm development tools under `/opt/rocm` (tested with 7.2.1), a C++ compiler, CMake 3.24+, Ninja, Git, and Python 3.10+ with `venv`. The model download is about 18 GB.
 
