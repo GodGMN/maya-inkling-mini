@@ -197,6 +197,9 @@ def main() -> int:
     ap.add_argument("--writers", default="attn,ffn")
     ap.add_argument("--mode", choices=("conv", "r"), default="conv")
     ap.add_argument("--scale", type=float, default=1.0)
+    ap.add_argument("--layer-scales", default="", help="optional per-range scales e.g. 0-5:0.3,6-17:0.5,18-23:1.0")
+    ap.add_argument("--include-embed", action="store_true", help="also project token_embd.weight off r * token_embd_norm")
+    ap.add_argument("--embed-scale", type=float, default=None, help="override scale for token_embd (defaults to --scale)")
     ap.add_argument("--keep-type", action="store_true", help="re-quantize IQ4_NL tensors as IQ4_NL (else Q8_0)")
     ap.add_argument("--full", action="store_true", help="a whole GGUF (OUTDIR/model.gguf) instead of an override shard")
     a = ap.parse_args()
@@ -211,10 +214,55 @@ def main() -> int:
     r /= np.linalg.norm(r)
     layers = sorted({l for part in a.layers.split(",") for l in
                      (range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1))})
+    scale_map = {l: a.scale for l in layers}
+    if a.layer_scales:
+        for spec in a.layer_scales.split(","):
+            if not spec.strip():
+                continue
+            rng, sv = spec.rsplit(":", 1)
+            lo, hi = (int(rng.split("-")[0]), int(rng.split("-")[-1]))
+            for l in range(lo, hi + 1):
+                scale_map[l] = float(sv)
     writers = set(a.writers.split(","))
     by = {t.name: t for t in f.tensors}
     out = []
+    if a.include_embed:
+        t_emb = by["token_embd.weight"]
+        V = t_emb.shape[1]
+        assert t_emb.shape[0] == C, (t_emb.name, t_emb.shape)
+        if "token_embd_norm.weight" in by:
+            tn = by["token_embd_norm.weight"]
+            wn = dequant(raw(f, a.base, tn), F32, C).astype(np.float64)
+            u_emb = (r * wn)
+        else:
+            u_emb = r.copy()
+        u_emb = (u_emb / max(1e-12, np.linalg.norm(u_emb)))[None, :]
+        escale = a.scale if a.embed_scale is None else a.embed_scale
+        buf = raw(f, a.base, t_emb)
+        vals, size = BLOCK[type_id(t_emb)]
+        row_bytes = C // vals * size
+        chunk = 4096
+        blocks = []
+        left = 0.0
+        for s0 in range(0, V, chunk):
+            s1 = min(V, s0 + chunk)
+            n_rows = s1 - s0
+            w = dequant(buf[s0 * row_bytes:s1 * row_bytes], type_id(t_emb), n_rows * C).reshape(n_rows, C)
+            proj = w.astype(np.float64) @ u_emb.T
+            w2 = (w.astype(np.float64) - escale * (proj @ u_emb)).astype(np.float32)
+            q = quant_q8(w2)
+            back = dequant(q, Q8_0, n_rows * C).reshape(n_rows, C)
+            denom = float(np.linalg.norm(w.astype(np.float64) @ u_emb.T))
+            if denom > 1e-12:
+                left = max(left, float(np.linalg.norm(back.astype(np.float64) @ u_emb.T) / denom))
+            blocks.append(q)
+        data = np.concatenate(blocks)
+        out.append((t_emb.name, list(t_emb.shape), Q8_0, data))
+        print(f"{t_emb.name}: {t_emb.type_name} -> Q8_0, scale {escale}, component left {left:.4f}", flush=True)
     for l in layers:
+        lscale = scale_map[l]
+        if lscale == 0.0:
+            continue
         for w_name, conv in (("attn_output.weight", "attn_post_conv.weight"), ("ffn_down_exps.weight", "ffn_post_conv.weight")):
             if ("attn" if w_name.startswith("attn") else "ffn") not in writers:
                 continue
@@ -230,7 +278,7 @@ def main() -> int:
             left = 0.0
             for e in range(E):
                 w = dequant(buf[e * per:(e + 1) * per], type_id(t), C * K).reshape(C, K)
-                w2 = edit_rows(w, U, a.scale)
+                w2 = edit_rows(w, U, lscale)
                 oty = IQ4_NL if (a.keep_type and type_id(t) == IQ4_NL) else Q8_0
                 q = quant_iq4nl(w2) if oty == IQ4_NL else quant_q8(w2)
                 back = dequant(q, oty, C * K).reshape(C, K)
@@ -239,7 +287,7 @@ def main() -> int:
             data = np.concatenate(blocks)
             oname = "IQ4_NL" if oty == IQ4_NL else "Q8_0"
             out.append((t.name, list(t.shape), oty, data))
-            print(f"{t.name}: {t.type_name} -> {oname}, basis {U.shape[0]}, component left after quantization {left:.4f}", flush=True)
+            print(f"{t.name}: {t.type_name} -> {oname}, scale {lscale}, basis {U.shape[0]}, component left after quantization {left:.4f}", flush=True)
     a.outdir.mkdir(parents=True, exist_ok=True)
     if a.full:   # every tensor in the base's order, the edited ones replaced; the metadata copied verbatim
         kv, n_kv, align = kv_block(a.base)
