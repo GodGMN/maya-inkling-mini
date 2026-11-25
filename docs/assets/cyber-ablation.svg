@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 285" width="960" height="285" role="img" aria-label="One-Flag Runtime Cyber Abliteration Benchmarks">
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b101b"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="cyberGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#2dd4bf"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="keepGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#818cf8"/>
+      <stop offset="100%" stop-color="#60a5fa"/>
+    </linearGradient>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="285" rx="16" fill="url(#bg2)" stroke="#1f2937" stroke-width="1.5"/>
+
+  <!-- Header -->
+  <text x="28" y="36" class="sans" font-size="17" font-weight="700" fill="#f8fafc">One-Flag Runtime Abliteration (<tspan class="mono" font-size="14" fill="#2dd4bf">IK2_ABLATE_MODE=cyber</tspan>)</text>
+  <text x="28" y="55" class="sans" font-size="12" fill="#94a3b8">Coding-orthogonalized 9 KB vector (v21-pc4 · KEEP_NORM=1) · Same stock GGUF · ~3% speed cost · Graded by Qwen3Guard-Gen-8B</text>
+
+  <!-- Left panel: Unlock gains -->
+  <g transform="translate(28, 74)">
+    <rect x="0" y="0" width="444" height="186" rx="12" fill="#0f172a" stroke="#1e293b"/>
+    <text x="18" y="26" class="sans" font-size="13" font-weight="600" fill="#f1f5f9">Refusal Removal (Stock vs. Cyber Flag)</text>
+
+    <!-- AdvBench -->
+    <text x="18" y="58" class="sans" font-size="12" fill="#e2e8f0">AdvBench Harmful (104)</text>
+    <text x="426" y="58" text-anchor="end" class="mono" font-size="11.5" fill="#2dd4bf">90.4% <tspan fill="#64748b">(vs 0% stock)</tspan></text>
+    <rect x="18" y="66" width="408" height="10" rx="5" fill="#1e293b"/>
+    <rect x="18" y="66" width="369" height="10" rx="5" fill="url(#cyberGrad)"/>
+
+    <!-- MITRE-120 -->
+    <text x="18" y="104" class="sans" font-size="12" fill="#e2e8f0">CyberSecEval-MITRE (120 · 4K)</text>
+    <text x="426" y="104" text-anchor="end" class="mono" font-size="11.5" fill="#2dd4bf">74.2% <tspan fill="#64748b">(10 ref vs 100 stock)</tspan></text>
+    <rect x="18" y="112" width="408" height="10" rx="5" fill="#1e293b"/>
+    <rect x="18" y="112" width="231" height="10" rx="5" fill="url(#cyberGrad)"/>
+    <rect x="249" y="112" width="72" height="10" rx="0" fill="#2dd4bf" opacity="0.38"/>
+
+    <!-- Harmless -->
+    <text x="18" y="150" class="sans" font-size="12" fill="#e2e8f0">Harmless Non-Refusal (104)</text>
+    <text x="426" y="150" text-anchor="end" class="mono" font-size="11.5" fill="#34d399">100.0% <tspan fill="#64748b">(0 over-refusals)</tspan></text>
+    <rect x="18" y="158" width="408" height="10" rx="5" fill="#1e293b"/>
+    <rect x="18" y="158" width="408" height="10" rx="5" fill="#10b981"/>
+  </g>
+
+  <!-- Right panel: Zero-collapse capability retention -->
+  <g transform="translate(488, 74)">
+    <rect x="0" y="0" width="444" height="186" rx="12" fill="#0f172a" stroke="#1e293b"/>
+    <text x="18" y="26" class="sans" font-size="13" font-weight="600" fill="#f1f5f9">Coding, Agentic &amp; Cyber Knowledge Preserved</text>
+
+    <!-- Pi Bench -->
+    <text x="18" y="54" class="sans" font-size="11.5" fill="#cbd5e1">Pi Agentic Bugfix (5 repos)</text>
+    <rect x="188" y="44" width="166" height="11" rx="5.5" fill="#1e293b"/>
+    <rect x="188" y="44" width="166" height="11" rx="5.5" fill="#10b981"/>
+    <text x="426" y="54" text-anchor="end" class="mono" font-size="11.5" font-weight="700" fill="#34d399">5/5 (100%)</text>
+
+    <!-- GSM8K -->
+    <text x="18" y="83" class="sans" font-size="11.5" fill="#cbd5e1">GSM8K-128 Math</text>
+    <rect x="188" y="73" width="166" height="11" rx="5.5" fill="#1e293b"/>
+    <rect x="188" y="73" width="157" height="11" rx="5.5" fill="url(#keepGrad)"/>
+    <text x="426" y="83" text-anchor="end" class="mono" font-size="11.5" fill="#f1f5f9">94.5% (121)</text>
+
+    <!-- CyberMetric -->
+    <text x="18" y="112" class="sans" font-size="11.5" fill="#cbd5e1">CyberMetric-500</text>
+    <rect x="188" y="102" width="166" height="11" rx="5.5" fill="#1e293b"/>
+    <rect x="188" y="102" width="154" height="11" rx="5.5" fill="url(#keepGrad)"/>
+    <text x="426" y="112" text-anchor="end" class="mono" font-size="11.5" fill="#f1f5f9">92.6% (463)</text>
+
+    <!-- MMLU -->
+    <text x="18" y="141" class="sans" font-size="11.5" fill="#cbd5e1">MMLU-256 (0 multi)</text>
+    <rect x="188" y="131" width="166" height="11" rx="5.5" fill="#1e293b"/>
+    <rect x="188" y="131" width="134" height="11" rx="5.5" fill="url(#keepGrad)"/>
+    <text x="426" y="141" text-anchor="end" class="mono" font-size="11.5" fill="#f1f5f9">80.9% (207)</text>
+
+    <!-- CTIBench MCQ -->
+    <text x="18" y="170" class="sans" font-size="11.5" fill="#cbd5e1">CTIBench MCQ-250</text>
+    <rect x="188" y="160" width="166" height="11" rx="5.5" fill="#1e293b"/>
+    <rect x="188" y="160" width="124" height="11" rx="5.5" fill="url(#keepGrad)"/>
+    <text x="426" y="170" text-anchor="end" class="mono" font-size="11.5" fill="#f1f5f9">74.8% (+1.6%)</text>
+  </g>
+</svg>
