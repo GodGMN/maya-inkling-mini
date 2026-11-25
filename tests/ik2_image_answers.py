@@ -18,20 +18,22 @@ def png(left, right):
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(row * height)) + chunk(b"IEND", b"")
 
 
+def setup_screenshots():
+    media = Path(__file__).resolve().parents[1] / "docs/media/setup-tui"
+    question = "What percentage is printed beside the progress bar? Reply with the number and percent sign only."
+    return [("setup-progress", (media / "03-compiling.png").read_bytes(), question, "39%"),
+            ("downloading", (media / "04-downloading.png").read_bytes(), question, "43%"),
+            ("loading", (media / "09-loading.png").read_bytes(),
+             "What is the large percentage shown under Loading the model? Reply with the percentage only.", "55%")]
+
+
 def run(url, directory, screenshots=False):
     colors = {"red": (236, 24, 24), "blue": (16, 40, 236), "green": (16, 165, 46)}
     question = "What color is the left half of this image? Answer with just the color name."
     images = [(f"{left}-{right}", png(colors[left], colors[right]), question, left)
               for left, right in (("red", "blue"), ("blue", "red"), ("green", "blue"))]
-    media = Path(__file__).resolve().parents[1] / "docs/media/setup-tui"
-    question = "What percentage is printed beside the progress bar? Reply with the number and percent sign only."
-    setup = ("setup-progress", (media / "03-compiling.png").read_bytes(), question, "39%")
-    if screenshots:
-        images = [setup, ("downloading", (media / "04-downloading.png").read_bytes(), question, "43%"),
-                  ("loading", (media / "09-loading.png").read_bytes(),
-                   "What is the large percentage shown under Loading the model? Reply with the percentage only.", "55%")]
-    else:
-        images.append(setup)
+    setup = setup_screenshots()
+    images = setup if screenshots else images + [setup[0]]
     if url:
         with urlopen(url + "/v1/models", timeout=15) as response:
             model = json.load(response)["data"][0]["id"]

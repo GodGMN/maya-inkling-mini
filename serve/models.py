@@ -150,15 +150,18 @@ def pack_of(cfg: dict) -> Path | None:
 
 
 # ------------------------------------------------------------------ the context a model was trained for
-def trained_context(model_dir) -> int | None:
-    """The context the model was trained for (`<arch>.context_length` in its first GGUF's header; GLM-5.3-Flash:
+def trained_context(model_path) -> int | None:
+    """The context the model was trained for (`<arch>.context_length` in its GGUF header; GLM-5.3-Flash:
     1,048,576): the top of the dashboard's Context size.  None when there is no readable GGUF."""
     try:
         from gguf_reader import GGUFFile                # (tools/, on the path above)
-        shards = sorted(Path(model_dir).glob("*-00001-of-*.gguf")) or sorted(Path(model_dir).glob("*.gguf"))
-        if not shards:
-            return None
-        md = GGUFFile(shards[0]).metadata
+        path = Path(model_path)
+        if not path.is_file():
+            shards = sorted(path.glob("*-00001-of-*.gguf")) or sorted(path.glob("*.gguf"))
+            if not shards:
+                return None
+            path = shards[0]
+        md = GGUFFile(path).metadata
         n = md.get(f"{md.get('general.architecture', '')}.context_length")
         return int(n) if isinstance(n, int) and n > 0 else None
     except Exception:  # noqa: BLE001 - a header it can't read: the fallback range

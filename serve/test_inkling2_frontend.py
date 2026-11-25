@@ -191,6 +191,60 @@ class Parser(unittest.TestCase):
 
 
 class Serving(unittest.TestCase):
+    def test_repeated_reasoning_can_finish_with_its_own_answer(self):
+        draft = "Check hours at the end of each month. " * 3
+        svc, eng, _ = service(MODEL + THINK + draft + END + MODEL + TEXT + "July." + END)
+        got = answer(svc, {"messages": ASK})
+        self.assertEqual((got["reasoning"], got["content"]), (draft, "July."))
+        self.assertEqual(len(eng.prompts), 1)
+
+    def test_persistent_thinking_loop_resumes_in_a_text_segment(self):
+        draft = "Compare calendar invitations in both time zones. " * 5
+        svc, eng, tok = service(MODEL + THINK + draft, draft, draft, "July." + END)
+        got = answer(svc, {"messages": ASK})
+        self.assertEqual(got["content"], "July.")
+        self.assertTrue(tok.decode(eng.prompts[-1]).endswith(END + MODEL + TEXT))
+        self.assertEqual(svc.loop_guard_counts["thinking_closed"], 1)
+
+    def test_guard_retries_report_the_first_native_prefill(self):
+        block = "Compare calendar invitations in both time zones. " * 5
+        svc, eng, _ = service(MODEL + THINK + block, block, block, "July." + END)
+        generate, reports = eng.generate, []
+
+        def timed(ids, max_new, sampling, cancel, embeddings=None):
+            generated = 0
+            try:
+                for token in generate(ids, max_new, sampling, cancel, embeddings):
+                    generated += 1
+                    yield token
+            finally:
+                eng.last = dict(prompt_tokens=len(ids), generated=generated, decode_ms=2 * generated,
+                                reused=len(ids) - 2 if reports else 0, prompt_ms=1 if reports else 12345)
+                reports.append(eng.last)
+
+        eng.generate = timed
+        got = answer(svc, {"messages": ASK})
+        self.assertEqual(got["content"], "July.")
+        self.assertEqual(len(reports), 4)
+        timings = got["done"]["timings"]
+        self.assertEqual((timings["cache_n"], timings["prompt_ms"]), (0, 12345))
+        self.assertEqual(timings["predicted_ms"], sum(r["decode_ms"] for r in reports))
+
+    def test_repeated_typed_calls_keep_all_arguments(self):
+        args = {"city": "San Cristobal de La Laguna", "days": 2}
+        svc, eng, _ = service(call("get_weather", args) * 3)
+        got = answer(svc, {"messages": ASK, "tools": TOOLS})
+        self.assertEqual(got["calls"], [("get_weather", args)] * 3)
+        self.assertEqual(len(eng.prompts), 1)
+
+    def test_loop_in_visible_answer_still_stops(self):
+        block = "Check hours at the end of each month. "
+        svc, _, _ = service(MODEL + TEXT + block * 6, block * 6)
+        got = answer(svc, {"messages": ASK})
+        self.assertEqual(got["done"]["finish"], "stop")
+        self.assertEqual(svc.loop_guard_counts["stopped"], 1)
+        self.assertEqual(svc.loop_guard_counts["thinking_closed"], 0)
+
     def test_stop(self):
         svc, _, tok = service("x")
         self.assertIn(tok.special_tokens[EOS], svc.stop_ids)

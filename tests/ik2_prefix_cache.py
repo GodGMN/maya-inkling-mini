@@ -84,6 +84,75 @@ def check_fork(engine, ids, depth):
     print(f"both forks retained {len(histories[0])} tokens and matched all 8 cold predictions", flush=True)
 
 
+def check_full_slot_rewind(engine, ids, depth):
+    left, right = list(dict.fromkeys(ids))[:2]
+    common = list(itertools.islice(itertools.cycle(ids), depth - 1))
+    a, b = [left] + common, [right] + common
+    a_reply, _ = generate(engine, a, 8)
+    b_reply, _ = generate(engine, b, 8)
+    # Simulate a loop guard keeping part of B's output and changing its continuation.
+    replacement = right if b_reply[3] == left else left
+    revised = b + b_reply[:3] + [replacement]
+    b_revised, reused = generate(engine, revised, 4)
+    if reused != len(b):
+        raise RuntimeError(f"rewind restored {reused} of B's {len(b)} prompt tokens")
+    controls = []
+    for label, history in (("A", a + a_reply[:-1]), ("B", revised + b_revised[:-1])):
+        request = history + [right, left]
+        answer, reused = generate(engine, request, 8)
+        if reused != len(history):
+            raise RuntimeError(f"rewinding B left {reused} of {label}'s {len(history)} live tokens")
+        controls.append((request, answer))
+    for marker in (left, right):
+        generate(engine, [right, marker], 1)
+    for request, expected in controls:
+        actual, reused = generate(engine, request, 8)
+        if reused or actual != expected:
+            raise RuntimeError(f"cold rewind control reused {reused} or changed its eight predictions")
+    print("Both conversations survived the rewind and matched eight cold predictions each", flush=True)
+
+
+def check_cancelled_prefill(engine, ids, chunk):
+    def request(prompt, limit, interrupt=False):
+        engine.stdin.write(f"GEN {limit} temperature=0 " + ",".join(map(str, prompt)) + "\n")
+        engine.stdin.flush()
+        tokens = []
+        stopped = False
+        for line in engine.stdout:
+            fields = line.split()
+            if not fields:
+                continue
+            if fields[0] == "PP" and interrupt and not stopped and int(fields[1]) < len(prompt):
+                engine.stdin.write("STOP\n")
+                engine.stdin.flush()
+                stopped = True
+            elif fields[0] == "T":
+                tokens.append(int(fields[1]))
+            elif fields[0] == "DONE":
+                expected = "cancel" if interrupt else "length"
+                if fields[5] != expected or (interrupt and (not stopped or tokens)):
+                    raise RuntimeError(f"expected {expected}, got {line.strip()}")
+                return tokens, int(fields[-1])
+        raise RuntimeError("engine exited during the prefill cancellation check")
+
+    a, b = list(dict.fromkeys(ids))[:2]
+    base = list(itertools.islice(itertools.cycle(ids), 7 * chunk))
+    reply, _ = request(base, 4)
+    request([b] + base, 8, interrupt=True)
+    request([b, b], 2)  # A fresh chat should occupy the slot freed by the cancellation.
+    history = base + reply[:-1]
+    prompt = history + [a]
+    answer, reused = request(prompt, 8)
+    if reused != len(history):
+        raise RuntimeError(f"cancelled prefill left {reused} of the other chat's {len(history)} live tokens")
+    for marker in (b, a):
+        request([b, marker], 1)
+    cold, reused = request(prompt, 8)
+    if reused or answer != cold:
+        raise RuntimeError("the resumed chat did not match the uncached control")
+    print(f"Cancelled a prefill, kept {len(history)} sibling tokens, matched eight cold predictions", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--engine", required=True)
@@ -94,7 +163,9 @@ def main():
     ap.add_argument("--chunk", type=int, default=256, help="prefill chunk size and first shared prefix")
     ap.add_argument("--cancel-after", type=int, default=128, help="send STOP after this many emitted copy tokens")
     ap.add_argument("--branches", type=int, default=0, help="branch repeatedly from one shared prefix")
-    ap.add_argument("--fork-slots", action="store_true", help="fork one prefix into two slots and resume each")
+    slot_test = ap.add_mutually_exclusive_group()
+    slot_test.add_argument("--fork-slots", action="store_true", help="fork one prefix into two slots and resume each")
+    slot_test.add_argument("--cancel-prefill", action="store_true", help="cancel one slot during prefill and resume its sibling")
     args = ap.parse_args()
     if args.branches < 0:
         ap.error("branches must be nonnegative")
@@ -106,14 +177,21 @@ def main():
         ap.error("the passage needs two distinct token IDs")
     a, b = distinct[:2]
     ctx = max(4096, 7 * args.chunk + 64)
-    cmd = [args.engine, "--serve-ik2", "--model", args.model, "--ctx", str(ctx * (2 if args.fork_slots else 1)), "--chunk", str(args.chunk)]
+    two = args.fork_slots or args.cancel_prefill
+    cmd = [args.engine, "--serve" if args.cancel_prefill else "--serve-ik2", "--model", args.model,
+           "--ctx", str(ctx * (2 if two else 1)), "--chunk", str(args.chunk)]
     if args.draft:
         cmd.extend(["--draft", args.draft])
-    if args.fork_slots:
+    if two:
         cmd.extend(["--cache-slots", "2"])
         with subprocess.Popen(cmd, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as engine:
-            receive(engine, "@READY ")
-            check_fork(engine, ids, 7 * args.chunk)
+            if args.cancel_prefill:
+                receive(engine, "READY ")
+                check_cancelled_prefill(engine, ids, args.chunk)
+            else:
+                receive(engine, "@READY ")
+                check_fork(engine, ids, 7 * args.chunk)
+                check_full_slot_rewind(engine, ids, 7 * args.chunk)
             engine.stdin.write("QUIT\n")
             engine.stdin.close()
             if engine.wait():

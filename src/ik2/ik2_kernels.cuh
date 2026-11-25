@@ -15,21 +15,36 @@
 
 namespace ik2::k {
 
-// A positive capacity wraps token-major rows. Global FP8 pages store sixteen tokens per KV head.
+// A positive capacity wraps token-major rows. Global E4M3 pages hold sixteen tokens per KV head.
+// Packed global E2M1 uses token-major rows of Fp4KvBlock.
 struct Fp8KvLayout {
-    constexpr Fp8KvLayout(int ring_capacity) : ring_capacity(ring_capacity), paged(false) {}
+    constexpr Fp8KvLayout(int ring_capacity) : ring_capacity(ring_capacity), paged(false), fp4(false) {}
     const int ring_capacity;
     const bool paged;
+    const bool fp4;
 #ifdef STRATA_USE_HIP
-    static constexpr Fp8KvLayout global_pages() { return Fp8KvLayout(); }
+    static constexpr Fp8KvLayout global_pages() { return Fp8KvLayout(true, false); }
+    static constexpr Fp8KvLayout global_fp4() { return Fp8KvLayout(false, true); }
 private:
-    constexpr Fp8KvLayout() : ring_capacity(0), paged(true) {}
+    constexpr Fp8KvLayout(bool pages, bool packed) : ring_capacity(0), paged(pages), fp4(packed) {}
 #endif
 };
 
+// E2M1 cache block. The FP16 scale applies to 32 consecutive channels within a KV head.
+struct Fp4KvBlock {
+    uint16_t scale;
+    uint8_t pairs[16];
+};
+static_assert(sizeof(Fp4KvBlock) == 18);
 
 /// y = x * rsqrt(mean(x^2) + eps) * w per row of D (w null: no weight).  x and y may alias.
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s);
+/// rows y[0 .. T) ([T][D]) each lose a direction: y <- y - s r (r . y - c) (r unit length; c 0: the component goes,
+/// else it is moved to c).  A block a row, a fixed-order sum, so a row's bits do not depend on T.  Refusal ablation.
+/// srow (device, T floats) when given: row t's strength is srow[t] * s (a request's on/off by its generated tokens).
+/// keep_norm: then each row is rescaled to the length it had (norm-preserving ablation).
+void project_out(float* y, const float* r, float s, float c, int T, int D, cudaStream_t st, const float* srow = nullptr,
+                 bool keep_norm = false);
 /// rms of n <= 3 vectors [D] in one launch, each with its own weights: y[i] = rms(x[i]) * w[i] (y may be x).
 struct RmsJobs {
     const float* x[3];
@@ -164,7 +179,7 @@ struct LoopGate {
     float* y;
     const uint16_t* compact[3] = {}; // D, F, G if each F32 is exactly its upper 16 bits
 };
-void loop_gates(const LoopGate* gates, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s);
+void loop_gates(const LoopGate* gates, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s, bool sequences = false);
 void loop_gate(const float* x, const float* m, const float* D, const float* F, const float* G, int T, int C, int R,
                float eps, float* sc, float* y, cudaStream_t s);
 /// Sampling's candidates found on the device: of x [n] (its values within [lo, hi]: softcapped logits) every value
@@ -321,6 +336,17 @@ struct MvF16Job {
 struct MvF16Jobs { MvF16Job job[3] = {}; };
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
              cudaStream_t s);
+#ifdef STRATA_USE_HIP
+bool sequence_attention_fp8(float* q, float* r, float* gate, int ld, const float* qclip, const float* rclip,
+                            const float* keys, const float* values, uint8_t* kc, uint8_t* vc, Fp8KvLayout layout,
+                            size_t stride, const int* slots, const int* pos, int T, int H, int KV, int dr,
+                            float qcap, float rcap, float eps, float alpha, float floor, float kscale, float vscale,
+                            const float* rel, int extent, int window, int splits, const float* sink,
+                            float* scratch, float* out, cudaStream_t stream);
+#endif
+void mv_q8p_sequences(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int rows,
+                      float* y, int ldy, cudaStream_t s);
+void conv_sequences(const int* slots, int rows, const float* x, int ldx, MvConv cv, cudaStream_t s);
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
                  const MvConv& c1, cudaStream_t s, const MvAlt& a0 = MvAlt{}, const MvAlt& a1 = MvAlt{},
                  const MvF16Jobs& side = MvF16Jobs{});
@@ -334,7 +360,7 @@ void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStrea
 /// experts_gate_up_swiglu, experts_down and moe_combine_f32 take.
 void route_gather(const int* top, const float* w, const uint8_t* const* tab, const float* sg_t, const float* su_t,
                   const float* sd_t, int S, int K, const uint8_t** blob, int* tok, int* inv, float* sg, float* su,
-                  float* wt, cudaStream_t s);
+                  float* wt, cudaStream_t s, bool group_128_experts = false);
 /// One token's route() and route_gather() in one launch (the same values to the bit): top, w [K] and the K slots'
 /// tables.
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
@@ -374,6 +400,14 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
 /// (fixed, so the launches do not change with the position) - attn_decode_mma_blocks(Hkv) of them fill the device
 /// once, a window of w keys needs no more than w / 64.  scratch: attn_decode_mma_scratch(H, n_split) floats.
 /// gate [H][128] (or null): the output times its sigmoid (gate_mul's); out16 (or null): an FP16 copy of the output.
+#ifdef STRATA_USE_HIP
+constexpr int kSparsePages = 224, kSparsePageSize = 64;
+constexpr int kSparseFirst = 2, kSparseRecent = 24;
+void rdna3_sparse_decode(const uint16_t* q, const float* r, const float* sink, const uint8_t* kc,
+                         const uint8_t* vc, int H, int Hkv, const int* pos, float qscale, float v_inv,
+                         const float* proj, int dr, int extent, int* pages, float* scratch, float* out,
+                         const float* gate, uint16_t* out16, cudaStream_t stream);
+#endif
 int attn_decode_mma_blocks(int Hkv);
 size_t attn_decode_mma_scratch(int H, int n_split);
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,

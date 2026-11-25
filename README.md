@@ -18,6 +18,7 @@ Each figure is the median of three greedy requests. [Measurements and commands](
 * **Tools.** OpenAI and Anthropic tool calls, including streamed parallel calls and multi-turn results. A conversation that grew from 20K to 300K tokens reused every previously processed token on each turn. [Tool conversations](docs/HIP-PORT.md#growing-conversations)
 * **Several chats.** `IK2_CACHE_SLOTS=2`, `3` or `4` splits the context into independent caches, so each follow-up processes only its new tokens. Requests run one at a time. [Slot sizes and VRAM](docs/HIP-PORT.md#separate-conversation-caches)
 * **Images.** The GPU image encoder reads a new screenshot in 0.7 to 1.6 s at full context and adds 404 MiB of VRAM. [Image timings](docs/HIP-PORT.md#image-latency-on-port-8085)
+* **Optional runtime ablation.** Toggle `IK2_ABLATE_MODE=cyber` on the packaged `r5` image (or pass `IK2_ABLATE=tools/ik2_ablate/directions/v21-pc4.f32`) against the same stock GGUF. [Runtime ablation guide](docs/inkling2-mini/runtime-ablation-gfx1100.md)
 
 ## ROCm quick start
 

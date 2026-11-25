@@ -82,7 +82,8 @@ def hy4_tool_pictures_noted(messages: list) -> list:
         out.append(m)
     return out
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
-                            EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
+                            EFFORT_WORDS, QWEN_EFFORT, INK_CALL, INK_END, INK_MODEL, INK_TEXT, INK_THINK,
+                            InklingRewriter, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
                             deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
@@ -989,8 +990,8 @@ class StrataEngine:
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
-        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
-        self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack", "--model")}
+        self.model_path = paths.get("--native") or paths.get("--pack") or paths.get("--model", "pack/full")
         self.log_path = log
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
@@ -1008,6 +1009,7 @@ class StrataEngine:
         self.multi = 0                   # READY ... multi=<n>: n conversations at once (requests tagged rid=<id>)
         self._routes: dict[int, queue.Queue] = {}       # rid -> its lines (multi)
         self._routes_lock = threading.Lock()
+        self._stdin_lock = threading.Lock()
         self._rids = itertools.count(1)
         self._tls = threading.local()                   # the request this thread is generating (pause())
         self.last = {}
@@ -1695,6 +1697,12 @@ class StrataEngine:
         except OSError:
             pass
 
+    def _multi_command(self, command):
+        # GEN lines can exceed PIPE_BUF. Keep them whole when several HTTP workers share stdin.
+        with self._stdin_lock:
+            self.proc.stdin.write(command + "\n")
+            self.proc.stdin.flush()
+
     def _generate_multi(self, ids, max_new, sampling, cancel, embeddings=None):
         """generate() on an engine that runs several conversations: this request's GEN carries rid=<id>, its lines come
         back through its own queue (_route), and STOP <id> ends it alone."""
@@ -1711,8 +1719,7 @@ class StrataEngine:
         done = False
         try:
             try:
-                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-                self.proc.stdin.flush()
+                self._multi_command(f"{head} {','.join(str(int(t)) for t in ids)}")
             except OSError:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
             heard, stall = time.monotonic(), {}
@@ -1751,8 +1758,7 @@ class StrataEngine:
                               f"and giving its place in the queue back (MAYA_REQUEST_QUIET_S={REQUEST_QUIET_S:.0f})",
                               flush=True)
                         try:
-                            self.proc.stdin.write(f"STOP {rid}\n")
-                            self.proc.stdin.flush()
+                            self._multi_command(f"STOP {rid}")
                         except OSError:
                             pass
                         done = True                        # nothing of its own to drain: later lines are dropped
@@ -1800,8 +1806,7 @@ class StrataEngine:
         finally:
             if not done:                                  # the consumer stopped early: stop this request, drain it
                 try:
-                    self.proc.stdin.write(f"STOP {rid}\n")
-                    self.proc.stdin.flush()
+                    self._multi_command(f"STOP {rid}")
                 except OSError:
                     pass
                 # The drain is bounded: an engine that does not honour the STOP (or whose DONE for this rid was
@@ -1838,7 +1843,8 @@ class StrataEngine:
             self._ask_end()
         try:
             if rid is not None:
-                self.proc.stdin.write(f"PAUSE {rid}{' keep' if keep else ''}\n")
+                self._multi_command(f"PAUSE {rid}{' keep' if keep else ''}")
+                return
             else:
                 self.proc.stdin.write("PAUSE keep\n" if keep else "PAUSE\n")
             self.proc.stdin.flush()
@@ -1850,6 +1856,9 @@ class StrataEngine:
         self._ask_end()
         if self.can_stop:
             try:
+                if self.multi:
+                    self._multi_command("STOP")
+                    return
                 self.proc.stdin.write("STOP\n")
                 self.proc.stdin.flush()
             except OSError:
@@ -1861,10 +1870,13 @@ class StrataEngine:
         wait = float(os.environ.get("MAYA_ENGINE_QUIT_S", "50") or 50)
         self._ask_end()
         try:
-            if self.can_stop:                           # a request in flight ends at its next step first: QUIT
-                self.proc.stdin.write("STOP\n")         # alone lets it run to max_tokens before the engine ends
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
+            if self.multi:
+                self._multi_command("STOP\nQUIT" if self.can_stop else "QUIT")
+            else:
+                if self.can_stop:                           # a request in flight ends at its next step first: QUIT
+                    self.proc.stdin.write("STOP\n")         # alone lets it run to max_tokens before the engine ends
+                self.proc.stdin.write("QUIT\n")
+                self.proc.stdin.flush()
             end = time.monotonic() + wait
             src = getattr(self, "lines", None)          # after start-up the pump thread owns stdout: read its queue
             while self.proc.poll() is None and time.monotonic() < end:
@@ -2659,6 +2671,15 @@ class Service:
             (_special_ids("</think%s>" % template.hy4_tag) or _special_ids("</think>")) \
             if getattr(template, "hy4", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
+        self.inkling_marks = {}
+        self.native_inkling_guard = False
+        if getattr(template, "inkling", False):
+            self.inkling_marks = {mark: token for mark in InklingRewriter.MARKS for token in _special_ids(mark)}
+            missing = {INK_THINK, INK_TEXT, INK_CALL, INK_END, INK_MODEL} - self.inkling_marks.keys()
+            self.native_inkling_guard = not missing
+            if missing:
+                print("[maya] using the generic loop guard because this tokenizer splits " + ", ".join(sorted(missing)),
+                      flush=True)
         # the tokens the engine itself ends a request at, whatever the server does (see THINK_RESTARTS): a pack
         # tokenizer that names its "eos" (DeepSeek's, MiniMax's: their engines' --eos default) ends there only; the
         # GLM/Qwen engine ends at every turn-end token of its vocabulary (GLM: <|endoftext|>, <|user|>,
@@ -2958,10 +2979,10 @@ class Service:
         threading.Thread(target=self._reload, args=(reload["from"], n), daemon=True).start()
         return reload
 
-    def _restart_with(self, n: int):
+    def _restart_with(self, n: int, cache_slots: int):
         if hasattr(self.engine, "set_context"):
             self.engine.stop()
-            self.engine.set_context(n)
+            self.engine.set_context(n * cache_slots)
             self.engine.restart()
         else:                                            # the mock engine: nothing to start
             time.sleep(float(os.environ.get("MAYA_MOCK_RELOAD_S", "2")))
@@ -2974,21 +2995,24 @@ class Service:
             print(f"[maya] reloading the model with a {n}-token context (was {old}) ...", flush=True)
             err = None
             t0 = time.time()
+            # Inkling reports per-conversation capacity in READY and takes the sum across caches in --max-context.
+            info = getattr(self.engine, "info", {}) or {}
+            cache_slots = int(info.get("cache_slots", 1)) if info.get("engine_kind") == "ik2" else 1
             try:
-                self._restart_with(n)
+                self._restart_with(n, cache_slots)
                 self.engine.load_s = round(time.time() - t0, 1)
             except Exception as e:  # noqa: BLE001 - any failed start: put the old context back
                 err = f"the engine did not start with a {n}-token context ({e})"
                 print(f"[maya] {err}; starting it again with {old} ...", flush=True)
                 try:
-                    self._restart_with(old)
+                    self._restart_with(old, cache_slots)
                 except Exception as e2:  # noqa: BLE001
                     err += f"; starting again with {old} failed too ({e2}) - the next request tries once more"
             places = max(1, int(getattr(self.engine, "multi", 0) or 1))   # the reloaded engine's conversations
             if places != self.fifo.capacity:
                 self.fifo.set_capacity(places)
             if err is None:
-                self._save_context(n)
+                self._save_context(n * cache_slots)
                 print(f"[maya] the model runs with a {n}-token context now", flush=True)
             with self.status_lock:
                 self.reload.update(state="failed" if err else "done", error=err, ended=time.time(),
@@ -4343,7 +4367,7 @@ class Service:
             c[{loop_guard.PENALTY: "penalised", loop_guard.CLOSE_THINKING: "thinking_closed",
                loop_guard.STOP: "stopped"}[act.kind]] += 1
 
-    def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat, guard=None) -> Iterator[int | None]:
+    def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat, calls, guard=None) -> Iterator[int | None]:
         """engine.generate(), in fair slices (MAYA_FAIR_SLICE_S): once this answer has been decoding that long and
         another request waits for the engine, the engine stops here, the FIFO goes to the next request and this one
         queues behind it.  Back in turn, it goes on with prompt + what it already wrote as the new prompt: the
@@ -4360,7 +4384,6 @@ class Service:
         of its own ends and the request's own sampling follows; or the answer ends there (LOOP_STOP).  Until then the
         engine calls and their sampling are the ones without it."""
         produced, cur, left, smp = [], list(ids), max_new, sampling
-        segments = []                                   # each slice's DONE (engine.last), summed at the end
         sent = 0                                        # produced[:sent] went to the caller (the guard holds the rest)
         # the thinking budget closed at a sentence's or line's end (THINK_GRACE, #613): past `soft` tokens of
         # reasoning, the first token that ends one is followed by the end of the thinking - this call stops there and
@@ -4426,7 +4449,7 @@ class Service:
                     self.fifo.unclaim_yield()           # (it ends, or goes on some other way: no place given up)
                 fresh = getattr(self.engine, "last", None)
                 if fresh is not None and fresh is not last0:
-                    segments.append(fresh)
+                    calls.append(fresh)
             if closed:                                  # the budget, at a sentence's or line's end: the thinking ends
                 later = len(produced) - soft
                 canon = self._closed_as_rendered(ids, produced, think_end)
@@ -4449,7 +4472,7 @@ class Service:
             if act is not None:                         # a loop: what is kept, then on from there - or the end
                 del produced[max(sent, len(produced) - act.drop):]   # (what was sent stays sent: only the held tail goes)
                 if act.kind == loop_guard.CLOSE_THINKING:
-                    produced.append(guard.think_end)
+                    produced.extend(guard.close_tokens[:max_new - len(produced)])
                 guard.resume(produced, act)
                 self._loop_noted(act, len(produced))
                 if act.kind == loop_guard.STOP or len(produced) >= max_new or cancel.is_set() or self.stopping:
@@ -4502,11 +4525,6 @@ class Service:
                 self.engine.restart()
             cur, left = list(ids) + produced, max_new - len(produced)
             smp = self._resumed_sampling(sampling, produced)   # (the thinking budget counts from where it got to)
-        if len(segments) > 1:                           # the request's figures, over all its slices
-            self.engine.last = merge_calls(segments)
-        lastd = getattr(self.engine, "last", None)
-        if isinstance(lastd, dict) and (lastd.get("prompt_tokens") or 0) > len(ids):
-            self.engine.last = own_prompt_figures(lastd, len(ids))   # (the first call's DONE was not seen)
         if guard is not None and not cancel.is_set():   # the end: what the guard still held back
             while sent < len(produced):
                 sent += 1
@@ -4549,11 +4567,9 @@ class Service:
         seg = {"prompt": ids, "ids": [], "next": None}   # this engine call's prompt and tokens; the next one's
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         direct_end = None
-        if getattr(self.template, "inkling", False) and prefill == "<|message_model|><|content_text|>" and not tools:
-            end = self.tok.encode("<|end_message|>", parse_special=True)
-            if len(end) == 1:
-                direct_end = end[0]
-                sampling = {**(sampling or {}), "_inkling_end": direct_end}
+        if INK_END in self.inkling_marks and prefill == INK_MODEL + INK_TEXT and not tools:
+            direct_end = self.inkling_marks[INK_END]
+            sampling = {**(sampling or {}), "_inkling_end": direct_end}
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         reasoning_tokens = 0
@@ -4588,10 +4604,9 @@ class Service:
                     lp_wait.clear()
             return evs
         emb = getattr(self.embeddings, "path", None)
-        # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
-        # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
-        engine_last0 = getattr(self.engine, "last", None)
-        calls: list[dict] = []                          # each finished engine call's DONE (segments()), merged at the end
+        # Save each native DONE while draining its generator. A stop token can close the outer
+        # response before a slice yields again, and another queued request has its own counters.
+        calls: list[dict] = []
         counted, my_started, my_first, queued = False, time.time(), None, False
         stat = RequestStat()                            # this request's live figures
         stat.spec_off = request_spec_off(sampling)
@@ -4628,7 +4643,6 @@ class Service:
                     counted = hold[1] = True
                     my_started = self.status["started"]
                     self.last_request_at = time.time()
-                before = getattr(self.engine, "last", None)
                 last_print = time.time()
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
@@ -4691,11 +4705,16 @@ class Service:
                     engine's ERR says "non-finite") before the first token, the engine has dropped that conversation's
                     state and the request runs once more, its prompt read from token 0."""
                     for again in (False, True):
-                        guard = loop_guard.ToolSafeGuard(self.think_end_id, parser.state == "reasoning",
-                                                         piece=self._guard_piece()) \
-                            if guard_on else None       # (serve/loop_guard.py; a fresh one for a run again; leaves tool calls alone)
+                        guard = None
+                        if guard_on:
+                            if self.native_inkling_guard:
+                                guard = loop_guard.InklingGuard(self.inkling_marks, prompt[-1] if prompt else None)
+                            else:
+                                guard = loop_guard.ToolSafeGuard(self.think_end_id, parser.state == "reasoning",
+                                                                 piece=self._guard_piece())
                         guards[:] = [guard] if guard is not None else []
-                        sliced, got = self._sliced(prompt, left, sampling, cancel, emb, hold, stat, guard), 0
+                        first_call = len(calls)
+                        sliced, got = self._sliced(prompt, left, sampling, cancel, emb, hold, stat, calls, guard), 0
                         try:
                             for t in sliced:
                                 got += t is not None
@@ -4704,6 +4723,7 @@ class Service:
                         except ValueError as e:
                             if again or got or NONFINITE not in str(e):
                                 raise
+                            del calls[first_call:]
                             print(f"[maya] the engine's numbers went non-finite before the answer started ({e}): "
                                   "running the request again from token 0", flush=True)
                         finally:
@@ -4715,11 +4735,7 @@ class Service:
                     engine rejected prompt + max_new + CTX_SLACK > context)."""
                     while True:
                         room = self.context_room(len(seg["prompt"]))
-                        l0 = getattr(self.engine, "last", None)
                         yield from attempts(seg["prompt"], max(1, min(max_new - n, room)))
-                        got = getattr(self.engine, "last", None)
-                        if got is not None and got is not l0:   # (its DONE: the request's figures merge every call's)
-                            calls.append(got)
                         if seg["next"] is None or cancel.is_set() or self.stopping:
                             return
                         seg["prompt"], seg["next"], seg["ids"] = seg["next"], None, []
@@ -4970,15 +4986,9 @@ class Service:
             with self.status_lock:
                 self.current_requests.discard(stat)
                 if counted:
-                    # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect);
-                    # over all its engine calls (#1058: a continuation's DONE alone read the whole answer as cached)
-                    last_obj, last = getattr(self.engine, "last", None), {}
-                    if last_obj is not engine_last0:
-                        if last_obj is not None and (not calls or calls[-1] is not last_obj):
-                            calls.append(last_obj)      # (the last call, closed before segments() saw its end)
-                        last = merge_calls(calls) if calls else dict(last_obj or {})
-                        if (last.get("prompt_tokens") or 0) > len(ids):
-                            last = own_prompt_figures(last, len(ids))
+                    last = merge_calls(calls)
+                    if (last.get("prompt_tokens") or 0) > len(ids):
+                        last = own_prompt_figures(last, len(ids))
                     started = my_started
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
@@ -5009,8 +5019,7 @@ class Service:
                     book = (len(ids), last.get("reused") or 0, n)
                     t["prompt_ms"] += last.get("prompt_ms") or 0.0
                     t["decode_ms"] += last.get("decode_ms") or 0.0
-                    fresh = getattr(self.engine, "last", None)
-                    if fresh is not None and fresh is not before:      # the engine's clock for THIS request
+                    if calls:
                         timings = request_timings(len(ids), n, last)
                         self.last_timings = dict(timings, at=int(time.time())) if timings else None
                     self.last_request_at = time.time()
@@ -7707,6 +7716,9 @@ def main() -> int:
         svc.model_dir = Path(args[args.index(flag) + 1]).resolve().parent
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
                          daemon=True).start()
+    elif getattr(engine, "info", {}).get("engine_kind") == "ik2" and "--model" in args[:-1]:
+        gguf = Path(cfg.get("cwd") or ".") / engine.model_path
+        threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(gguf)), daemon=True).start()
     elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder
         svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])
         svc.model_dir = Path(args[args.index("--pack") + 1]).resolve().parent

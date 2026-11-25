@@ -130,6 +130,78 @@ void test_rms() {
     cudaFree(dx), cudaFree(dw), cudaFree(dy);
 }
 
+// the refusal ablation's projection: against a double reference, the component left along r, rows independent of T
+void test_project_out() {
+    const int T = 9, D = 2304;
+    auto x = fvec((size_t) T * D, 4.0f), r = fvec(D);
+    double n2 = 0;
+    for (float v : r) n2 += (double) v * v;
+    for (float& v : r) v = (float) (v / std::sqrt(n2));
+    float* dr = dev(r);
+    const float cases[][2] = {{1.0f, 0.0f}, {1.3f, 0.0f}, {0.8f, 0.0f}, {1.0f, 2.5f}};
+    for (const auto& sc : cases) {
+        float* dy = dev(x);
+        k::project_out(dy, dr, sc[0], sc[1], T, D, 0);
+        std::vector<double> want((size_t) T * D);
+        for (int t = 0; t < T; ++t) {
+            double d = 0;
+            for (int e = 0; e < D; ++e) d += (double) r[e] * x[(size_t) t * D + e];
+            for (int e = 0; e < D; ++e) want[(size_t) t * D + e] = x[(size_t) t * D + e] - sc[0] * (d - sc[1]) * r[e];
+        }
+        const auto got = host(dy, want.size());
+        char name[64];
+        std::snprintf(name, sizeof name, "project_out (s %.1f, c %.1f)", sc[0], sc[1]);
+        expect(name, got, want, 2e-5, 1e-4);
+        if (sc[0] == 1.0f) {   // what is left along r: c
+            double worst = 0;
+            for (int t = 0; t < T; ++t) {
+                double d = 0;
+                for (int e = 0; e < D; ++e) d += (double) r[e] * got[(size_t) t * D + e];
+                worst = std::max(worst, std::fabs(d - sc[1]));
+            }
+            expect_true("project_out leaves c along r", worst <= 1e-3);
+        }
+        float* d1 = dev(std::vector<float>(x.begin() + (size_t) 4 * D, x.begin() + (size_t) 5 * D));   // row 4 alone
+        k::project_out(d1, dr, sc[0], sc[1], 1, D, 0);
+        const auto one = host(d1, D);
+        expect_true("project_out row bits do not depend on T",
+                    std::memcmp(one.data(), got.data() + (size_t) 4 * D, (size_t) D * sizeof(float)) == 0);
+        cudaFree(dy), cudaFree(d1);
+    }
+    {   // per-row strengths: row t takes srow[t] * s (0 leaves it as it was)
+        std::vector<float> srow(T);
+        for (int t = 0; t < T; ++t) srow[t] = t % 3 == 0 ? 0.0f : 1.0f + 0.1f * t;
+        float *dy = dev(x), *ds = dev(srow);
+        k::project_out(dy, dr, 1.0f, 0.0f, T, D, 0, ds);
+        std::vector<double> want((size_t) T * D);
+        for (int t = 0; t < T; ++t) {
+            double d = 0;
+            for (int e = 0; e < D; ++e) d += (double) r[e] * x[(size_t) t * D + e];
+            for (int e = 0; e < D; ++e) want[(size_t) t * D + e] = x[(size_t) t * D + e] - srow[t] * d * r[e];
+        }
+        expect("project_out (per-row strengths)", host(dy, want.size()), want, 2e-5, 1e-4);
+        cudaFree(dy), cudaFree(ds);
+    }
+    {   // norm-preserving: the projection, then each row back to its length
+        float* dy = dev(x);
+        k::project_out(dy, dr, 1.0f, 0.0f, T, D, 0, nullptr, true);
+        std::vector<double> want((size_t) T * D);
+        for (int t = 0; t < T; ++t) {
+            double d = 0, n0 = 0, n1 = 0;
+            for (int e = 0; e < D; ++e) d += (double) r[e] * x[(size_t) t * D + e], n0 += (double) x[(size_t) t * D + e] * x[(size_t) t * D + e];
+            for (int e = 0; e < D; ++e) {
+                want[(size_t) t * D + e] = x[(size_t) t * D + e] - d * r[e];
+                n1 += want[(size_t) t * D + e] * want[(size_t) t * D + e];
+            }
+            for (int e = 0; e < D; ++e) want[(size_t) t * D + e] *= std::sqrt(n0 / n1);
+        }
+        expect("project_out (norm kept)", host(dy, want.size()), want, 2e-5, 1e-4);
+        cudaFree(dy);
+    }
+    k::project_out(nullptr, dr, 1.0f, 0.0f, 0, D, 0);   // T 0: nothing
+    cudaFree(dr);
+}
+
 void test_l2clip() {
     const int rows = 7, th_cases = 2;
     for (int c = 0; c < 3; ++c) {
@@ -1560,16 +1632,39 @@ float e4m3fn_to_f32_host(uint8_t q);
 // first token, a context shorter than a step, splits with and without keys; the FP8 cache with every finite byte
 // (the subnormals among them).
 #ifdef STRATA_USE_HIP
-constexpr int attention_formats = 3; // Half, E4M3 rows, E4M3 global pages.
+constexpr int attention_formats = 4; // Half, E4M3 rows, E4M3 pages, block-scaled E2M1 rows.
 #else
 constexpr int attention_formats = 2;
 #endif
 
 k::Fp8KvLayout test_fp8_layout(int format, int ring) {
 #ifdef STRATA_USE_HIP
+    if (format == 3) return k::Fp8KvLayout::global_fp4();
     if (format == 2) return k::Fp8KvLayout::global_pages();
 #endif
     return ring;
+}
+
+constexpr float kv_fp4_levels[] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
+
+// Fill a packed cache independently of the writer. Return the exact decoded values for the CPU oracle.
+template<class T> void fp4_fixture(std::vector<uint8_t>& bytes, std::vector<T>& decoded) {
+    bytes.resize(decoded.size() / 32 * 18);
+    for (size_t i = 0; i < decoded.size(); i += 32) {
+        uint8_t* block = bytes.data() + i / 32 * 18;
+        const uint16_t scale = f2h_host((1 + rng() % 15) / 8.f);
+        std::memcpy(block, &scale, 2);
+        for (int j = 0; j < 32; j += 2) {
+            const unsigned pair = rng() & 255;
+            block[2 + j/2] = pair;
+            for (int n = 0; n < 2; ++n) {
+                const int code = pair >> (n*4);
+                const float val = kv_fp4_levels[code & 7] * (code & 8 ? -1 : 1) * h2f_host(scale);
+                if constexpr (sizeof(T) == 2) decoded[i+j+n] = f2h_host(val);
+                else decoded[i+j+n] = val;
+            }
+        }
+    }
 }
 
 size_t page_offset(int token, int head, int d, int heads, bool value) {
@@ -1588,6 +1683,64 @@ std::vector<uint8_t> page_cache(const std::vector<uint8_t>& linear, int heads, b
 }
 
 #ifdef STRATA_USE_HIP
+void test_rdna3_sparse_decode() {
+    // Different landmark keys win for each KV head. The last page has one live token.
+    constexpr int H = 4, KV = 2, D = 128, n = 32769, page_size = 64;
+    constexpr int budget = k::kSparsePages, total = (n + page_size - 1) / page_size;
+    std::vector<uint8_t> keys(size_t(n) * KV * D), values(keys.size());
+    std::vector<uint16_t> q(H * D);
+    for (int h = 0; h < H; ++h) q[h * D + h % 2] = f2h_host(1.f);
+    for (int t = 0; t < n; ++t) {
+        for (int kv = 0; kv < KV; ++kv) {
+            const int page = t / page_size;
+            const size_t row = (size_t(t) * KV + kv) * D;
+            if (page % 3 == kv && t % page_size == (kv ? 48 : 16)) keys[row + kv] = 0x48; // 4
+            values[row] = (page % 3 == kv || t == n - 1) ? 0x40 : 0xb8; // 2 or -1
+        }
+    }
+    auto* dq = dev(q);
+    auto* dk = dev(keys);
+    auto* dv = dev(values);
+    auto* pos = dev(std::vector<int>{n - 1});
+    auto* zero = dev(std::vector<float>(H, 0.f));
+    auto* pages = dev_n<int>(KV * budget);
+    auto* out = dev_n<float>(H * D);
+    auto* scratch = dev_n<float>(k::attn_decode_mma_scratch(H, 64));
+    k::rdna3_sparse_decode(dq, zero, zero, dk, dv, H, KV, pos, 1.f, 1.f, zero, 1, 1,
+                            pages, scratch, out, nullptr, nullptr, nullptr);
+    const auto actual = host(pages, KV * budget);
+    std::vector<int> selected(KV * budget);
+    std::vector<double> expected(H * D);
+    for (int kv = 0; kv < KV; ++kv) {
+        double z[2] = {1., 1.}, sum[2] = {}; // sink
+        for (int slot = 0; slot < budget; ++slot) {
+            int page = slot;
+            if (slot >= budget - 24) page = total - budget + slot;
+            else if (slot >= 2) {
+                const int begin = 2 + (slot - 2) * (total - 26) / (budget - 26);
+                const int end = 2 + (slot - 1) * (total - 26) / (budget - 26);
+                page = begin;
+                for (int candidate = begin; candidate < end; ++candidate)
+                    if (candidate % 3 == kv) { page = candidate; break; }
+            }
+            selected[kv * budget + slot] = page;
+            for (int t = page * page_size; t < std::min(n, (page + 1) * page_size); ++t) {
+                const size_t row = (size_t(t) * KV + kv) * D;
+                for (int h = 0; h < 2; ++h) {
+                    const double w = keys[row + h] ? std::exp(4.) : 1.;
+                    z[h] += w;
+                    sum[h] += w * (values[row] == 0x40 ? 2. : -1.);
+                }
+            }
+        }
+        for (int h = 0; h < 2; ++h) expected[(kv * 2 + h) * D] = sum[h] / z[h];
+    }
+    expect_true("sparse page ids by KV head", actual == selected);
+    expect("sparse decode vs selected-key FP64", host(out, H * D), expected, 2e-3, 5e-5);
+    CU(cudaFree(dq)); CU(cudaFree(dk)); CU(cudaFree(dv)); CU(cudaFree(pos)); CU(cudaFree(zero));
+    CU(cudaFree(pages)); CU(cudaFree(out)); CU(cudaFree(scratch));
+}
+
 void test_rdna3_deep_attention() {
     constexpr int n = 392957, D = 128, H = 3, T = 2, splits = 512, padded = ((n + 15) / 16) * 16;
     const int marks[] = {n / 20, n / 2, 19 * n / 20, n - 1};
@@ -1618,17 +1771,38 @@ void test_rdna3_deep_attention() {
     auto* out = dev_n<float>(query.size());
     const size_t scratch_n = std::max(k::attn_decode_mma_scratch(H, splits), size_t(T * H * 130 * 16));
     auto* scratch = dev_n<float>(scratch_n);
-    for (int format : {1, 2}) {
+    std::vector<k::Fp4KvBlock> packed_k(size_t(padded) * D / 32), packed_v(packed_k.size());
+    for (int i = 0; i < 4; ++i) {
+        const size_t head = size_t(marks[i]) * D / 32;
+        packed_k[head].scale = f2h_host((16.f + 2 * i) / 4.f);
+        packed_k[head].pairs[0] = 6; // code 6 is +4; other channels are zero.
+        for (int d = 0; d < D; d += 2) {
+            auto& block = packed_v[head + d / 32];
+            block.scale = f2h_host(1.f);
+            const int lo = d & (1 << i) ? 2 : 10;
+            const int hi = (d + 1) & (1 << i) ? 2 : 10;
+            block.pairs[(d % 32) / 2] = lo | (hi << 4);
+        }
+    }
+    for (size_t block = size_t(n) * D / 32; block < packed_k.size(); ++block) {
+        packed_k[block].scale = f2h_host(64.f);
+        std::memset(packed_k[block].pairs, 0x77, sizeof(packed_k[block].pairs));
+        packed_v[block] = packed_k[block];
+    }
+    const char* prefill_names[] = {"393K linear causal prefill", "393K paged causal prefill", "393K FP4 causal prefill"};
+    const char* decode_names[] = {"393K linear decode", "393K paged decode", "393K FP4 decode"};
+    for (int format : {1, 2, 3}) {
         const auto layout = test_fp8_layout(format, 0);
-        auto* dk = dev(format == 2 ? page_cache(keys, 1, false) : keys);
-        auto* dv = dev(format == 2 ? page_cache(values, 1, true) : values);
+        auto* dk = format == 3 ? reinterpret_cast<uint8_t*>(dev(packed_k)) :
+                   dev(format == 2 ? page_cache(keys, 1, false) : keys);
+        auto* dv = format == 3 ? reinterpret_cast<uint8_t*>(dev(packed_v)) :
+                   dev(format == 2 ? page_cache(values, 1, true) : values);
         k::attn_flash_fp8(dq, H * D, dk, dv, layout, H, 1, D, T, n - T, 1.f, 1.f, zero, 1, n,
                           zero, out, H * D, scratch, scratch_n, 16, nullptr);
-        expect(format == 1 ? "393K linear causal prefill" : "393K paged causal prefill",
-               host(out, query.size()), expected, 2e-3, 5e-5);
+        expect(prefill_names[format - 1], host(out, query.size()), expected, 2e-3, 5e-5);
         k::attn_decode_mma_fp8(dq + H * D, zero, zero, dk, dv, layout, H, 1, pos, 0, splits, 1.f, 1.f,
                                zero, 16, 1, n, scratch, out, nullptr, nullptr, nullptr);
-        expect(format == 1 ? "393K linear decode" : "393K paged decode", host(out, H * D),
+        expect(decode_names[format - 1], host(out, H * D),
                std::vector<double>(expected.begin() + H * D, expected.end()), 2e-3, 5e-5);
         CU(cudaFree(dk)); CU(cudaFree(dv));
     }
@@ -1657,7 +1831,7 @@ void test_attn_decode_mma() {
     };
     for (int fp8 = 0; fp8 < attention_formats; ++fp8)
         for (const Case& c : cases) {
-            if (fp8 == 2 && c.kv_cap) continue;
+            if (fp8 >= 2 && c.kv_cap) continue;
             const int H = c.H, KV = c.KV, n_pos = c.qpos + 1, rows = c.kv_cap > 0 ? c.kv_cap : n_pos;
             const float k_inv = fp8 ? 1.0f / 16.0f : 1.0f, v_inv = fp8 ? 1.0f / 32.0f : 1.0f;
             // the cache's values as the kernel reads them: kf, vf [n_pos][KV * D] (before the scales)
@@ -1682,6 +1856,7 @@ void test_attn_decode_mma() {
                     }
                 }
             }
+            if (fp8 == 3) { fp4_fixture(k8, kf); fp4_fixture(v8, vf); }
             auto qf = fvec((size_t) H * D, fp8 ? 2.0f : 4.0f);
             std::vector<uint16_t> q16(qf.size());
             for (size_t i = 0; i < qf.size(); ++i) q16[i] = f2h_host(qf[i]);
@@ -1704,7 +1879,7 @@ void test_attn_decode_mma() {
                                        d_rel, c.extent, c.window, dscr, dout, dg, dout16, 0);
                 k::attn_decode_fp8_at(dq32, dr, ds, dk, dv, test_fp8_layout(fp8, c.kv_cap), H, KV, dpos, c.n_split, scale * k_inv,
                                       v_inv, dp, d_rel, c.extent, c.window, split_part, gated, 0, dg);
-                if (fp8 == 2) {
+                if (fp8 >= 2) {
                     float* tmp = dev_n<float>((size_t)H * 128 * 130);
                     float* result = dev_n<float>((size_t)H * D);
                     k::attn_decode_fp8(dq32, dr, ds, dk, dv, test_fp8_layout(fp8, 0), H, KV, D, 0, n_pos, c.qpos,
@@ -1758,10 +1933,10 @@ void test_attn_decode_mma() {
                 }
             }
             char label[96];
-            std::snprintf(label, sizeof label, "mma %s %s", fp8 == 2 ? "paged fp8" : fp8 ? "fp8" : "f16", c.name);
+            std::snprintf(label, sizeof label, "mma %s %s", fp8 == 3 ? "block fp4" : fp8 == 2 ? "paged fp8" : fp8 ? "fp8" : "f16", c.name);
             // (P is FP16 in the P V product: 2^-11 of a term)
             expect("split attention and gate", host(gated, want.size()), want, 1e-3, 1e-5);
-            if (fp8 == 2) {
+            if (fp8 >= 2) {
                 auto ungated = want;
                 for (size_t i = 0; i < ungated.size(); ++i) ungated[i] *= 1.0 + std::exp(-(double)gate[i]);
                 expect("paged scalar decode", scalar, ungated, 1e-3, 1e-5);
@@ -1803,7 +1978,7 @@ void test_attn_flash() {
 #endif
     };
     for (int fp8 = 0; fp8 < attention_formats; ++fp8) for (const Case& c : cases) {
-        if (fp8 == 2 && c.kv_cap) continue;
+        if (fp8 >= 2 && c.kv_cap) continue;
         const int n_pos = c.qpos0 + c.Tq;   // positions written so far
         const int rows = c.kv_cap > 0 ? c.kv_cap : n_pos;
         std::vector<uint8_t> k8((size_t) rows * KV * D), v8(k8.size());
@@ -1823,6 +1998,7 @@ void test_attn_flash() {
                 }
             }
         }
+        if (fp8 == 3) { fp4_fixture(k8, kc); fp4_fixture(v8, vc); }
         const int q_ld = H * D + (c.block ? 0 : 64);
         auto qf = fvec((size_t) c.Tq * q_ld, 4.0f);
         std::vector<uint16_t> q16(qf.size());
@@ -1915,7 +2091,7 @@ void test_attn_flash() {
             }
         }
         char name[96];
-        std::snprintf(name, sizeof name, "%s %s", c.name, fp8 == 2 ? "paged fp8" : fp8 ? "fp8" : "f16");
+        std::snprintf(name, sizeof name, "%s %s", c.name, fp8 == 3 ? "block fp4" : fp8 == 2 ? "paged fp8" : fp8 ? "fp8" : "f16");
         expect(name, got, want, 1e-2, 2e-3);
         cudaFree(dq);
         for (float* p : {db, ds, dout, dscr}) cudaFree(p);
@@ -2239,6 +2415,53 @@ float e4m3fn_to_f32_host(uint8_t q) {
     return sgn * std::ldexp(1.0f + (float) m / 8.0f, (int) e - 7);
 }
 
+#ifdef STRATA_USE_HIP
+void test_fp4_kv_write() {
+    constexpr int D = 128, T = 3, KV = 2, P = 17, KD = D * KV;
+    const auto layout = k::Fp8KvLayout::global_fp4();
+    auto key = fvec(T * KD, 9.f), value = fvec(T * KD, 7.f);
+    std::fill_n(key.begin(), 32, 0.f);
+    std::fill_n(value.begin()+KD, 32, 0.f);
+    auto* dk = dev(key); auto* dv = dev(value);
+    auto* q = dev(fvec(T * D)); auto* r = dev(fvec(T * 16));
+    auto* kc = dev_n<uint8_t>((P + T) * KD / 32 * 18);
+    auto* vc = dev_n<uint8_t>((P + T) * KD / 32 * 18);
+    k::prep_qkv_r_fp8(q, nullptr, dk, kc, dv, vc, r, nullptr, T, 1, KV, D, 16,
+                      22.f, 8.f, 1e-6f, nullptr, 0.f, 1.f, P, layout, 16.f, 32.f, nullptr);
+    auto* uk = dev_n<uint16_t>(T * KD); auto* uv = dev_n<uint16_t>(T * KD);
+    k::unpack_kv_fp8_to_f16(kc, vc, layout, P, T, KD, 1/16.f, 1/32.f, uk, uv, nullptr);
+    for (bool keys : {true, false}) {
+        const auto& input = keys ? key : value;
+        auto actual = host(keys ? uk : uv, T * KD);
+        int mismatch = 0;
+        for (int h=0; h<T*KV; ++h) {
+            double ss=0;
+            for (int d=0; d<D; ++d) ss += (double)input[h*D+d] * input[h*D+d];
+            double norm = keys ? std::min(1.,22./(std::sqrt(ss)+1e-6)) : 1./std::sqrt(ss/D+1e-6);
+            float external = keys ? 16.f : 32.f;
+            for (int g=0; g<D; g+=32) {
+                const float* src = input.data()+h*D+g;
+                double peak=0;
+                for (int d=0; d<32; ++d) peak=std::max(peak,std::abs(src[d]*norm));
+                double block_scale=h2f_host(f2h_host(peak*external/6.))/external;
+                for (int d=0; d<32; ++d) {
+                    const double target=std::abs(src[d]*norm);
+                    int best=0;
+                    for (int i=1; i<8; ++i)
+                        if (std::abs(kv_fp4_levels[i]*block_scale-target)<std::abs(kv_fp4_levels[best]*block_scale-target))
+                            best=i;
+                    const float wanted=std::copysign(kv_fp4_levels[best]*block_scale,src[d]);
+                    mismatch += h2f_host(actual[h*D+g+d]) != h2f_host(f2h_host(wanted));
+                }
+            }
+        }
+        expect_true(keys ? "FP4 clipped key CPU pack/unpack" : "FP4 normalized value CPU pack/unpack", mismatch==0);
+    }
+    for (auto* ptr : {dk, dv, q, r}) cudaFree(ptr);
+    cudaFree(kc); cudaFree(vc); cudaFree(uk); cudaFree(uv);
+}
+#endif
+
 void test_fp8_kv() {
     // 1. All 254 finite E4M3FN byte values -> unpack_kv_fp8_to_f16 bit-for-bit equality vs exact FP16
     {
@@ -2272,7 +2495,7 @@ void test_fp8_kv() {
         const int T = 5, H = 48, KV = 8, D = 128, d_rel = 16, kv_cap = 1056;
         const float qk_clip = 22.627416610717773f, rel_clip = 8.0f, eps = 1e-6f, alpha = 0.1f, n_floor = 128000.0f;
         const float k_scale = 16.0f, v_scale = 32.0f, k_inv = 1.0f / k_scale, v_inv = 1.0f / v_scale;
-        for (int full = 0; full < attention_formats; ++full) {
+        for (int full = 0; full < std::min(3, attention_formats); ++full) {
             const int cap = full ? 0 : kv_cap, pos0 = full ? 109 : 1054;
             const int kc_rows = full == 2 ? ((pos0 + T + 15) / 16) * 16 : cap > 0 ? cap : pos0 + T;
             auto q = fvec((size_t) T * H * D, 4.0f), qc = fvec((size_t) H * D, 2.0f),
@@ -3326,6 +3549,7 @@ int main() {
     std::printf("ik2_kernels_test on %s (sm_%d%d)\n", p.name, p.major, p.minor);
 #endif
     test_rms();
+    test_project_out();
     test_l2clip();
     test_conv();
     test_attn_res(9, 4608);
@@ -3360,6 +3584,9 @@ int main() {
     test_attn_f16();
     test_round2_fused();
     test_fp8_kv();
+#ifdef STRATA_USE_HIP
+    test_fp4_kv_write();
+#endif
     test_round6();
     test_attn_flash();
     test_attn_decode_mma();
@@ -3371,6 +3598,7 @@ int main() {
 #ifdef STRATA_USE_HIP
     test_experts_mma(2304, 1152, 1);
     test_rdna3_deep_attention();
+    test_rdna3_sparse_decode();
 #endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;

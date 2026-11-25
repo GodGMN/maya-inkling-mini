@@ -15,6 +15,10 @@ cp "$1" "$context/maya-ik2"
 cp -R "$2" "$context/tokenizer"
 cp "$root/docs/inkling2-mini/ik2-mini-gfx1100.json" "$root/docker/ik2-gfx1100.Dockerfile" "$context/"
 cp "$root/docker/start-ik2-gfx1100.sh" "$context/"
+mkdir "$context/ablate"
+if [ -d "$root/tools/ik2_ablate/directions" ]; then
+    cp -R "$root/tools/ik2_ablate/directions/." "$context/ablate/"
+fi
 mkdir "$context/vision"
 if [ "$#" -ge 4 ]; then
     test -x "$4"
@@ -49,6 +53,15 @@ def gpu_preset(exe, name, chunk):
 gpu_preset("vision/maya-vision-hip", "ik2-mini-gfx1100-hip-vision.json", 256)
 gpu_preset("vision/maya-vision-hip-host", "ik2-mini-gfx1100-hip-host-vision.json", 1024)
 gpu_preset("vision/maya-vision-hip-host", "ik2-mini-gfx1100-hip-host-vision-512.json", 512)
+host_vision = directory / "ik2-mini-gfx1100-hip-host-vision-512.json"
+if host_vision.is_file():
+    for slots, per_slot in [(2, 360448), (4, 176128)]:
+        preset = json.loads(host_vision.read_text())
+        preset["env"]["IK2_KV"] = "fp4-global"
+        args = preset["args"]
+        args[args.index("--max-context") + 1] = str(slots * per_slot)
+        args.extend(["--cache-slots", str(slots)])
+        (directory / f"ik2-mini-gfx1100-fp4-{slots}.json").write_text(json.dumps(preset, indent=2) + "\n")
 PYCONFIG
 fi
 cp -R "$root/serve" "$root/tools" "$context/"

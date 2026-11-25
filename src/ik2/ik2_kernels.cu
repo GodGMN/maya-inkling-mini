@@ -379,15 +379,52 @@ __device__ __forceinline__ void store_v_warp(const float* vp, uint8_t* vdst, int
     rms_fp8_warp(vp, vdst, D, eps, v_scale, paged);
 }
 
+__device__ __forceinline__ unsigned fp4_encode(float x) {
+    const float a = fabsf(x);
+    // Adjacent E2M1 bin midpoints, ties to the even code.
+    return ((x < 0.f) << 3) | ((a > .25f) + (a >= .75f) + (a > 1.25f) +
+        (a >= 1.75f) + (a > 2.5f) + (a >= 3.5f) + (a > 5.f));
+}
+
+__device__ __forceinline__ float fp4_value(unsigned code) {
+    const unsigned m = code & 7;
+    const unsigned bits = m > 1 ? 0x3800 + (m << 9) : m * 0x3800;
+    return h2f((uint16_t)(bits | ((code & 8) << 12)));
+}
+
+__device__ __forceinline__ float fp4_read(const uint8_t* cache, size_t element) {
+    const auto& block = reinterpret_cast<const Fp4KvBlock*>(cache)[element / 32];
+    unsigned pair = block.pairs[(element % 32) / 2];
+    return fp4_value((pair >> (4 * (element % 2))) & 15) * h2f(block.scale);
+}
+
+__device__ __forceinline__ void store_fp4_head(const float* src, uint8_t* cache, size_t head,
+                                               bool key, float clip, float eps, float scale) {
+    const int lane = threadIdx.x & 31;
+    const float4 x = reinterpret_cast<const float4*>(src)[lane];
+    const float ss = wsum(x.x*x.x + x.y*x.y + x.z*x.z + x.w*x.w);
+    const float multiplier = scale * (key ? fminf(1.f, clip / (sqrtf(ss) + 1e-6f)) : rsqrtf(ss / 128.f + eps));
+    float peak = fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(x.z), fabsf(x.w)));
+#pragma unroll
+    for (int step = 4; step; step /= 2) peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, step));
+    auto& block = reinterpret_cast<Fp4KvBlock*>(cache)[head * 4 + lane / 8];
+    const uint16_t bits = f2h(peak * multiplier / 6.f);
+    const float inv = bits ? multiplier / h2f(bits) : 0.f;
+    if (!(lane & 7)) block.scale = bits;
+    block.pairs[(lane & 7) * 2] = fp4_encode(x.x * inv) | (fp4_encode(x.y * inv) << 4);
+    block.pairs[(lane & 7) * 2 + 1] = fp4_encode(x.z * inv) | (fp4_encode(x.w * inv) << 4);
+}
+
 // 1 warp (32 threads) per group across all q, k, v, r groups of T tokens
-template <class KV>
+template <class KV, bool Sequences = false>
 __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const float* k_in, KV* kc, const float* v_in,
                                        KV* vc, float* r, const float* r_clip, int T, int H, int KVh, int D, int d_rel,
                                        float qk_clip, float rel_clip, float eps, const int* pos, float alpha,
                                        float n_floor, int pos0, int kv_cap, float k_scale, float v_scale,
                                        const int* pos0_d, uint16_t* q16, const uint16_t* sink_w, const float* sink_x,
-                                       int sink_k, float* sink_y, int q_ld = 0, int r_ld = 0, bool paged = false) {
-    if (pos0_d) pos0 = *pos0_d;   // (a token of a replayed graph: its position read here)
+                                       int sink_k, float* sink_y, int q_ld = 0, int r_ld = 0, bool paged = false, bool fp4 = false,
+                                       const int* slots = nullptr, size_t slot_stride = 0) {
+    if (!Sequences && pos0_d) pos0 = *pos0_d;   // (a token of a replayed graph: its position read here)
     const int gid = blockIdx.x;
     const int per_tok = 2 * H + 2 * KVh;
     if (q_ld <= 0) q_ld = H * D;   // (q's and r's rows: a token's [H][D] and [H][d_rel] unless given)
@@ -406,6 +443,11 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
         return;
     }
     const int t = gid / per_tok, rem = gid % per_tok;
+    if constexpr (Sequences) {
+        pos0 = pos0_d[t] - t;
+        kc += slots[t] * slot_stride;
+        vc += slots[t] * slot_stride;
+    }
     const float tau = pos ? (1.0f + alpha * logf(fmaxf(1.0f, ((float) pos[t] + 1.0f) / n_floor))) : 1.0f;
     if (rem < H) {
         const int h = rem;
@@ -416,12 +458,24 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
         const int kv = rem - H;
         const int slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t);
         const float* kp = k_in + ((size_t) t * KVh + kv) * D;
+        if constexpr (sizeof(KV) == 1) {
+            if (fp4) {
+                store_fp4_head(kp, kc, (size_t)slot * KVh + kv, true, qk_clip, eps, k_scale);
+                return;
+            }
+        }
         KV* kdst = kc + (paged ? kv_page_base(slot, kv, KVh) + (slot % 16) * 128 : ((size_t)slot * KVh + kv) * D);
         store_k_warp(kp, kdst, D, qk_clip, k_scale);
     } else if (rem < H + 2 * KVh) {
         const int kv = rem - H - KVh;
         const int slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t);
         const float* vp = v_in + ((size_t) t * KVh + kv) * D;
+        if constexpr (sizeof(KV) == 1) {
+            if (fp4) {
+                store_fp4_head(vp, vc, (size_t)slot * KVh + kv, false, qk_clip, eps, v_scale);
+                return;
+            }
+        }
         KV* vdst = vc + (paged ? kv_page_base(slot, kv, KVh) + slot % 16 : ((size_t)slot * KVh + kv) * D);
         store_v_warp(vp, vdst, D, eps, v_scale, paged);
     } else {
@@ -3694,7 +3748,7 @@ template <class KV>
 __device__ __forceinline__ void attn_flash_range(const float* qh, const float* rh, const KV* kc, const KV* vc,
                                                  int KD, int g, int kv_cap, int k0, int j0, int j1, int qpos,
                                                  float qk_scale, const float* proj, int d_rel, int extent, int window,
-                                                 float* sm_m, float* sm_s, float sm_o[][128], bool paged) {
+                                                 float* sm_m, float* sm_s, float sm_o[][128], bool paged, bool fp4) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int o = lane * 4;
     const float4 q4 = (((uintptr_t) qh & 15) == 0) ? __ldg((const float4*) (qh + o))
@@ -3709,7 +3763,17 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
         const int slot = kv_cap > 0 ? pos % kv_cap : pos;
         const size_t page = paged ? kv_page_base(slot, g, KD / 128) : 0;
         const size_t head_off = paged ? page + (slot % 16) * 128 : (size_t)slot * KD + (size_t)g * 128;
-        const float4 k4 = v_load4(kc + head_off, lane);
+        auto load = [&](const KV* cache) {
+            if constexpr (sizeof(KV) == 1) {
+                if (fp4) {
+                    const size_t i = head_off + lane * 4;
+                    return make_float4(fp4_read(cache, i), fp4_read(cache, i+1),
+                                       fp4_read(cache, i+2), fp4_read(cache, i+3));
+                }
+            }
+            return v_load4(cache + head_off, lane);
+        };
+        const float4 k4 = load(kc);
         float l;
 #ifdef STRATA_USE_HIP
         if constexpr (sizeof(KV) == 1) {
@@ -3736,8 +3800,8 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
                 if (paged) {
                     const KV* v = vc + page + slot % 16 + lane * 4 * 16;
                     v4 = make_float4(e4m3fn_to_f32(v[0]), e4m3fn_to_f32(v[16]), e4m3fn_to_f32(v[32]), e4m3fn_to_f32(v[48]));
-                } else v4 = v_load4(vc + head_off, lane);
-            } else v4 = v_load4(vc + head_off, lane);
+                } else v4 = load(vc);
+            } else v4 = load(vc);
             const float m_new = fmaxf(m_w, l);
             const float alpha = (m_w == -INFINITY) ? 0.0f : expf(m_w - m_new);
             const float beta = expf(l - m_new);
@@ -3761,7 +3825,7 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
 template <class KV>
 __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int H,
                                   int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel,
-                                  int extent, int window, float* part, const int* pos_d, bool paged = false) {
+                                  int extent, int window, float* part, const int* pos_d, bool paged = false, bool fp4 = false) {
     if (pos_d) {   // (tokens of a replayed graph: the first's position read here, the keys they may see from it)
         qpos0 = *pos_d;
         k0 = window < (1 << 30) ? max(0, qpos0 - window + 1) : 0;
@@ -3775,7 +3839,7 @@ __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, 
     const float* qh = q + ((size_t) qi * H + h) * 128;
     const float* rh = r + ((size_t) qi * H + h) * d_rel;
     attn_flash_range(qh, rh, kc, vc, KD, g, kv_cap, k0, j0, j1, qpos, qk_scale, proj, d_rel, extent, window, sm_m,
-                     sm_s, sm_o, paged);
+                     sm_s, sm_o, paged, fp4);
     const float M = fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3]));
     float sum = 0.0f, o = 0.0f;
     if (M > -INFINITY) {
@@ -3817,8 +3881,9 @@ __global__ void attn_combine_kernel(const float* sink, const float* part, int H,
 #ifdef STRATA_USE_HIP
 // Compute one exponential per split. Each feature then combines the same partials in the scalar kernel's order.
 __global__ void rdna3_combine_splits(const float* sink, const float* partials, int splits, float inv,
-                                     float* out, const float* gate, uint16_t* out16) {
-    const int head = blockIdx.x, tid = threadIdx.x;
+                                     float* out, const float* gate, uint16_t* out16, int gate_ld = 0) {
+    const int head = blockIdx.x + blockIdx.y * gridDim.x, tid = threadIdx.x;
+    if (gate_ld) gate += blockIdx.y * (gate_ld - gridDim.x * 128);
     const float* data = partials + (size_t)head * splits * 130;
     __shared__ float wave_max[4];
     extern __shared__ float2 weights[];
@@ -3881,7 +3946,7 @@ __global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_
 template <class KV>
 __global__ void attn_decode_kernel(const float* q, const float* r, const float* sink, const KV* kc, const KV* vc,
                                    int kv_cap, int H, int Hkv, int k0, int nk, int qpos, float qk_scale,
-                                   float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* out, bool paged = false) {
+                                   float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* out, bool paged = false, bool fp4 = false) {
     __shared__ float sm_m[4], sm_s[4];
     __shared__ __align__(16) float sm_o[4][128];
     const int h = blockIdx.x, g = h / (H / Hkv), tid = threadIdx.x;
@@ -3889,7 +3954,7 @@ __global__ void attn_decode_kernel(const float* q, const float* r, const float* 
     const float* qh = q + (size_t) h * 128;
     const float* rh = r + (size_t) h * d_rel;
     attn_flash_range(qh, rh, kc, vc, KD, g, kv_cap, k0, 0, nk, qpos, qk_scale, proj, d_rel, extent, window, sm_m, sm_s,
-                     sm_o, paged);
+                     sm_o, paged, fp4);
     const float sk = sink[h];
     const float M = fmaxf(sk, fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3])));
     float den = expf(sk - M), o = 0.0f;
@@ -3951,7 +4016,7 @@ __global__ void unpack_kv_fp8_to_f16_vec4_kernel(const uint8_t* kc, const uint8_
 
 __global__ void unpack_kv_fp8_to_f16_kernel(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,
                                             float k_inv_scale, float v_inv_scale, uint16_t* k_out16,
-                                            uint16_t* v_out16, bool paged) {
+                                            uint16_t* v_out16, bool paged, bool fp4) {
     const size_t total = (size_t) nk * KD;
     for (size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x; idx < total;
          idx += (size_t) gridDim.x * blockDim.x) {
@@ -3962,8 +4027,8 @@ __global__ void unpack_kv_fp8_to_f16_kernel(const uint8_t* kc, const uint8_t* vc
         const size_t page = paged ? kv_page_base(slot, d / 128, KD / 128) : 0;
         const size_t k = paged ? page + (slot % 16) * 128 + d % 128 : src;
         const size_t v = paged ? page + (d % 128) * 16 + slot % 16 : src;
-        if (k_out16) k_out16[idx] = unpack_scaled_byte(kc[k], k_inv_scale);
-        if (v_out16) v_out16[idx] = unpack_scaled_byte(vc[v], v_inv_scale);
+        if (k_out16) k_out16[idx] = fp4 ? f2h(fp4_read(kc, src) * k_inv_scale) : unpack_scaled_byte(kc[k], k_inv_scale);
+        if (v_out16) v_out16[idx] = fp4 ? f2h(fp4_read(vc, src) * v_inv_scale) : unpack_scaled_byte(vc[v], v_inv_scale);
     }
 }
 
@@ -4125,6 +4190,46 @@ __device__ __forceinline__ void mv_q8p_row(const int8_t* __restrict__ q, const u
     acc = wsum(acc);
     if (lane == 0 && !mv_conv_row(c0, row, acc) && !mv_conv_row(c1, row, acc)) y[row] = acc;
 }
+// Four sequences share each planar weight load. Each wave reduces one output channel
+// in the same lane and iteration order as mv_q8p_row.
+template <int Rows>
+__global__ void mv_q8p_sequences_kernel(const int8_t* q, const uint16_t* d, int N, int K,
+                                        const float* x, int T, float* y, int ldy) {
+    const int r = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (r >= N) return;
+    const int first = blockIdx.y * Rows;
+    const uint32_t* qr = (const uint32_t*)(q + (size_t)r * K);
+    const uint16_t* dr = d + (size_t)r * (K >> 5);
+    float acc[Rows] = {};
+#pragma unroll 4
+    for (int i = 0; i < K / 128; ++i) {
+        const uint32_t w = qr[i * 32 + lane];
+        const float scale = h2f(dr[i * 4 + (lane >> 3)]);
+#pragma unroll
+        for (int t = 0; t < Rows; ++t) {
+            if (first + t >= T) break;
+            const float4 v = ((const float4*)(x + (size_t)(first + t) * K))[i * 32 + lane];
+            acc[t] += scale * ((int8_t)w * v.x + (int8_t)(w >> 8) * v.y +
+                               (int8_t)(w >> 16) * v.z + (int8_t)(w >> 24) * v.w);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < Rows && first + t < T; ++t) {
+        const float sum = wsum(acc[t]);
+        if (!lane) y[(size_t)(first + t) * ldy + r] = sum;
+    }
+}
+
+__global__ void conv_sequences_kernel(const int* slots, const float* x, int ldx, MvConv cv) {
+    const int row = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cv.n) return;
+    cv.hist += (size_t)slots[row] * 3 * cv.n;
+    if (cv.dyn) cv.dyn += row * cv.heads * 4;
+    if (cv.res) cv.res += row * cv.n;
+    cv.y += row * cv.n;
+    mv_conv_row(cv, c, x[(size_t)row * ldx + c]);
+}
+
 template <int WARPS, int StaticK = 0, int Unroll = 4>
 __global__ void mv_q8p_kernel(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y,
                               MvConv c0, MvConv c1, MvAlt a0, MvAlt a1) {
@@ -4158,18 +4263,32 @@ __global__ void decode_q8p_f16_kernel(const int8_t* __restrict__ q, const uint16
 
 // the routed slots' tables from the picks, on the device: slot i's expert e = top[i] - its blocks, its token, its
 // scales; wt = the route weight times down's scale
+template <bool GroupByExpert>
 __global__ void route_gather_kernel(const int* __restrict__ top, const float* __restrict__ w,
                                     const uint8_t* const* __restrict__ tab, const float* __restrict__ sg_t,
                                     const float* __restrict__ su_t, const float* __restrict__ sd_t, int S, int K,
                                     const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt) {
     const int i = threadIdx.x;
-    if (i >= S) return;
+    int ordered = i;
+    if constexpr (GroupByExpert) {
+        // Run neighboring picks of the same expert together so they can share cached weights.
+        // The inverse map restores the original top-K summation order in moe_combine_f32.
+        extern __shared__ int counts[];
+        if (i < 128) counts[i] = 0;
+        __syncthreads();
+        const int e = i < S ? top[i] : 0;
+        const int within = i < S ? atomicAdd(counts + e, 1) : 0;
+        __syncthreads();
+        if (i >= S) return;
+        ordered = within;
+        for (int j = 0; j < e; ++j) ordered += counts[j];
+    } else if (i >= S) return;
     const int e = top[i];
-    blob[i] = tab[e];
-    tok[i] = i / K;
-    inv[i] = i;
-    sg[i] = sg_t ? sg_t[e] : 1.0f;
-    su[i] = su_t ? su_t[e] : 1.0f;
+    blob[ordered] = tab[e];
+    tok[ordered] = i / K;
+    inv[i] = ordered;
+    sg[ordered] = sg_t ? sg_t[e] : 1.0f;
+    su[ordered] = su_t ? su_t[e] : 1.0f;
     wt[i] = w[i] * (sd_t ? sd_t[e] : 1.0f);
 }
 // One token's routing in one launch: route's picks and weights and route_gather's tables, the same values.  A
@@ -5445,6 +5564,33 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
 
 }  // namespace
 
+__global__ void project_out_kernel(float* __restrict__ y, const float* __restrict__ r, float s, float c, int D,
+                                   const float* __restrict__ srow, bool keep_norm) {
+    float* row = y + (size_t) blockIdx.x * D;
+    __shared__ float part[256], part2[256];
+    float d = 0.0f, n2 = 0.0f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) d += row[i] * r[i], n2 += row[i] * row[i];
+    part[threadIdx.x] = d;
+    part2[threadIdx.x] = n2;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+        if (threadIdx.x < w) part[threadIdx.x] += part[threadIdx.x + w], part2[threadIdx.x] += part2[threadIdx.x + w];
+        __syncthreads();
+    }
+    const float k = (srow ? srow[blockIdx.x] * s : s) * (part[0] - c);
+    float g = 1.0f;   // |y|^2 after: |y|^2 - 2 k (r . y) + k^2 (r unit)
+    if (keep_norm) {
+        const float after = part2[0] - 2.0f * k * part[0] + k * k;
+        g = after > 1e-30f ? sqrtf(part2[0] / after) : 1.0f;
+    }
+    for (int i = threadIdx.x; i < D; i += blockDim.x) row[i] = (row[i] - k * r[i]) * g;
+}
+void project_out(float* y, const float* r, float s, float c, int T, int D, cudaStream_t st, const float* srow,
+                 bool keep_norm) {
+    if (T <= 0) return;
+    project_out_kernel<<<T, 256, 0, st>>>(y, r, s, c, D, srow, keep_norm);
+    check("project_out");
+}
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s) {
     if (rows <= 0) return;
     rms_impl_kernel<false, true><<<rows, kBlk, 0, s>>>(x, w, D, eps, nullptr, y);
@@ -5575,6 +5721,11 @@ void rdna3_flash(const uint16_t* q, int q_ld, const KV* kc, const KV* vc, Fp8KvL
         constexpr int queries = Waves * 16;
         const dim3 grid(H, splits, (T + queries - 1) / queries);
         if constexpr (sizeof(KV) == 1) {
+            if (layout.fp4) {
+                rdna3_attn_part<true, false, Waves, (Waves > 1), false, true><<<grid, Waves * 32, 0, stream>>>(
+                    q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias);
+                return;
+            }
             if (layout.paged) {
                 rdna3_attn_part<true, false, Waves, (Waves > 1), true><<<grid, Waves * 32, 0, stream>>>(
                     q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias);
@@ -5798,7 +5949,7 @@ void softcap(float* x, size_t n, float cap, cudaStream_t s) {
     check("softcap");
 }
 
-void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s) {
+void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float* sc, cudaStream_t s, bool sequences) {
     if (T <= 0 || n <= 0) return;
     if (n > 3 || R > kLoopRankMax || T > 65535) {
         std::fprintf(stderr, "ik2::k::loop_gates: %d gates, rank %d, %d tokens\n", n, R, T);
@@ -5822,10 +5973,10 @@ void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float
     for (int j = 0; j < n; ++j) {
         aligned &= !(((uintptr_t)a.x[j] | (uintptr_t)a.m[j]) & 15) && !((uintptr_t)a.D[j] & 7);
     }
-    if (tile == 256 && T == 1 && R == 64 && C % 64 == 0 && compact && aligned) {
-        rdna3_gate_dots<<<dim3(R, n), 128, 0, s>>>(a, C, sc);
+    if (tile == 256 && (T == 1 || sequences) && R == 64 && C % 64 == 0 && compact && aligned) {
+        rdna3_gate_dots<<<dim3(R, n, T), 128, 0, s>>>(a, C, sc);
         check("rdna3_gate_dots");
-        rdna3_gate_apply<<<dim3(C / 64, n), 256, 0, s>>>(a, C, eps, sc);
+        rdna3_gate_apply<<<dim3(C / 64, n, T), 256, 0, s>>>(a, C, eps, sc);
         check("rdna3_gate_apply");
         return;
     }
@@ -6221,7 +6372,7 @@ void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* k
     const int total = T * (2 * H + 2 * KV);
     prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) total, 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
-        pos0, kv_cap, k_scale, v_scale, nullptr, nullptr, nullptr, nullptr, 0, nullptr, 0, 0, layout.paged);
+        pos0, kv_cap, k_scale, v_scale, nullptr, nullptr, nullptr, nullptr, 0, nullptr, 0, 0, layout.paged, layout.fp4);
     check("prep_qkv_r_fp8");
 }
 
@@ -6237,7 +6388,7 @@ void attn_multi_impl(const float* q, const float* r, const float* sink, const KV
     const int P = std::min(128, std::max(1, (nk + 63) / 64));
     float* part = scratch;
     attn_split_kernel<KV><<<dim3(H, P, nq), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale, proj,
-                                                          d_rel, extent, window, part, nullptr, layout.paged);
+                                                          d_rel, extent, window, part, nullptr, layout.paged, layout.fp4);
     check("attn_multi_split");
     attn_combine_kernel<<<dim3(H, nq), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
     check("attn_multi_combine");
@@ -6296,13 +6447,13 @@ void attn_decode_impl(const float* q, const float* r, const float* sink, const K
     const int P = std::min(128, std::max(1, (nk + 63) / 64));
     if (P == 1) {
         attn_decode_kernel<KV><<<H, 128, 0, s>>>(q, r, sink, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale,
-                                                   v_inv_scale, proj, d_rel, extent, window, out, layout.paged);
+                                                   v_inv_scale, proj, d_rel, extent, window, out, layout.paged, layout.fp4);
         check("attn_decode");
         return;
     }
     float* part = scratch;
     attn_split_kernel<KV><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
-                                                      extent, window, part, nullptr, layout.paged);
+                                                      extent, window, part, nullptr, layout.paged, layout.fp4);
     check("attn_decode_split");
     attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
     check("attn_decode_combine");
@@ -6339,6 +6490,17 @@ void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x
 }
 
 #endif
+void mv_q8p_sequences(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int rows,
+                      float* y, int ldy, cudaStream_t s) {
+    mv_q8p_sequences_kernel<4><<<dim3((N + 3) / 4, (rows + 3) / 4), 128, 0, s>>>(q, d, N, K, x, rows, y, ldy);
+    check("mv_q8p_sequences");
+}
+
+void conv_sequences(const int* slots, int rows, const float* x, int ldx, MvConv cv, cudaStream_t s) {
+    conv_sequences_kernel<<<dim3((cv.n + 127) / 128, rows), 128, 0, s>>>(slots, x, ldx, cv);
+    check("conv_sequences");
+}
+
 void mv_q8p_conv(const int8_t* q, const uint16_t* d, int N, int K, const float* x, float* y, const MvConv& c0,
                  const MvConv& c1, cudaStream_t s, const MvAlt& a0, const MvAlt& a1, const MvF16Jobs& side) {
     if (N <= 0) return;
@@ -6401,14 +6563,19 @@ void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStrea
 
 void route_gather(const int* top, const float* w, const uint8_t* const* tab, const float* sg_t, const float* su_t,
                   const float* sd_t, int S, int K, const uint8_t** blob, int* tok, int* inv, float* sg, float* su,
-                  float* wt, cudaStream_t s) {
+                  float* wt, cudaStream_t s, bool group) {
     if (S <= 0) return;
     if (S > 1024) {
         std::fprintf(stderr, "ik2::k::route_gather: %d slots\n", S);
         std::abort();
     }
-    route_gather_kernel<<<1, (unsigned) ((S + 31) / 32 * 32), 0, s>>>(top, w, tab, sg_t, su_t, sd_t, S, K, blob, tok, inv,
-                                                                       sg, su, wt);
+    const unsigned threads = (S + 31) / 32 * 32;
+    if (group)
+        route_gather_kernel<true><<<1, std::max(128u, threads), 128 * sizeof(int), s>>>(
+            top, w, tab, sg_t, su_t, sd_t, S, K, blob, tok, inv, sg, su, wt);
+    else
+        route_gather_kernel<false><<<1, threads, 0, s>>>(top, w, tab, sg_t, su_t, sd_t, S, K, blob, tok, inv,
+                                                        sg, su, wt);
     check("route_gather");
 }
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
@@ -6456,7 +6623,7 @@ void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t
     const int kv_cap = layout.ring_capacity;
     prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) (2 * H + 2 * KV + (sink_w ? H : 0)), 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
-        alpha, n_floor, 0, kv_cap, k_scale, v_scale, pos, q16, sink_w, sink_x, sink_k, sink_y, 0, 0, layout.paged);
+        alpha, n_floor, 0, kv_cap, k_scale, v_scale, pos, q16, sink_w, sink_x, sink_k, sink_y, 0, 0, layout.paged, layout.fp4);
     check("prep_qkv_r_fp8_at");
 }
 
@@ -6467,7 +6634,7 @@ void split_token_attention(const float* q, const float* r, const KV* kc, const K
     const int ring = layout.ring_capacity;
 #ifdef STRATA_USE_HIP
     static const bool grouped = getenv("IK2_DECODE_SUBWAVE") && atoi(getenv("IK2_DECODE_SUBWAVE"));
-    if (grouped) {
+    if (grouped && !layout.fp4) {
         if (layout.paged)
             rdna3_decode_split<KV, true><<<dim3(H, splits), 128, 0, stream>>>(q, r, kc, vc, ring, H, Hkv, pos, scale,
                                                               proj, dr, extent, window, scratch);
@@ -6479,9 +6646,45 @@ void split_token_attention(const float* q, const float* r, const KV* kc, const K
     }
 #endif
     attn_split_kernel<KV><<<dim3(H, splits), 128, 0, stream>>>(q, r, kc, vc, ring, H, Hkv, 0, 0, 0, scale,
-                                                             proj, dr, extent, window, scratch, pos, layout.paged);
+                                                             proj, dr, extent, window, scratch, pos, layout.paged, layout.fp4);
     check("attn_split_kernel");
 }
+
+#ifdef STRATA_USE_HIP
+bool sequence_attention_fp8(float* q, float* r, float* gate, int ld, const float* qclip, const float* rclip,
+                            const float* keys, const float* values, uint8_t* kc, uint8_t* vc, Fp8KvLayout layout,
+                            size_t stride, const int* slots, const int* pos, int T, int H, int KV, int dr,
+                            float qcap, float rcap, float eps, float alpha, float floor, float kscale, float vscale,
+                            const float* rel, int extent, int window, int splits, const float* sink,
+                            float* scratch, float* out, cudaStream_t stream) {
+    static const bool grouped = getenv("IK2_DECODE_SUBWAVE") && atoi(getenv("IK2_DECODE_SUBWAVE"));
+    if (!grouped || layout.fp4) return false;
+    const int ring = layout.ring_capacity;
+    prep_qkv_r_impl_kernel<uint8_t, true><<<T * (2 * H + 2 * KV), 32, 0, stream>>>(
+        q, qclip, keys, kc, values, vc, r, rclip, T, H, KV, 128, dr, qcap, rcap, eps,
+        ring ? nullptr : pos, alpha, floor, 0, ring, kscale, vscale, pos, nullptr, nullptr, nullptr,
+        0, nullptr, ld, ld, layout.paged, false, slots, stride);
+    check("sequence KV append");
+    const dim3 grid(H, splits, T);
+    const float scale = (1.f / sqrtf(128.f)) / kscale;
+    if (layout.paged)
+        rdna3_decode_split<uint8_t, true, true><<<grid, 128, 0, stream>>>(
+            q, r, kc, vc, ring, H, KV, pos, scale, rel, dr, extent, window, scratch, slots, stride, ld);
+    else
+        rdna3_decode_split<uint8_t, false, true><<<grid, 128, 0, stream>>>(
+            q, r, kc, vc, ring, H, KV, pos, scale, rel, dr, extent, window, scratch, slots, stride, ld);
+    check("sequence attention");
+    static const bool shared = getenv("IK2_SHARED_COMBINE") && atoi(getenv("IK2_SHARED_COMBINE"));
+    if (shared && splits >= 16)
+        rdna3_combine_splits<<<dim3(H, T), 128, splits * sizeof(float2), stream>>>(
+            sink, scratch, splits, 1.f / vscale, out, gate, nullptr, ld);
+    else
+        attn_combine_kernel<<<dim3(H, T), 128, 0, stream>>>(
+            sink, scratch, H, splits, 1.f / vscale, out, gate, nullptr, 0, ld);
+    check("sequence attention combine");
+    return true;
+}
+#endif
 
 void attn_decode_f16_at(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
@@ -6499,6 +6702,22 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
     check("attn_decode_fp8_at (combine)");
 }
 
+
+#ifdef STRATA_USE_HIP
+void rdna3_sparse_decode(const uint16_t* q, const float* r, const float* sink, const uint8_t* kc,
+                         const uint8_t* vc, int H, int Hkv, const int* pos, float qscale, float v_inv,
+                         const float* proj, int dr, int extent, int* pages, float* scratch, float* out,
+                         const float* gate, uint16_t* out16, cudaStream_t stream) {
+    constexpr int splits = 64;
+    rdna3_select_pages<<<dim3(kSparsePages, Hkv), 32, 0, stream>>>(q, kc, H / Hkv, Hkv, pos, pages);
+    check("rdna3_select_pages");
+    rdna3_attn_part<false, false, 1, true, false, false, true><<<dim3(Hkv, splits), 32, 0, stream>>>(
+        q, r, kc, vc, 0, H, Hkv, pos, 0, qscale, proj, dr, extent, 1 << 30, scratch, 1, H * 128, nullptr, 0, pages);
+    check("rdna3 sparse attention");
+    combine_token_splits(sink, scratch, H, splits, v_inv, out, gate, out16, stream);
+    check("rdna3 sparse attention combine");
+}
+#endif
 
 int attn_decode_mma_blocks(int Hkv) {
 #ifdef STRATA_USE_HIP
@@ -6532,7 +6751,10 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
         std::abort();
     }
     static const bool staged = getenv("IK2_ATTN_STAGED") && atoi(getenv("IK2_ATTN_STAGED"));
-    if (layout.paged)
+    if (layout.fp4)
+        rdna3_attn_part<false, false, 1, true, false, true><<<dim3(Hkv, n_split), 32, 0, s>>>(q16, r, kc, vc, kv_cap, H, Hkv, pos, qpos,
+                                                      qk_scale, proj, d_rel, extent, window, scratch, 1, H * 128, nullptr);
+    else if (layout.paged)
         rdna3_attn_part<false, false, 1, false, true><<<dim3(Hkv, n_split), 32, 0, s>>>(q16, r, kc, vc, kv_cap, H, Hkv, pos, qpos,
                                                       qk_scale, proj, d_rel, extent, window, scratch, 1, H * 128, nullptr);
     else if (staged)
@@ -6582,7 +6804,7 @@ void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, Fp8KvLayout layo
                           cudaStream_t s) {
     const int kv_cap = layout.ring_capacity;
     if (nk <= 0 || KD <= 0) return;
-    if (!layout.paged && (KD & 3) == 0 && (!k_out16 || ((((uintptr_t) kc & 3) == 0) && (((uintptr_t) k_out16 & 7) == 0))) &&
+    if (!layout.paged && !layout.fp4 && (KD & 3) == 0 && (!k_out16 || ((((uintptr_t) kc & 3) == 0) && (((uintptr_t) k_out16 & 7) == 0))) &&
         (!v_out16 || ((((uintptr_t) vc & 3) == 0) && (((uintptr_t) v_out16 & 7) == 0)))) {
         const int kd4 = KD >> 2;
         const int bx = std::min(256, kd4);
@@ -6595,7 +6817,7 @@ void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, Fp8KvLayout layo
     const size_t total = (size_t) nk * KD;
     const unsigned blocks = (unsigned) std::min<size_t>((total + kBlk - 1) / kBlk, 65535u);
     unpack_kv_fp8_to_f16_kernel<<<blocks, kBlk, 0, s>>>(kc, vc, kv_cap, k0, nk, KD, k_inv_scale, v_inv_scale, k_out16,
-                                                        v_out16, layout.paged);
+                                                        v_out16, layout.paged, layout.fp4);
     check("unpack_kv_fp8_to_f16");
 }
 
@@ -6670,7 +6892,11 @@ static void attn_block_impl(const uint16_t* q16, const float* r, int r_ld, const
         std::abort();
     }
     const int columns = T * (H / Hkv);
-    if (layout.paged)
+    if (layout.fp4)
+        rdna3_attn_part<false, true, 1, false, false, true><<<dim3(Hkv, n_split, (columns + 15) / 16), 32, 0, s>>>(
+        q16, r, kc, vc, kv_cap, H, Hkv, pos, 0, qk_scale, proj, d_rel, extent, window,
+        scratch, T, H * 128, nullptr, r_ld);
+    else if (layout.paged)
         rdna3_attn_part<false, true, 1, false, true><<<dim3(Hkv, n_split, (columns + 15) / 16), 32, 0, s>>>(
         q16, r, kc, vc, kv_cap, H, Hkv, pos, 0, qk_scale, proj, d_rel, extent, window,
         scratch, T, H * 128, nullptr, r_ld);
@@ -6788,7 +7014,7 @@ void prep_qkv_r_fp8_block(float* q, int q_ld, const float* q_clip, const float* 
     const int kv_cap = layout.ring_capacity;
     prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) (T * (2 * H + 2 * KV) + (sink_w ? T * H : 0)), 32, 0, s>>>(
         q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
-        alpha, n_floor, 0, kv_cap, k_scale, v_scale, pos, q16, sink_w, sink_x, sink_k, sink_y, q_ld, r_ld, layout.paged);
+        alpha, n_floor, 0, kv_cap, k_scale, v_scale, pos, q16, sink_w, sink_x, sink_k, sink_y, q_ld, r_ld, layout.paged, layout.fp4);
     check("prep_qkv_r_fp8_block");
 }
 void prep_qkv_r_f16_block(float* q, int q_ld, const float* q_clip, const float* k_in, uint16_t* kc, const float* v_in,

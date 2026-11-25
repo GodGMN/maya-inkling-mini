@@ -169,6 +169,7 @@ class LoopGuard:
     def __init__(self, think_end: int | None = None, in_think: bool = False, detector: LoopDetector | None = None):
         self.det = detector or LoopDetector()
         self.think_end = think_end
+        self.close_tokens = (think_end,) if think_end is not None else ()
         self.in_think = bool(in_think) and think_end is not None
         self.hits = {"thinking": 0, "answer": 0}
         self.events: list[Action] = []
@@ -260,6 +261,8 @@ class ToolSafeGuard(LoopGuard):
 
     def _follow(self, t: int) -> bool:
         """Read token t's text for the markers; True when it is in a tool call (or ends one)."""
+        if self.piece is None:
+            return False
         was = self.in_tool
         buf = self.tail + (self.piece(t) or "")
         while True:
@@ -274,8 +277,6 @@ class ToolSafeGuard(LoopGuard):
         return was or self.in_tool
 
     def push(self, t: int, written: int | None = None) -> Action | None:
-        if self.piece is None:
-            return super().push(t, written)
         inside = self._follow(t)
         self.since_tool = 0 if inside else self.since_tool + 1
         self.call_n += self.in_tool
@@ -294,6 +295,29 @@ class ToolSafeGuard(LoopGuard):
     def resume(self, kept: list[int], act: Action) -> None:
         self.since_tool = max(0, self.since_tool - act.drop)
         super().resume(kept, act)
+
+
+class InklingGuard(ToolSafeGuard):
+    """Follow Inkling's single-token segment headers, including one already supplied in the prompt."""
+
+    def __init__(self, marks: dict[str, int], prompt_tail: int | None):
+        from serve.frontend import INK_CALL, INK_END, INK_MODEL, INK_TEXT, INK_THINK
+        super().__init__(think_end=marks[INK_END])
+        self.think = marks[INK_THINK]
+        self.call = marks[INK_CALL]
+        self.markers = frozenset(marks.values())
+        self.close_tokens = (marks[INK_END], marks[INK_MODEL], marks[INK_TEXT])
+        if prompt_tail is not None:
+            self._follow(prompt_tail)
+
+    def _follow(self, t: int) -> bool:
+        inside = self.in_tool
+        if t in self.markers:
+            self.in_think = t == self.think
+            self.in_tool = t == self.call
+            if self.in_tool:
+                self.tool_penalised, self.call_n = False, 0
+        return inside or self.in_tool
 
 
 # ------------------------------------------------------------------------------------------------ across turns
