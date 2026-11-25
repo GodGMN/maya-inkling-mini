@@ -6703,6 +6703,22 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
 }
 
 
+#ifdef STRATA_USE_HIP
+void rdna3_sparse_decode(const uint16_t* q, const float* r, const float* sink, const uint8_t* kc,
+                         const uint8_t* vc, int H, int Hkv, const int* pos, float qscale, float v_inv,
+                         const float* proj, int dr, int extent, int* pages, float* scratch, float* out,
+                         const float* gate, uint16_t* out16, cudaStream_t stream) {
+    constexpr int splits = 64;
+    rdna3_select_pages<<<dim3(kSparsePages, Hkv), 32, 0, stream>>>(q, kc, H / Hkv, Hkv, pos, pages);
+    check("rdna3_select_pages");
+    rdna3_attn_part<false, false, 1, true, false, false, true><<<dim3(Hkv, splits), 32, 0, stream>>>(
+        q, r, kc, vc, 0, H, Hkv, pos, 0, qscale, proj, dr, extent, 1 << 30, scratch, 1, H * 128, nullptr, 0, pages);
+    check("rdna3 sparse attention");
+    combine_token_splits(sink, scratch, H, splits, v_inv, out, gate, out16, stream);
+    check("rdna3 sparse attention combine");
+}
+#endif
+
 int attn_decode_mma_blocks(int Hkv) {
 #ifdef STRATA_USE_HIP
     return std::max(1, 256 / std::max(Hkv, 1));

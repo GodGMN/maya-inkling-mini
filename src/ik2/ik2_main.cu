@@ -1294,6 +1294,7 @@ struct Work {
     uint16_t *kv_k16 = nullptr, *kv_v16 = nullptr;
     int kv_tmp_cap = 0;
     float* attn_lora_tmp = nullptr;
+    int* sparse_pages = nullptr;
     int* pos;
     cudaEvent_t prefill_inputs_copied;
     float* rlog;
@@ -2319,6 +2320,7 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 // dense weights are the GGUF's blocks (IK2_DENSE=q8, the default when the experts fit), one product a launch.
 bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
 bool g_fast_want = false;
+bool g_sparse_decode = false;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
 bool g_block = true;        // IK2_BLOCK=0: a verify window through forward() instead of the block path
 int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN_MMA=0: the scalar kernels; 2: the
@@ -2328,6 +2330,7 @@ struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
     int attention_bucket = 0;
+    bool sparse = false;
 };
 bool tier_active = false;
 bool stage_cold = false;
@@ -2436,7 +2439,8 @@ __global__ void stage_selected_experts(const uint8_t* const* table, const uint8_
 
 void decode_attention(const Config& c, const Layer& Ly, int attention_bucket, float* q_p, float* r_p,
                       float* gate_p, float* kconv, float* vconv, const int* pos, uint16_t* x16,
-                      const uint16_t* sink_after_projection, const float* xq, float* sink, float* lg, float* o) {
+                      const uint16_t* sink_after_projection, const float* xq, float* sink, float* lg, float* o,
+                      int* sparse_pages = nullptr) {
     const int C = c.C, HD = c.H * c.D;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
@@ -2467,6 +2471,13 @@ void decode_attention(const Config& c, const Layer& Ly, int attention_bucket, fl
         k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, kconv, Ly.kc8, vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                              c.qk_clip, c.rel_clip, c.eps, pos, !Ly.sliding, c.alpha, c.n_floor, Ly.fp8_layout(),
                              k_scale, v_scale, q16, g_s, sink_after_projection, xq, C, sink);
+#ifdef STRATA_USE_HIP
+        if (sparse_pages && !Ly.sliding) {
+            k::rdna3_sparse_decode(q16, r_p, sink, Ly.kc8, Ly.vc8, c.H, c.KV, pos, qk_scale / k_scale,
+                                   1.f / v_scale, Ly.rel_proj, c.d_rel, extent, sparse_pages, lg, o, gate_p, x16, g_s);
+            return;
+        }
+#endif
         if (mma)
             k::attn_decode_mma_fp8(q16, r_p, sink, Ly.kc8, Ly.vc8, Ly.fp8_layout(), c.H, c.KV, pos, 0, ns,
                                    qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, lg,
@@ -2489,7 +2500,7 @@ void decode_attention(const Config& c, const Layer& Ly, int attention_bucket, fl
     if (!mma && !split_gate) k::gate_mul_f16(o, gate_p, (size_t)HD, x16, true, g_s);
 }
 
-void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_bucket) {
+void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_bucket, bool sparse = false) {
     AblDecodeScope abl_decode;
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
@@ -2614,7 +2625,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
         }
         // the clips, the token's K and V into the cache at its position, the attention
         decode_attention(c, Ly, attention_bucket, q_p, r_p, gate_p, W.kconv, W.vconv, W.pos,
-                         W.x16, sink_after_projection, W.xq, W.sink, W.lg, W.o);
+                         W.x16, sink_after_projection, W.xq, W.sink, W.lg, W.o, sparse ? W.sparse_pages : nullptr);
         // the output projection with its short conv (and the stream added, but where a block starts: there the
         // stream joins the blocks and starts again)
         const bool first = l % c.block == 0;
@@ -2748,15 +2759,21 @@ int decode_bucket(int pos) {
 }
 
 void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>& logits_out,
-                std::vector<int>* argmax_out) {
+                std::vector<int>* argmax_out, bool generation) {
     const Config& c = M.c;
     Work& W = dev_work(0);
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
     const int attention_bucket = decode_bucket(pos);
+    const bool sparse = generation && g_sparse_decode && pos >= 32768;
+    if (sparse) {
+        static bool reported = false;
+        if (!reported) std::fprintf(stderr, "sparse global decode active at position %d\n", pos);
+        reported = true;
+    }
     if (!g_graph) {
-        fast_token_launches(M, W, out_mode, attention_bucket);
+        fast_token_launches(M, W, out_mode, attention_bucket, sparse);
     } else {
         FastGraph& G =
             g_fgraph[(tier_active && (stage_cold || !host_plan.active.empty())) || host_plan.forced][(int)out_mode];
@@ -2764,19 +2781,20 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
         // A chat server can alternate between short and long requests on successive turns.
         static FastGraph previous[4];
         static const bool keep_pair = getenv("IK2_GRAPH_PAIR") && atoi(getenv("IK2_GRAPH_PAIR"));
-        if (keep_pair && G.exec && G.attention_bucket != attention_bucket && !g_managed_experts &&
+        if (keep_pair && G.exec && (G.attention_bucket != attention_bucket || G.sparse != sparse) && !g_managed_experts &&
             !tier_active && !host_plan.forced && !stage_cold)
             std::swap(G, previous[(int)out_mode]);
 #endif
-        if (G.exec && G.attention_bucket != attention_bucket) {
+        if (G.exec && (G.attention_bucket != attention_bucket || G.sparse != sparse)) {
             CU(cudaGraphExecDestroy(G.exec));
             CU(cudaGraphDestroy(G.graph));
             G = {};
         }
         if (!G.exec) {   // the first token of this kind: its launches recorded
             G.attention_bucket = attention_bucket;
+            G.sparse = sparse;
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
-            fast_token_launches(M, W, out_mode, attention_bucket);
+            fast_token_launches(M, W, out_mode, attention_bucket, sparse);
             CU(cudaStreamEndCapture(g_s, &G.graph));
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
         }
@@ -3427,12 +3445,12 @@ bool resident_wmma_prefill(const Config& c, const Layer& ly, int T, Work& w) {
 #endif
 
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
-             std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
+             std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp, bool generation = false) {
     k::enable_grouped_tensor_products(allow_short_batch_products());
     const Config& c = M.c;
     const int C = c.C;
     if (g_fast && T == 1 && dump.empty() && !g_prof && !g_rec && !g_trace && g_pop.empty() && g_img.at(pos0) < 0) {
-        fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out);
+        fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out, generation);
         return;
     }
     if (out_mode == OutMode::kCand) out_mode = OutMode::kLogits, g_cand.n = -1;   // (this path: the logits)
@@ -4643,6 +4661,17 @@ int main(int argc, char** argv) {
     if (model.empty() || (toks.empty() && !serve))
         die("usage: maya-ik2 --model FIRST.gguf (--tokens 1,2,3 [--gen N] | --serve) [--chunk 2048] [--ctx N] ...");
     const int batch_width = getenv("IK2_BATCH") ? std::atoi(getenv("IK2_BATCH")) : 1;
+    if (const char* v = getenv("IK2_SPARSE_DECODE")) {
+        if (std::string(v) != "0" && std::string(v) != "1") die("IK2_SPARSE_DECODE expects 0 or 1");
+        g_sparse_decode = std::string(v) == "1";
+    }
+    if (g_sparse_decode) {
+#ifndef STRATA_USE_HIP
+        die("IK2_SPARSE_DECODE requires the gfx1100 backend");
+#endif
+        if (batch_width != 1 || !draft_path.empty() || (getenv("IK2_SUFFIX") && atoi(getenv("IK2_SUFFIX"))))
+            die("IK2_SPARSE_DECODE requires single-stream decode without speculation");
+    }
     if (batch_width < 1 || batch_width > 32) die("IK2_BATCH must be between 1 and 32");
     if (batch_width > 1) {
 #ifndef STRATA_USE_HIP
@@ -5160,6 +5189,8 @@ int main(int argc, char** argv) {
     // Each visit owns its KV. Sliding layers use ring buffers in both CLI and server mode.
     const bool paged_kv = getenv("IK2_PAGED_KV") && atoi(getenv("IK2_PAGED_KV"));
 #ifdef STRATA_USE_HIP
+    if (g_sparse_decode && (paged_kv || g_kv_precision != KVPrecision::fp8 || c.D != 128 || g_attn_mma != 3))
+        die("IK2_SPARSE_DECODE requires token-major IK2_KV=fp8 and IK2_ATTN_MMA=3 with 128-wide heads");
     if (g_kv_precision == KVPrecision::fp4_global && (paged_kv || c.D != 128))
         die("fp4-global requires token-major KV and 128-wide heads");
     if (paged_kv && (!byte_cache(false) || c.D != 128)) die("IK2_PAGED_KV requires global E4M3 KV with 128-wide heads");
@@ -5532,6 +5563,9 @@ int main(int argc, char** argv) {
         W.kv_k16 = work_alloc<uint16_t>((size_t)W.kv_tmp_cap * KD);
         W.kv_v16 = work_alloc<uint16_t>((size_t)W.kv_tmp_cap * KD);
     }
+#ifdef STRATA_USE_HIP
+    if (g_sparse_decode) W.sparse_pages = work_alloc<int>(c.KV * k::kSparsePages);
+#endif
     W.pos = work_alloc<int>(T_buf);
     W.rlog = work_alloc<float>(T_buf * c.E), W.route_d = work_alloc<int>(S_buf * 2);
     W.ex16 = work_alloc<uint16_t>(T_buf * C),
@@ -5735,6 +5769,11 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
     }
 #ifdef STRATA_USE_HIP
+    if (g_sparse_decode) {
+        if (!g_fast || g_prof || g_rec || g_trace || !g_pop.empty() || !dump.empty())
+            die("IK2_SPARSE_DECODE requires the resident decoder without tracing, profiling or dumps");
+        std::fprintf(stderr, "sparse decode enabled: 224 x 64 global keys from position 32768; dense prefill\n");
+    }
     if ((drafter || suffix_window) && g_block) {
         const bool planar = M.out_w.q8 && std::all_of(M.L.begin(), M.L.end(), [](const Layer& ly) {
             return ly.wo.q8 && (ly.sliding ? ly.wqkvrg.q8 != nullptr : ly.wqrg.q8 && ly.wk.q8 && ly.wv.q8);
@@ -6342,13 +6381,13 @@ int main(int argc, char** argv) {
                 if (temp <= 0) {
                     std::vector<float> lo;
                     std::vector<int> ag;
-                    forward(M, &tok, 1, (int) hist.size(), false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
+                    forward(M, &tok, 1, (int) hist.size(), false, OutMode::kArgmax, std::string(), lo, &ag, t_exp, true);
                     greedy_tok = ag[0];
                     last.clear();
                 } else {
                     std::vector<float> lo;
                     forward(M, &tok, 1, (int) hist.size(), false, use_cand ? OutMode::kCand : OutMode::kLogits,
-                            std::string(), lo, nullptr, t_exp);
+                            std::string(), lo, nullptr, t_exp, true);
                     cand = use_cand && g_cand.n >= 0;
                     last = std::move(lo);
                 }
@@ -6524,7 +6563,7 @@ int main(int argc, char** argv) {
         std::vector<int> ag;
         if (lo) logits.clear();
         forward(M, &tok, 1, (int) prompt.size() + i, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
-                logits, &ag, t_exp);
+                logits, &ag, t_exp, true);
         if (lo) {
             std::fwrite(logits.data(), sizeof(float), (size_t) c.n_vocab, lo);
             best = (int) (std::max_element(logits.begin(), logits.begin() + c.n_vocab) - logits.begin());

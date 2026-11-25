@@ -1683,6 +1683,64 @@ std::vector<uint8_t> page_cache(const std::vector<uint8_t>& linear, int heads, b
 }
 
 #ifdef STRATA_USE_HIP
+void test_rdna3_sparse_decode() {
+    // Different landmark keys win for each KV head. The last page has one live token.
+    constexpr int H = 4, KV = 2, D = 128, n = 32769, page_size = 64;
+    constexpr int budget = k::kSparsePages, total = (n + page_size - 1) / page_size;
+    std::vector<uint8_t> keys(size_t(n) * KV * D), values(keys.size());
+    std::vector<uint16_t> q(H * D);
+    for (int h = 0; h < H; ++h) q[h * D + h % 2] = f2h_host(1.f);
+    for (int t = 0; t < n; ++t) {
+        for (int kv = 0; kv < KV; ++kv) {
+            const int page = t / page_size;
+            const size_t row = (size_t(t) * KV + kv) * D;
+            if (page % 3 == kv && t % page_size == (kv ? 48 : 16)) keys[row + kv] = 0x48; // 4
+            values[row] = (page % 3 == kv || t == n - 1) ? 0x40 : 0xb8; // 2 or -1
+        }
+    }
+    auto* dq = dev(q);
+    auto* dk = dev(keys);
+    auto* dv = dev(values);
+    auto* pos = dev(std::vector<int>{n - 1});
+    auto* zero = dev(std::vector<float>(H, 0.f));
+    auto* pages = dev_n<int>(KV * budget);
+    auto* out = dev_n<float>(H * D);
+    auto* scratch = dev_n<float>(k::attn_decode_mma_scratch(H, 64));
+    k::rdna3_sparse_decode(dq, zero, zero, dk, dv, H, KV, pos, 1.f, 1.f, zero, 1, 1,
+                            pages, scratch, out, nullptr, nullptr, nullptr);
+    const auto actual = host(pages, KV * budget);
+    std::vector<int> selected(KV * budget);
+    std::vector<double> expected(H * D);
+    for (int kv = 0; kv < KV; ++kv) {
+        double z[2] = {1., 1.}, sum[2] = {}; // sink
+        for (int slot = 0; slot < budget; ++slot) {
+            int page = slot;
+            if (slot >= budget - 24) page = total - budget + slot;
+            else if (slot >= 2) {
+                const int begin = 2 + (slot - 2) * (total - 26) / (budget - 26);
+                const int end = 2 + (slot - 1) * (total - 26) / (budget - 26);
+                page = begin;
+                for (int candidate = begin; candidate < end; ++candidate)
+                    if (candidate % 3 == kv) { page = candidate; break; }
+            }
+            selected[kv * budget + slot] = page;
+            for (int t = page * page_size; t < std::min(n, (page + 1) * page_size); ++t) {
+                const size_t row = (size_t(t) * KV + kv) * D;
+                for (int h = 0; h < 2; ++h) {
+                    const double w = keys[row + h] ? std::exp(4.) : 1.;
+                    z[h] += w;
+                    sum[h] += w * (values[row] == 0x40 ? 2. : -1.);
+                }
+            }
+        }
+        for (int h = 0; h < 2; ++h) expected[(kv * 2 + h) * D] = sum[h] / z[h];
+    }
+    expect_true("sparse page ids by KV head", actual == selected);
+    expect("sparse decode vs selected-key FP64", host(out, H * D), expected, 2e-3, 5e-5);
+    CU(cudaFree(dq)); CU(cudaFree(dk)); CU(cudaFree(dv)); CU(cudaFree(pos)); CU(cudaFree(zero));
+    CU(cudaFree(pages)); CU(cudaFree(out)); CU(cudaFree(scratch));
+}
+
 void test_rdna3_deep_attention() {
     constexpr int n = 392957, D = 128, H = 3, T = 2, splits = 512, padded = ((n + 15) / 16) * 16;
     const int marks[] = {n / 20, n / 2, 19 * n / 20, n - 1};
@@ -3540,6 +3598,7 @@ int main() {
 #ifdef STRATA_USE_HIP
     test_experts_mma(2304, 1152, 1);
     test_rdna3_deep_attention();
+    test_rdna3_sparse_decode();
 #endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
