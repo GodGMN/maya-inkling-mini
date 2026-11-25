@@ -1,13 +1,13 @@
-# Inkling-2-Mini RX 7900 XTX (`gfx1100`) — Runtime Cyber Abliteration (`r5`)
+# Inkling-2-Mini RX 7900 XTX (`gfx1100`) — Runtime Abliteration (`r5`)
 
-`hyperion/maya-ik2:gfx1100-service-r5` packages the compiled `maya-ik2` HIP engine (with `IK2_ABLATE_KEEP_NORM`, `IK2_ABLATE_VISITS`, and native `attn_output` LoRA support) plus the 9 KB orthogonalized refusal direction (`v21-pc4.f32`) right inside the image.
+`hyperion/maya-ik2:gfx1100-service-r5` packages the compiled `maya-ik2` HIP engine (with `IK2_ABLATE_KEEP_NORM`, `IK2_ABLATE_VISITS`, and native `attn_output` LoRA support) plus the 9 KB norm-preserving orthogonalized refusal direction (`v21-pc4.f32`) right inside the image.
 
 - **Zero extra model download:** uses the exact same stock `Inkling-2-Mini-IQ4_NL.gguf` (17.6 GB).
-- **Single feature flag:** off by default (100% stock Inkling-2-Mini); flip `IK2_ABLATE_MODE=cyber` to enable our verified `v21-pc4 @ s=1.6, VISITS=22:48, KEEP_NORM=1` configuration (~114.6 tok/s vs. 118.6 tok/s stock, ~3% overhead).
+- **Single feature flag:** off by default (100% stock Inkling-2-Mini); flip `IK2_ABLATE_MODE=on` (aliases: `1`, `true`, `v21-pc4-kn`, `cyber`) to enable our verified `v21-pc4 @ s=1.6, VISITS=22:48, KEEP_NORM=1` configuration (~114.6 tok/s vs. 118.6 tok/s stock, ~3% overhead).
 
 ## Quick Start (RX 7900 XTX, ROCm)
 
-### Cyber Mode (`3 × 131K` FP8 KV, text-only — no `mmproj` required)
+### Abliterated Mode (`3 × 131K` FP8 KV, text-only — no `mmproj` required)
 ```bash
 docker run -d --name inkling-2-mini \
   --device /dev/dri --device /dev/kfd \
@@ -15,7 +15,7 @@ docker run -d --name inkling-2-mini \
   -v /path/to/inkling-2-mini:/opt/maya/models:ro \
   -e IK2_CACHE_SLOTS=3 \
   -e IK2_TEXT_ONLY=1 \
-  -e IK2_ABLATE_MODE=cyber \
+  -e IK2_ABLATE_MODE=on \
   -p 127.0.0.1:8085:8080 \
   hyperion/maya-ik2:gfx1100-service-r5
 ```

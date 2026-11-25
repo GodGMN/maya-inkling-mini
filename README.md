@@ -2,7 +2,7 @@
 
 # Maya-IK2 for AMD RX 7900 XTX (`gfx1100`)
 
-**Thinking Machines' 26B Looped MoE (`Inkling-2-Mini`) running 100% resident in 24 GB VRAM — 119 tok/s single-stream, 328 tok/s batched, 694 tok/s code edits, 393K context, GPU vision, and one-flag runtime cyber abliteration.**
+**Thinking Machines' 26B Looped MoE (`Inkling-2-Mini`) running 100% resident in 24 GB VRAM — 119 tok/s single-stream, 328 tok/s batched, 694 tok/s code edits, 393K context, GPU vision, and one-flag runtime abliteration.**
 
 [![GPU](https://img.shields.io/badge/AMD-RX%207900%20XTX%20(gfx1100)-ED1C24?style=flat-square&logo=amd&logoColor=white)](docs/HIP-PORT.md)
 [![Speed](https://img.shields.io/badge/Decode-119%20tok%2Fs%20%7C%20328%20batched-0ea5e9?style=flat-square)](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
@@ -35,14 +35,14 @@ A native **HIP / RDNA3 (`gfx1100`)** port of [`alesha-pro/maya-inkling-mini`](ht
 
 ## One-Flag Runtime Abliteration
 
-No second 17.6 GB model download. No destructive weight-baking collapse. Flip **`IK2_ABLATE_MODE=cyber`** on the exact same stock `Inkling-2-Mini-IQ4_NL.gguf` to apply our coding-orthogonalized **9 KB** direction (`v21-pc4.f32`, norm-preserving `KEEP_NORM=1`) at runtime — keeping **~114.6 tok/s** (~3% overhead) and **5/5** on multi-file agentic bugfix benchmarks.
+No second 17.6 GB model download. No destructive weight-baking collapse. Flip **`IK2_ABLATE_MODE=on`** on the exact same stock `Inkling-2-Mini-IQ4_NL.gguf` to apply our norm-preserving, coding-orthogonalized **9 KB** direction (`v21-pc4.f32`, `KEEP_NORM=1`) at runtime — keeping **~114.6 tok/s** (~3% overhead) and **5/5** on multi-file agentic bugfix benchmarks.
 
 <p align="center">
-  <img src="docs/assets/cyber-ablation.svg" alt="One-Flag Runtime Cyber Abliteration Benchmarks" width="100%" />
+  <img src="docs/assets/cyber-ablation.svg" alt="One-Flag Runtime Abliteration Benchmarks" width="100%" />
 </p>
 
 - **Off by default (`IK2_ABLATE_MODE=off`):** byte-identical stock Inkling-2-Mini.
-- **Flip on (`IK2_ABLATE_MODE=cyber`):** loads [`tools/ik2_ablate/directions/v21-pc4.f32`](tools/ik2_ablate/directions/v21-pc4.f32) (`s=1.6`, `VISITS=22:48`, `KEEP_NORM=1`).
+- **Flip on (`IK2_ABLATE_MODE=on`):** loads [`tools/ik2_ablate/directions/v21-pc4.f32`](tools/ik2_ablate/directions/v21-pc4.f32) (`s=1.6`, `VISITS=22:48`, `KEEP_NORM=1`).
 - **Need a standalone portable `.gguf` for vanilla `llama.cpp` / NVIDIA?** Use our included 20-tensor BF16 LoRA trainer ([`colab_inkling_lora.ipynb`](tools/ik2_ablate/colab_inkling_lora.ipynb)) + zero-PyTorch GGUF splicer ([`apply_lora_gguf.py`](tools/ik2_ablate/apply_lora_gguf.py)).
 
 Full flags, A/B testing, and betatester image export instructions: **[`docs/inkling2-mini/runtime-ablation-gfx1100.md`](docs/inkling2-mini/runtime-ablation-gfx1100.md)**.
@@ -61,11 +61,11 @@ docker run -d --name inkling-2-mini \
   -v /path/to/inkling-2-mini:/opt/maya/models:ro \
   -e IK2_CACHE_SLOTS=3 \
   -e IK2_TEXT_ONLY=1 \
-  -e IK2_ABLATE_MODE=cyber \
+  -e IK2_ABLATE_MODE=on \
   -p 127.0.0.1:8085:8080 \
   hyperion/maya-ik2:gfx1100-service-r5
 ```
-> Omit `IK2_ABLATE_MODE=cyber` for 100% stock Inkling. Omit `IK2_TEXT_ONLY=1` if `mmproj-F16.gguf` is in your models folder to enable GPU vision.
+> Omit `IK2_ABLATE_MODE=on` for 100% stock Inkling. Omit `IK2_TEXT_ONLY=1` if `mmproj-F16.gguf` is in your models folder to enable GPU vision.
 
 ### Option 2 — Build from Source (Linux + ROCm + `gfx1100`)
 ```bash
@@ -87,7 +87,7 @@ hf download ggml-org/Inkling-2-Mini-GGUF Inkling-2-Mini-IQ4_NL.gguf --local-dir 
 python3 tools/strata_tokenizer.py --gguf models/Inkling-2-Mini-IQ4_NL.gguf --out ik2 \
   --chat-template tools/ik2/chat_template.jinja
 
-# Serve OpenAI + Anthropic API on :18085 (add IK2_ABLATE vars for cyber mode)
+# Serve OpenAI + Anthropic API on :18085 (add IK2_ABLATE vars for runtime abliteration)
 IK2_ABLATE=tools/ik2_ablate/directions/v21-pc4.f32 \
 IK2_ABLATE_SCALE=1.6 IK2_ABLATE_VISITS=22:48 IK2_ABLATE_KEEP_NORM=1 \
 python3 serve/server.py --engine maya --config docs/inkling2-mini/ik2-mini-gfx1100.json \
