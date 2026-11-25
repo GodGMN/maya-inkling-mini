@@ -11,7 +11,7 @@ You need Linux, an RTX 3090 or another 24 GB `sm_86` card, CUDA 12.8 with `nvcc`
 ### 1. Build the engine
 
 ```bash
-git clone https://github.com/GodGMN/maya-inkling-mini && cd maya-inkling-mini
+git clone https://github.com/GodGMN/tintero && cd tintero
 pip install numpy jinja2 regex pyyaml tqdm requests pillow psutil "jsonschema>=4.18,<5" huggingface_hub
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON \
   -DCMAKE_CUDA_ARCHITECTURES=86 -DSTRATA_BUILD_TESTS=OFF
