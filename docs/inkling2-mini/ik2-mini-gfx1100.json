@@ -1,6 +1,6 @@
 {
   "backend": "hip",
-  "exe": "build-ik2/maya-ik2",
+  "exe": "build-ik2/tintero",
   "args": ["--model", "models/Inkling-2-Mini-IQ4_NL.gguf", "--max-context", "393216", "--chunk", "1024"],
   "env": {
     "IK2_HOST": "mmap",

@@ -33,7 +33,7 @@ def main():
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--workload", choices=("inventory", "python"), default="inventory")
     ap.add_argument("--inventory-lines", type=int, default=9, help="number of nine-box lines in the inventory")
-    ap.add_argument("--score", type=Path, help="stdout of maya-ik2 --serve-ik2")
+    ap.add_argument("--score", type=Path, help="stdout of tintero --serve-ik2")
     args = ap.parse_args()
     if min(args.max_tokens, args.repeats) < 1:
         ap.error("--max-tokens and --repeats must be positive")

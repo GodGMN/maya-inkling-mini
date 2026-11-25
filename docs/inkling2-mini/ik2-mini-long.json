@@ -1,5 +1,5 @@
 {
- "exe": "build/maya-ik2",
+ "exe": "build/tintero",
  "args": [
   "--model",
   "models/Inkling-2-Mini-UD-Q4_K_XL.gguf",

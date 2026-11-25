@@ -4,7 +4,7 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/maya
 COPY LICENSE VERSION ./
-COPY maya-ik2 build-ik2/maya-ik2
+COPY tintero build-ik2/tintero
 COPY serve/ serve/
 COPY tools/ tools/
 COPY tokenizer/ ik2/tokenizer/

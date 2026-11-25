@@ -14,7 +14,7 @@ model=/weights/Inkling-2-Mini-IQ4_NL.gguf
 docker run --rm --network none "${mounts[@]}" --entrypoint sh "$image" -ec '
     test ! -e /dev/kfd
     test -r "$1"
-    for binary in /trial/build/maya-ik2 /trial/build/ik2_kernels_test; do
+    for binary in /trial/build/tintero /trial/build/ik2_kernels_test; do
         deps=$(ldd "$binary"); if echo "$deps" | grep "not found"; then exit 1; fi
     done
     python3 /trial/src/tests/ik2_sparse_decode.py run --help >/dev/null
@@ -37,6 +37,6 @@ docker run --rm --network none --name maya-ik2-sparse-trial --user "$(id -u):$(i
     --device /dev/kfd --device /dev/dri "${mounts[@]}" -v "$out:/out" \
     -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONUNBUFFERED=1 --entrypoint sh "$image" -ec '
         /trial/build/ik2_kernels_test > /out/kernels.log 2>&1 || { tail -50 /out/kernels.log; exit 1; }
-        exec python3 /trial/src/tests/ik2_sparse_decode.py run --engine /trial/build/maya-ik2 \
+        exec python3 /trial/src/tests/ik2_sparse_decode.py run --engine /trial/build/tintero \
             --model "$1" --tokenizer ik2/tokenizer --fixtures /trial/fixtures --output /out/quality
     ' sh "$model" | tee "$out/progress.log"

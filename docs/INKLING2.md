@@ -119,10 +119,10 @@ in memory are read from the SSD. A ~150 GB pack in the shape of Maya's DeepSeek 
 dense weights GPTQ'd at 5-6 bits) is the target for a 160 GB pool; unsloth's KLD (0.092 against their BF16 file,
 which keeps the experts' original bits) is the bar.
 
-## 6. Phase 2: the engine, `maya-ik2`
+## 6. Phase 2: the engine, `tintero`
 
 `src/ik2/` runs unsloth's GGUFs in place (UD-Q4_K_XL: NVFP4 experts in layers 0-39; UD-Q3_K_XL: IQ3_XXS / IQ4_XS),
-CUDA on Linux, Ampere on. Built by CMake beside the other engines (`maya-ik2`, and `ik2_kernels_test` with
+CUDA on Linux, Ampere on. Built by CMake beside the other engines (`tintero`, and `ik2_kernels_test` with
 `STRATA_BUILD_TESTS`); a 90 in `CMAKE_CUDA_ARCHITECTURES` builds sm_90a for the Hopper attention.
 
 **Where the weights sit.** The dense weights (attention, router, head: ~4.7 B) are decoded once to FP16 in VRAM. The
@@ -164,7 +164,7 @@ To run it (no setup in `maya.py` yet):
     python tools/strata_tokenizer.py --gguf Inkling-2-Small-UD-Q4_K_XL-00001-of-00009.gguf --out ik2 \
         --chat-template tools/ik2/chat_template.jinja --check
     cat > ik2.json <<EOF
-    {"exe": "build/maya-ik2", "args": ["--model", "Inkling-2-Small-UD-Q4_K_XL-00001-of-00009.gguf",
+    {"exe": "build/tintero", "args": ["--model", "Inkling-2-Small-UD-Q4_K_XL-00001-of-00009.gguf",
      "--max-context", "65536", "--cache-gb", "200"], "tokenizer": "ik2/tokenizer", "model_name": "inkling-2-small"}
     EOF
     python serve/server.py --engine maya --config ik2.json
@@ -216,7 +216,7 @@ the block states the core was first given. A pass after the first reads the pass
 layer - for q, k, v and the MoE - each an attention residual over the earlier pass's block states and its final
 stream (`loop_res_query`, `loop_kv_res_query`), let into the layer's input by a gate of rank 64:
 `(1 - tanh(F g)) x + tanh(G g) m`, `g = D [rms(x); rms(m)]`. The weights are a layer's; the KV cache and the conv
-histories are a visit's. `ref/inkling2.py` and `maya-ik2` keep a list of visits; with `num_loops` 1 it is the layers.
+histories are a visit's. `ref/inkling2.py` and `tintero` keep a list of visits; with `num_loops` 1 it is the layers.
 
 **The file.** unsloth's Mini GGUFs are in the layout llama.cpp master reads (other tensor and key names, the convs
 not folded, gate and up merged into `ffn_gate_up_exps`); the reference and the engine read both layouts.
@@ -252,7 +252,7 @@ expert's blocks once for up to 8 of its tokens, instead of decoded to FP16 for a
 
 **Measured**, one RTX 3090 (24 GB, 300 W), UD-Q4_K_XL, tok/s:
 
-| | llama.cpp b12590 | `maya-ik2`, FP16 cache | FP8 cache |
+| | llama.cpp b12590 | `tintero`, FP16 cache | FP8 cache |
 | --- | --- | --- | --- |
 | A token, 47 tokens deep | 57 | 112 | 110 |
 | 4,096 deep | | 106 | 107 |

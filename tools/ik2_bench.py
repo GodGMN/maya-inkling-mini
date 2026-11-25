@@ -1,4 +1,4 @@
-"""Measure uncached prefill and decode on maya-ik2 or a running llama.cpp service."""
+"""Measure uncached prefill and decode on tintero or a running llama.cpp service."""
 import argparse
 from contextlib import contextmanager
 import json
@@ -67,7 +67,7 @@ def llama_requests(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--engine", help="path to maya-ik2")
+    target.add_argument("--engine", help="path to tintero")
     target.add_argument("--llama-url", help="base URL of llama.cpp server")
     parser.add_argument("--model", help="GGUF for --engine")
     parser.add_argument("--draft", type=pathlib.Path, help="optional DSpark mtp.safetensors for --engine")

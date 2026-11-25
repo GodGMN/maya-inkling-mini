@@ -102,7 +102,7 @@ def main():
     ap.add_argument("--decode-steps", type=int, default=0,
                     help="also time this many decode steps after extending the same prompt by one token")
     mode = ap.add_mutually_exclusive_group()
-    mode.add_argument("--score", type=Path, help="stdout of maya-ik2 --serve-ik2")
+    mode.add_argument("--score", type=Path, help="stdout of tintero --serve-ik2")
     mode.add_argument("--llama-url", help="run the same token IDs through llama.cpp /completion")
     args = ap.parse_args()
     depths = [int(x) for x in args.depths.split(",")]

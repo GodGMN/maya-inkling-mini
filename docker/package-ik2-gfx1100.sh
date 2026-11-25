@@ -2,7 +2,7 @@
 # Package a built gfx1100 engine and a tokenizer exported from the target GGUF.
 set -eu
 if [ "$#" -lt 3 ] || [ "$#" -gt 6 ]; then
-    echo "usage: $0 MAYA_IK2 TOKENIZER_DIRECTORY IMAGE_TAG [CPU_VISION [HIP_VISION [HIP_VISION_HOST_WEIGHTS]]]" >&2
+    echo "usage: $0 TINTERO_BINARY TOKENIZER_DIRECTORY IMAGE_TAG [CPU_VISION [HIP_VISION [HIP_VISION_HOST_WEIGHTS]]]" >&2
     exit 2
 fi
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -11,7 +11,7 @@ test -r "$2/chat_template.jinja"
 context=$(mktemp -d)
 trap 'rm -rf "$context"' EXIT
 cp "$root/LICENSE" "$root/VERSION" "$context/"
-cp "$1" "$context/maya-ik2"
+cp "$1" "$context/tintero"
 cp -R "$2" "$context/tokenizer"
 cp "$root/docs/inkling2-mini/ik2-mini-gfx1100.json" "$root/docker/ik2-gfx1100.Dockerfile" "$context/"
 cp "$root/docker/start-ik2-gfx1100.sh" "$context/"

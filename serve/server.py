@@ -3855,9 +3855,9 @@ class Service:
                                  "videos: send the request without them (describe the picture in text instead)")
             inkling = getattr(self.template, "inkling", False)
             if self.vision is None and inkling:
-                # Inkling 2: maya-ik2 has no vision tower of its own (the GGUF leaves it out); with a "vision" entry in
+                # Inkling 2: tintero has no vision tower of its own (the GGUF leaves it out); with a "vision" entry in
                 # the config the image encoder (maya-vision and unsloth's mmproj) reads the pictures
-                raise ValueError(f"{self.model} on maya-ik2 reads text only without the image encoder (a \"vision\" "
+                raise ValueError(f"{self.model} on tintero reads text only without the image encoder (a \"vision\" "
                                  "entry in its config: maya-vision and the model's mmproj file), so it cannot read "
                                  "images or videos: send the request without them (describe the picture in text "
                                  "instead)")

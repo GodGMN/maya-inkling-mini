@@ -1,4 +1,4 @@
-"""tools/ik2_compare.py - maya-ik2's dump (--dump DIR: blk.L.out.f32, logprobs.f32) against ref/inkling2.py's seams
+"""tools/ik2_compare.py - tintero's dump (--dump DIR: blk.L.out.f32, logprobs.f32) against ref/inkling2.py's seams
 (--dump-dir: blk.L.out.npy, logprobs.npy), the same tokens through both.
 
     python tools/ik2_compare.py ENGINE_DUMP_DIR REF_SEAMS_DIR [--width 4608]

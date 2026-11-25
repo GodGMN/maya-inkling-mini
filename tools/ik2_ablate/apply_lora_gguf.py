@@ -4,7 +4,7 @@ directly into a quantized Inkling-2-Mini GGUF (zero PyTorch required).
 
 Produces either:
   - A tiny override shard (`weights-00001-of-00002.gguf` symlink + `weights-00002-of-00002.gguf`) for
-    instant testing on maya-ik2, OR
+    instant testing on tintero, OR
   - With `--full`, a single standalone portable `model.gguf` that runs out-of-the-box in vanilla
     llama.cpp / Ollama / LM Studio on NVIDIA/AMD/Apple Silicon with zero custom runtime hooks.
 

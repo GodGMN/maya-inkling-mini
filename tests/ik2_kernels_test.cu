@@ -1,4 +1,4 @@
-// tests/ik2_kernels_test.cu - maya-ik2's kernels (src/ik2/ik2_kernels.cu) on random data, no model, each against a
+// tests/ik2_kernels_test.cu - tintero's kernels (src/ik2/ik2_kernels.cu) on random data, no model, each against a
 // double reference written from ref/inkling2.py's ops:
 //   * rms, the scaled L2 clip (with and without the full layers' log scaling), the short conv (static and dynamic taps,
 //     the history carried over calls of 1, 2, 3 and many tokens = one call over all of them), the attention residual

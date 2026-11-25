@@ -124,7 +124,7 @@ class Dashboard(unittest.TestCase):
 
     def test_inkling_context_reload_and_rollback_with_two_caches(self):
         slots = 2
-        self.cfg.write_text(json.dumps({"exe": "maya-ik2", "args": ["--max-context", "65536", "--cache-slots", "2"]}))
+        self.cfg.write_text(json.dumps({"exe": "tintero", "args": ["--max-context", "65536", "--cache-slots", "2"]}))
         self.engine.info.update(engine_kind="ik2", cache_slots=slots)
         self.engine.stop = lambda: None
         self.engine.restart = lambda: None

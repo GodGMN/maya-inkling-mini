@@ -6,7 +6,7 @@ tests/ik2_coding.py, but generates in parallel against batched servers and auto-
 local Docker image with Python + NumPy (ik2-evalplus:local or hyperion/maya-ik2:gfx1100-service-r4).
 
 Works identically against Maya runtime-ablation presets (127.0.0.1:8087) and standalone/baked GGUFs
-served via maya-ik2 or llama-server.
+served via tintero or llama-server.
 """
 from __future__ import annotations
 

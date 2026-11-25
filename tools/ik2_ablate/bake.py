@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bake.py - writes a refusal direction into Inkling 2 Mini weights: an override shard for maya-ik2 (the edited
+"""bake.py - writes a refusal direction into Inkling 2 Mini weights: an override shard for tintero (the edited
 tensors in Q8_0, read after the base file) or, with --full, a whole GGUF for any runtime.
 
     bake.py BASE.gguf DIR.f32 OUTDIR --layers 18-23 [--writers attn,ffn] [--mode conv|r] [--scale 1] [--full]
@@ -12,7 +12,7 @@ plain transformer's abliteration does).  The writers: attn_output and every expe
 listed.  A looped core's layer is edited for all of its passes (the weights are shared).
 
 OUTDIR gets weights-00001-of-00002.gguf (a link to BASE) and weights-00002-of-00002.gguf (the edited tensors), the
-pair maya-ik2 loads with --model OUTDIR/weights-00001-of-00002.gguf; with --full, OUTDIR/model.gguf instead.
+pair tintero loads with --model OUTDIR/weights-00001-of-00002.gguf; with --full, OUTDIR/model.gguf instead.
 Needs numpy and tools/gguf_reader.py.
 """
 from __future__ import annotations

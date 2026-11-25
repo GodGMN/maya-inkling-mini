@@ -1,5 +1,5 @@
 # evalq.py PORT_OR_URL TAG [N] [MT] [NM] [SAVE_JSONL]: the quick check of a setting (runtime ablation preset OR
-# standalone GGUF served via maya-ik2 or llama-server) - MMLU first 64 (reasoning off: correct, and answers that list
+# standalone GGUF served via tintero or llama-server) - MMLU first 64 (reasoning off: correct, and answers that list
 # several options), harmful test with medium reasoning (refused, hit the 2048 limit), harmless test medium (refused,
 # hit the limit).  When SAVE_JSONL (or env EVALQ_SAVE) is set, saves full {i, set, reasoning_effort, prompt, reasoning,
 # answer, finish} rows for batch grading by grade.py.  GSM8K runs beside it (bench-q.sh).  Prints one JSON line.

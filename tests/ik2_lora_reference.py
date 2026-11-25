@@ -16,7 +16,7 @@ from glm_synth_gguf import kv_str, kv_f32, write_gguf
 
 
 def overlay(folder, base, name, dims, blocks):
-    # maya-ik2 reads ordinary split GGUFs. The second shard supplies just this matrix.
+    # tintero reads ordinary split GGUFs. The second shard supplies just this matrix.
     folder.mkdir()
     first = folder / "fixture-00001-of-00002.gguf"
     first.symlink_to(base)

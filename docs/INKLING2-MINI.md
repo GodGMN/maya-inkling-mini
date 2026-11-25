@@ -1,6 +1,6 @@
 # Inkling 2 Mini on one RTX 3090: the guide
 
-`maya-ik2` runs [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) with every weight in the VRAM of one 24 GB card. This page is how to build and run it, what speed to expect, and how it works. The engine's design notes, with the model's exact arithmetic, are in [INKLING2.md](INKLING2.md) (section 8 is Mini).
+`tintero` runs [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) with every weight in the VRAM of one 24 GB card. This page is how to build and run it, what speed to expect, and how it works. The engine's design notes, with the model's exact arithmetic, are in [INKLING2.md](INKLING2.md) (section 8 is Mini).
 
 For the experimental RX 7900 XTX build, see the [gfx1100 port notes](HIP-PORT.md).
 
@@ -11,11 +11,11 @@ You need Linux, an RTX 3090 or another 24 GB `sm_86` card, CUDA 12.8 with `nvcc`
 ### 1. Build the engine
 
 ```bash
-git clone https://github.com/alesha-pro/maya-inkling-mini && cd maya-inkling-mini
+git clone https://github.com/GodGMN/maya-inkling-mini && cd maya-inkling-mini
 pip install numpy jinja2 regex pyyaml tqdm requests pillow psutil "jsonschema>=4.18,<5" huggingface_hub
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON \
   -DCMAKE_CUDA_ARCHITECTURES=86 -DSTRATA_BUILD_TESTS=OFF
-cmake --build build -j 24 --target maya-ik2
+cmake --build build -j 24 --target tintero
 ```
 
 CMake downloads the pinned llama.cpp commit for ggml on its own. If the system has more than one CUDA, point CMake at the right one: `-DCUDAToolkit_ROOT=/usr/local/cuda-12.8 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc`.
@@ -104,7 +104,7 @@ The command behind every row:
 
 ```bash
 IK2_KV=fp8 IK2_GATE_TILE=64 IK2_GATE_BF16=1 IK2_Q8_UNROLL=1 IK2_BATCH_PREFILL=1 CUDA_VISIBLE_DEVICES=3 \
-  build/maya-ik2 --model models/Inkling-2-Mini-UD-Q4_K_XL.gguf --ctx 344064 --chunk 2048 --tokens @IDS.txt --gen 400
+  build/tintero --model models/Inkling-2-Mini-UD-Q4_K_XL.gguf --ctx 344064 --chunk 2048 --tokens @IDS.txt --gen 400
 ```
 
 `IDS.txt` is a comma separated list of token ids. Run the CLI with `--ctx`: without it the engine doesn't keep every expert in VRAM and takes its slower general path.
@@ -123,7 +123,7 @@ With the drafter (context 262,144, `IK2_DRAFT_CTX=65536`, the same card), agains
 
 ```bash
 IK2_KV=fp8 IK2_GATE_TILE=64 IK2_GATE_BF16=1 IK2_Q8_UNROLL=1 IK2_BATCH_PREFILL=1 IK2_DRAFT_CTX=65536 \
-  build/maya-ik2 --model models/Inkling-2-Mini-UD-Q4_K_XL.gguf --ctx 262144 --chunk 2048 --tokens @IDS.txt --gen 384 \
+  build/tintero --model models/Inkling-2-Mini-UD-Q4_K_XL.gguf --ctx 262144 --chunk 2048 --tokens @IDS.txt --gen 384 \
   --draft models/mtp.safetensors
 ```
 

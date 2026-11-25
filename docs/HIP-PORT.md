@@ -4,7 +4,7 @@ On Prometheus’s RX 7900 XTX, the Radeon server runs the installed ggml-org IQ4
 
 ### Which GPUs and models can run it?
 
-`maya-ik2` implements the Inkling 2 Mini architecture. Its HIP executable contains code for AMD target `gfx1100`, with 32-lane waves and RDNA3 matrix instructions. Prometheus's 24 GiB RX 7900 XTX is the card tested here. The 20 GiB RX 7900 XT and 16 GiB RX 7900 GRE share the target, but neither fits the measured 23.64 GiB full-context image configuration. A smaller configuration needs its own fit and correctness tests. The RX 7800 XT uses `gfx1101` and needs a separately supported build. The NVIDIA CUDA build has its own kernels. [AMD GPU specifications](https://rocm.docs.amd.com/en/docs-7.2.3/reference/gpu-arch-specs.html)
+`tintero` implements the Inkling 2 Mini architecture. Its HIP executable contains code for AMD target `gfx1100`, with 32-lane waves and RDNA3 matrix instructions. Prometheus's 24 GiB RX 7900 XTX is the card tested here. The 20 GiB RX 7900 XT and 16 GiB RX 7900 GRE share the target, but neither fits the measured 23.64 GiB full-context image configuration. A smaller configuration needs its own fit and correctness tests. The RX 7800 XT uses `gfx1101` and needs a separately supported build. The NVIDIA CUDA build has its own kernels. [AMD GPU specifications](https://rocm.docs.amd.com/en/docs-7.2.3/reference/gpu-arch-specs.html)
 
 Both Prometheus engines load the same `Inkling-2-Mini-IQ4_NL.gguf` text weights. The FP8 Maya profile stores attention keys and values from previously read tokens in E4M3, an 8-bit floating-point format. The FP4 profiles use block-scaled E2M1 for the global cache and E4M3 for sliding-window attention. The previous llama.cpp service stored its keys and values in Q4_0. On the 7900 XTX, Maya unpacks E4M3 in software for attention. The separate image encoder loads the same `mmproj-F16.gguf` with either backend. These settings can change the numerical results even with identical text weights.
 
@@ -140,7 +140,7 @@ python3 src/tests/ik2_chat_growth.py http://127.0.0.1:18085 --server-pid "$pid" 
 Build and check the FP4 kernels with the existing Prometheus build containers:
 
 ```sh
-docker exec -w /work maya-ik2-hip-build cmake --build build-ik2 -j4 --target maya-ik2 ik2_kernels_test
+docker exec -w /work maya-ik2-hip-build cmake --build build-ik2 -j4 --target tintero ik2_kernels_test
 docker exec -w /work -e IK2_FLASH_WAVES=4 -e IK2_ATTN_STAGED=1 -e IK2_DECODE_SUBWAVE=1 \
     maya-ik2-gfx1100 ./build-ik2/ik2_kernels_test
 ```
@@ -415,7 +415,7 @@ python3 tests/ik2_slot_chats.py "$URL" --slots 4 --depth 175104 --concurrent --i
 
 ```sh
 # From ~/ai/build/maya-ik2-hip on Prometheus
-sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer \
+sh src/docker/package-ik2-gfx1100.sh build-ik2/tintero ik2-tokenizer/tokenizer \
     hyperion/maya-ik2:gfx1100-service-r4 vision-cpu/bin/maya-vision \
     vision-resident/maya-vision vision-hip/bin/maya-vision
 docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 --entrypoint python3 \
@@ -481,9 +481,9 @@ Use the existing `heldout-teacher.{all,prompt,force}` and `heldout-teacher-ref.n
 
 ```sh
 for kv in fp8 fp4-global; do
-    IK2_KV="$kv" IK2_PREFILL_LOGITS_OUT="$kv-pp.f32" ./build-ik2/maya-ik2 \
+    IK2_KV="$kv" IK2_PREFILL_LOGITS_OUT="$kv-pp.f32" ./build-ik2/tintero \
         --model /weight.gguf --ctx 1024 --chunk 64 --tokens @heldout-teacher.all --gen 0
-    IK2_KV="$kv" IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="$kv-tg.f32" ./build-ik2/maya-ik2 \
+    IK2_KV="$kv" IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="$kv-tg.f32" ./build-ik2/tintero \
         --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
     oracle-env/bin/python src/tools/ik2_compare_decode.py "$kv-pp.f32" --ref heldout-teacher-ref.npy \
         --tokens heldout-teacher.all --vocab 200058 --prompt-length 256 --prefill
@@ -621,13 +621,13 @@ On the 7900 XTX the old executable lost all 1,799 live tokens of the other chat 
 
 ```sh
 # From /work in maya-ik2-gfx1100, with the usual gfx1100 preset environment
-IK2_KV=fp4-global python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 \
+IK2_KV=fp4-global python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/tintero \
     --model /weight.gguf --tokens water.force --fork-slots
-IK2_KV=fp8 python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 \
+IK2_KV=fp8 python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/tintero \
     --model /weight.gguf --tokens water.force --fork-slots
 IK2_KV=fp4-global IK2_DRAFT_ADAPT=0 IK2_DRAFT_WIDTH=2 python3 src/tests/ik2_prefix_cache.py \
-    --engine ./build-ik2/maya-ik2 --model /weight.gguf --tokens water.force --draft mtp.safetensors --fork-slots
-IK2_KV=fp4-global python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 \
+    --engine ./build-ik2/tintero --model /weight.gguf --tokens water.force --draft mtp.safetensors --fork-slots
+IK2_KV=fp4-global python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/tintero \
     --model /weight.gguf --tokens water.force --cancel-prefill
 ```
 
@@ -706,7 +706,7 @@ Across 32 different chat prompts of 33 to 47 tokens, the new binary with batchin
 The original server and the batch server each answered 32/32 GSM8K questions correctly with a 2,048-token limit. All final answers and finish reasons matched. An eight-worker GSM8K run also scored 32/32 while tool calls ran alongside it. OpenAI and Anthropic tool conversations passed with and without streaming in all three runs.
 
 ```sh
-python3 tests/ik2_batch_decode.py --baseline /path/to/original/maya-ik2 --engine build-ik2/maya-ik2 \
+python3 tests/ik2_batch_decode.py --baseline /path/to/original/maya-ik2 --engine build-ik2/tintero \
     --model models/Inkling-2-Mini-IQ4_NL.gguf --tokenizer ik2/tokenizer \
     --preset docs/inkling2-mini/ik2-mini-gfx1100.json
 python3 tools/ik2_batch_bench.py --url http://127.0.0.1:8088
@@ -817,7 +817,7 @@ cfg = json.load(open("src/docs/inkling2-mini/ik2-mini-gfx1100.json"))
 os.execvpe(sys.argv[1], sys.argv[1:], {**os.environ, **cfg["env"]})' "$@"
 }
 bench() {
-    radeon python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    radeon python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --ctx 393216 --chunk 1024 --gen 129 --repeats 3 "$@"
 }
 bench --tokens water.force --depths 32,512,2048,8192,32768
@@ -833,14 +833,14 @@ On the first 192 GSM8K test questions, this build scored **184/192** with a 4,09
 for offset in 0 96; do
     args="--model /weight.gguf --data gsm8k-test.jsonl --count 96 --offset $offset --max-tokens 4096"
     oracle-env/bin/python src/tests/ik2_gsm8k.py $args >"gsm-$offset.requests"
-    radeon ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 8192 --chunk 1024 \
+    radeon ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 8192 --chunk 1024 \
         <"gsm-$offset.requests" >"gsm-$offset.log"
     oracle-env/bin/python src/tests/ik2_gsm8k.py $args --score "gsm-$offset.log"
 done
 quiz() {
     oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer "$@"
 }
-quiz | radeon ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 4096 --chunk 512 >mmlu.log
+quiz | radeon ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 4096 --chunk 512 >mmlu.log
 quiz --score mmlu.log
 ```
 
@@ -858,10 +858,10 @@ quiz --score mmlu.log
 
 On the same 192 GSM8K questions the mixed cache answered **188/192** correctly. All responses finished within the 4,096-token limit. The four changed scores were all gains. On MMLU the mixed cache scored **206/256** with all letters valid. Two answers changed from wrong to right and three from right to wrong. The all-E4M3 preset had the higher measured prefill rate at 512 and 2,048 tokens.
 
-Run the throughput command below. To repeat the quality comparison, use `radeon env IK2_KV=fp8-global ./build-ik2/maya-ik2` for both engine invocations in the preceding GSM8K and MMLU commands.
+Run the throughput command below. To repeat the quality comparison, use `radeon env IK2_KV=fp8-global ./build-ik2/tintero` for both engine invocations in the preceding GSM8K and MMLU commands.
 
 ```sh
-radeon env IK2_KV=fp8-global python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 \
+radeon env IK2_KV=fp8-global python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero \
     --model /weight.gguf --ctx 393216 --chunk 1024 --tokens water.force \
     --depths 32,512,2048,8192,32768 --gen 129 --repeats 3
 ```
@@ -881,16 +881,16 @@ The CPU reference's perplexity was 3.96770 on those 255 labels. With FP16 throug
 ```sh
 # Create heldout-teacher.{all,prompt,force} and heldout-teacher-ref.npy using the fixture command.
 for kv in fp8 fp8-global f16; do
-    radeon env IK2_KV="$kv" IK2_PREFILL_LOGITS_OUT="$kv-pp.f32" ./build-ik2/maya-ik2 \
+    radeon env IK2_KV="$kv" IK2_PREFILL_LOGITS_OUT="$kv-pp.f32" ./build-ik2/tintero \
         --model /weight.gguf --ctx 1024 --chunk 64 --tokens @heldout-teacher.all --gen 0
     radeon env IK2_KV="$kv" IK2_GRAPH=1 IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="$kv-tg.f32" \
-        ./build-ik2/maya-ik2 --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
+        ./build-ik2/tintero --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
     oracle-env/bin/python src/tools/ik2_compare_decode.py "$kv-pp.f32" --ref heldout-teacher-ref.npy \
         --tokens heldout-teacher.all --vocab 200058 --prefill --prompt-length 256
     oracle-env/bin/python src/tools/ik2_compare_decode.py "$kv-tg.f32" --ref heldout-teacher-ref.npy \
         --tokens heldout-teacher.all --vocab 200058 --gen 33 --prompt-length 224
 done
-radeon env IK2_KV=f16 python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 \
+radeon env IK2_KV=f16 python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero \
     --model /weight.gguf --chunk 1024 --tokens water.force --depths 512,8192 --gen 129 --repeats 3
 ```
 
@@ -910,7 +910,7 @@ for position in 5 50 95; do
         python3 src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
             --depths 392960 --percent "$position" --direct-answer --max-tokens 200 --decode-steps 128 "$@"
     }
-    needle | radeon ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 >"needle-$position.log"
+    needle | radeon ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 >"needle-$position.log"
     needle --score "needle-$position.log"
 done
 ```
@@ -954,7 +954,7 @@ cmake -S src -B build-ik2 -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=/opt/rocm \
   -DCMAKE_HIP_ARCHITECTURES=gfx1100 -DGPU_TARGETS=gfx1100 \
   -DSTRATA_GGML_DIR=/work/llama.cpp-3cf03257f219afbe7334045ff7c6a06ac68c627d
-cmake --build build-ik2 -j4 --target maya-ik2 ik2_kernels_test ik2_host_ref_test
+cmake --build build-ik2 -j4 --target tintero ik2_kernels_test ik2_host_ref_test
 ```
 
 The base library uses the same source and target architecture. For the separate base build directory on Prometheus, the build command is `cmake --build build -j4 --target strata_engine`. The engine links its own kernels and hipBLAS directly.
@@ -991,7 +991,7 @@ mkdir -p vision-resident
 cp -n vision-hip/bin/maya-vision vision-resident/maya-vision
 docker exec -w /work maya-ik2-hip-build cmake -S src/tools/vision -B vision-hip -DSTRATA_VISION_HOST_WEIGHTS=ON
 docker exec -w /work maya-ik2-hip-build cmake --build vision-hip --target maya-vision -j4
-sh src/docker/package-ik2-gfx1100.sh build-ik2/maya-ik2 ik2-tokenizer/tokenizer \
+sh src/docker/package-ik2-gfx1100.sh build-ik2/tintero ik2-tokenizer/tokenizer \
     hyperion/maya-ik2:gfx1100-service-r4 vision-cpu/bin/maya-vision vision-resident/maya-vision vision-hip/bin/maya-vision
 docker run --rm --network none --memory 768m --memory-swap 768m --cpus 2 \
     --entrypoint python3 hyperion/maya-ik2:gfx1100-service-r4 -m unittest serve.test_inkling2_frontend
@@ -1048,7 +1048,7 @@ Example for the GPU validation session, with `MODEL` pointing to the approved Mi
 printf '%s\n' '101,102,103' > force.csv
 for graph in 0 1; do
   IK2_KV=fp8 IK2_GRAPH="$graph" IK2_FORCE=force.csv IK2_LOGITS_OUT="graph-$graph.f32" \
-    /work/build-ik2/maya-ik2 --model "$MODEL" --tokens 1,2 --gen 4 --ctx 256
+    /work/build-ik2/tintero --model "$MODEL" --tokens 1,2 --gen 4 --ctx 256
 done
 python3 /work/src/tools/ik2_compare_decode.py graph-1.f32 --baseline graph-0.f32 \
   --prompt-length 2 --gen 4 --vocab 200058
@@ -1077,7 +1077,7 @@ export IK2_HOST=mmap IK2_KV=fp8 IK2_GATE_BF16=1 IK2_GATE_TILE=64 IK2_Q8_UNROLL=1
 printf '%s\n' '152717,11,149880' > paris-force.csv
 for graph in 0 1; do
   IK2_GRAPH=$graph IK2_FORCE=paris-force.csv IK2_LOGITS_OUT=paris-$graph.f32 \
-    build-ik2/maya-ik2 --model /weight.gguf --ctx 1024 --chunk 128 --tokens 371,151451,149879,151194,149884 --gen 4
+    build-ik2/tintero --model /weight.gguf --ctx 1024 --chunk 128 --tokens 371,151451,149879,151194,149884 --gen 4
 done
 oracle-env/bin/python src/ref/inkling2.py /weight.gguf --tokens 371,151451,149879,151194,149884,152717,11,149880 --logprobs-out paris-ref.npy
 oracle-env/bin/python src/tools/ik2_compare_decode.py paris-1.f32 --baseline paris-0.f32 --prompt-length 5 --gen 4 --vocab 200058
@@ -1109,7 +1109,7 @@ cd /work
 echo '151712,156358,179692,149880,167442,82,149922,150011,156258,156358,179692,149922,151333,150628,13,150847,151197,178091,82,149876,167442,279,150279,159383,150301,186867,152023,149884,151214,13' > water.force
 IK2_HOST=mmap IK2_KV=fp8 IK2_GATE_BF16=1 IK2_GATE_TILE=64 IK2_Q8_UNROLL=1 \
 IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1 IK2_EXPERT_LIMB=60 IK2_ATTN_MMA=0 IK2_FLASH=0 \
-python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --depths 32,512,2048 --gen 129 --repeats 3 --chunk 128
 ```
 
@@ -1149,7 +1149,7 @@ All throughput columns are in tokens per second. Run the following from `/work` 
 export IK2_HOST=mmap IK2_KV=fp8 IK2_GATE_BF16=1 IK2_GATE_TILE=64 IK2_Q8_UNROLL=1
 export IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1 IK2_FLASH=1 IK2_Q8_TILE=1
 export IK2_EXPERT_LIMB=0 IK2_IQ4_MV=1 IK2_F16_MV=1 IK2_ATTN_MMA=0
-python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --depths 32,512,2048,8192 --gen 129 --repeats 3 --chunk 128
 ```
 
@@ -1180,7 +1180,7 @@ cd /work
 curl -fLsS https://raw.githubusercontent.com/openai/grade-school-math/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data/test.jsonl -o gsm8k-test.jsonl
 oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf --count 96 >gsm96-requests.txt
 # Use the environment from the FP32 expert benchmark.
-./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 2048 --chunk 128 <gsm96-requests.txt >gsm96.log
+./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 2048 --chunk 128 <gsm96-requests.txt >gsm96.log
 oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf --count 96 --score gsm96.log
 oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf --count 96 \
     --llama-url http://192.168.100.111:8085
@@ -1193,7 +1193,7 @@ At a 4,096-token cap, the cooperative RDNA3 configuration answered **93/96** on 
 for offset in 0 96; do
     oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf \
         --count 96 --offset "$offset" --max-tokens 4096 >"gsm-$offset.requests"
-    ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 8192 --chunk 1024 \
+    ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 8192 --chunk 1024 \
         <"gsm-$offset.requests" >"gsm-$offset.log"
     oracle-env/bin/python src/tests/ik2_gsm8k.py --data gsm8k-test.jsonl --model /weight.gguf \
         --count 96 --offset "$offset" --score "gsm-$offset.log"
@@ -1218,10 +1218,10 @@ The production comparison above used identical tokens at 8,192 and reached 1,488
 # Start with the FP32 expert environment above.
 export IK2_PREFILL_DENSE=1 IK2_PREFILL_TILE=16 IK2_Q8_MV=1 IK2_F16_MV=2
 for chunk in 512 1024; do
-    python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --tokens water.force --depths 32,512,2048,8192,32768 --gen 129 --repeats 2 --chunk "$chunk"
 done
-python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --depths 2048,8192,32768 --gen 129 --repeats 2 --chunk 2048
 ```
 
@@ -1249,7 +1249,7 @@ export IK2_BATCH_PREFILL=1 IK2_PREFILL_WMMA=1 IK2_PREFILL_TILE=64 IK2_EXPERT_TIL
 export IK2_F16_MV=2 IK2_IQ4_MV=1 IK2_Q8_MV=1 IK2_Q8_TILE=1 IK2_EXPERT_LIMB=0
 export IK2_PREFILL_DENSE=1 IK2_DENSE_WMMA=1 IK2_FLASH=1 IK2_FLASH_WAVES=4
 export IK2_ATTN_MMA=3 IK2_DECODE_SUBWAVE=1 IK2_ATTN_STAGED=1 IK2_RESIDENT_ONLY=1
-python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf --tokens water.force \
+python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf --tokens water.force \
     --depths 32,512,2048,8192,32768 --gen 129 --repeats 3 --chunk 2048
 ```
 
@@ -1272,7 +1272,7 @@ Use the preceding cooperative prefill environment with `IK2_EXPERT_TILE_LDS=1`. 
 ```sh
 oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer >copy.requests
 for window in 0 8 64; do
-    IK2_SUFFIX=$window ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf \
+    IK2_SUFFIX=$window ./build-ik2/tintero --serve-ik2 --model /weight.gguf \
         --ctx 4096 --chunk 512 <copy.requests >"copy-$window.log"
     oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer --score "copy-$window.log"
 done
@@ -1292,7 +1292,7 @@ for task in inventory python; do
     for window in 0 64 128; do
         oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
             --direct-answer --workload "$task" --repeats 3 >"copy-$task.requests"
-        IK2_SUFFIX=$window ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf \
+        IK2_SUFFIX=$window ./build-ik2/tintero --serve-ik2 --model /weight.gguf \
             --ctx 8192 --chunk 512 <"copy-$task.requests" >"copy-$task-$window.log"
         oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
             --direct-answer --workload "$task" --repeats 3 --score "copy-$task-$window.log"
@@ -1307,7 +1307,7 @@ In the run before the host input copy fix, with `--ctx 393216 --chunk 1024`, the
 ```sh
 oracle-env/bin/python src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
     --depths 32768,131072,392960 >retrieval.requests
-./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 <retrieval.requests >retrieval.log
+./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 <retrieval.requests >retrieval.log
 oracle-env/bin/python src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/tokenizer --data gsm8k-test.jsonl \
     --depths 32768,131072,392960 --score retrieval.log
 ```
@@ -1328,7 +1328,7 @@ CUDA 12.8 compiled and linked the engine and its device tests for sm_86 with the
 
 ```sh
 cmake -S . -B build-cuda -G Ninja -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=ON
-cmake --build build-cuda --target maya-ik2 ik2_kernels_test -j4
+cmake --build build-cuda --target tintero ik2_kernels_test -j4
 ```
 
 ### Held-out distribution fixture
@@ -1359,7 +1359,7 @@ The paged prefill agreed with the FP64 reference on 251 of 256 held-out next-tok
 ```sh
 export IK2_PAGED_KV=1
 ./build-ik2/ik2_kernels_test
-IK2_PREFILL_LOGITS_OUT=teacher-pages.f32 ./build-ik2/maya-ik2 --model /weight.gguf \
+IK2_PREFILL_LOGITS_OUT=teacher-pages.f32 ./build-ik2/tintero --model /weight.gguf \
     --ctx 1024 --chunk 64 --tokens @heldout-teacher.all --gen 0
 oracle-env/bin/python src/tools/ik2_compare_decode.py teacher-pages.f32 --ref heldout-teacher-ref.npy \
     --tokens heldout-teacher.all --vocab 200058 --prefill --prompt-length 256
@@ -1378,9 +1378,9 @@ The Radeon preset computes the FP16 attention sink and dynamic convolution taps 
 ```sh
 # Export the cooperative prefill environment above.
 for flag in 0 1; do
-    IK2_DECODE_PROJ=$flag python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    IK2_DECODE_PROJ=$flag python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --tokens water.force --gen 257 --depths 32,512,8192 --repeats 3 --chunk 2048
-    IK2_DECODE_PROJ=$flag IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="projection-$flag.f32" ./build-ik2/maya-ik2 --model /weight.gguf \
+    IK2_DECODE_PROJ=$flag IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="projection-$flag.f32" ./build-ik2/tintero --model /weight.gguf \
         --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
 done
 cmp projection-0.f32 projection-1.f32
@@ -1416,7 +1416,7 @@ Use the cooperative prefill environment with fused projections and paged KV. Bot
 
 ```sh
 oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer >mmlu.requests
-IK2_DECODE_PROJ=1 IK2_PAGED_KV=1 ./build-ik2/maya-ik2 --model /weight.gguf --serve-ik2 --ctx 4096 --chunk 512 \
+IK2_DECODE_PROJ=1 IK2_PAGED_KV=1 ./build-ik2/tintero --model /weight.gguf --serve-ik2 --ctx 4096 --chunk 512 \
     <mmlu.requests >mmlu-maya.log
 oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer --score mmlu-maya.log
 oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu256.jsonl --tokenizer ik2-tokenizer/tokenizer --llama-url http://127.0.0.1:8085
@@ -1438,7 +1438,7 @@ The Radeon server preset uses token-major KV. The page layout takes the same byt
 # Use the cooperative prefill environment above.
 export IK2_DECODE_PROJ=1 IK2_FLASH_WAVES=4
 for page in 0 1; do
-    IK2_PAGED_KV=$page python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    IK2_PAGED_KV=$page python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --tokens water.force --depths 512,8192,32768 --gen 129 --repeats 3 --chunk 2048
 done
 for waves in 2 8; do
@@ -1455,10 +1455,10 @@ With `IK2_GATE_TILE=256`, median decode at 512 tokens rose from 113.93 to **117.
 ```sh
 # Use the cooperative prefill environment above with IK2_DECODE_PROJ=1.
 for tile in 64 256; do
-    IK2_GATE_TILE=$tile python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    IK2_GATE_TILE=$tile python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --tokens water.force --depths 32,512,8192 --gen 257 --repeats 3 --chunk 2048
     IK2_GATE_TILE=$tile IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT="gate-$tile.f32" \
-        ./build-ik2/maya-ik2 --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
+        ./build-ik2/tintero --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
     oracle-env/bin/python src/tools/ik2_compare_decode.py "gate-$tile.f32" --ref heldout-teacher-ref.npy \
         --tokens heldout-teacher.all --vocab 200058 --gen 33 --prompt-length 224
 done
@@ -1471,7 +1471,7 @@ The server has eight snapshots of the sliding KV and convolution state. Previous
 
 ```sh
 # Use the Radeon preset environment.
-python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --branches 12
 ```
 
@@ -1504,9 +1504,9 @@ The table uses three uncached requests per depth, `--chunk 2048` and the install
 # Export the cooperative prefill environment, IK2_DECODE_PROJ=1 and IK2_GATE_TILE=256.
 export IK2_WMMA_K=32
 for flag in 0 1; do
-    IK2_PREFILL_SWIGLU=$flag IK2_PREFILL_LOGITS_OUT="swiglu-$flag.f32" ./build-ik2/maya-ik2 \
+    IK2_PREFILL_SWIGLU=$flag IK2_PREFILL_LOGITS_OUT="swiglu-$flag.f32" ./build-ik2/tintero \
         --model /weight.gguf --ctx 1024 --chunk 64 --tokens @heldout-teacher.all --gen 0
-    IK2_PREFILL_SWIGLU=$flag python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    IK2_PREFILL_SWIGLU=$flag python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --tokens water.force --depths 512,2048,8192,32768 --gen 129 --repeats 3 --chunk 2048
 done
 cmp swiglu-0.f32 swiglu-1.f32
@@ -1522,10 +1522,10 @@ With the loop-gate optimization enabled, the median of three 256-step requests c
 ```sh
 # Run on the parent of the projection commit, then on the commit itself.
 export IK2_GATE_TILE=256 IK2_Q8_UNROLL=1 IK2_DECODE_PROJ=1
-python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --depths 32,512,8192 --gen 257 --repeats 3 --chunk 2048
 IK2_Q8_UNROLL=1 ./build-ik2/ik2_kernels_test
-IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT=projection.f32 ./build-ik2/maya-ik2 \
+IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT=projection.f32 ./build-ik2/tintero \
     --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
 sha256sum projection.f32
 ```
@@ -1543,13 +1543,13 @@ quiz() {
     oracle-env/bin/python src/tests/ik2_multiple_choice.py --data mmlu32.jsonl \
         --tokenizer ik2-tokenizer/tokenizer --prefix-tokens 256 --background gsm8k-test.jsonl "$@"
 }
-quiz | ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 4096 --chunk 512 >quiz.log
+quiz | ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 4096 --chunk 512 >quiz.log
 quiz --min-cached 256 --score quiz.log
 ledger() {
     oracle-env/bin/python src/tests/ik2_retrieval.py --data gsm8k-test.jsonl \
         --tokenizer ik2-tokenizer/tokenizer --depths 32768 --inventory --direct-answer --max-tokens 32 "$@"
 }
-ledger | IK2_PAGED_KV=1 ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 >ledger.log
+ledger | IK2_PAGED_KV=1 ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 393216 --chunk 1024 >ledger.log
 ledger --score ledger.log
 ```
 
@@ -1571,7 +1571,7 @@ for task in inventory python; do
     oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
         --direct-answer --workload "$task" --repeats 3 >"$task.requests"
     for w in 128 256 512; do
-        IK2_SUFFIX=$w ./build-ik2/maya-ik2 --serve-ik2 --model /weight.gguf --ctx 8192 \
+        IK2_SUFFIX=$w ./build-ik2/tintero --serve-ik2 --model /weight.gguf --ctx 8192 \
             --chunk 512 <"$task.requests" >"$task-$w.log"
         oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
             --direct-answer --workload "$task" --repeats 3 --score "$task-$w.log"
@@ -1579,7 +1579,7 @@ for task in inventory python; do
 done
 oracle-env/bin/python src/tests/ik2_copy_edit.py --tokenizer ik2-tokenizer/tokenizer \
     --direct-answer --inventory-lines 27 --max-tokens 2048 >long-copy.requests
-IK2_SUFFIX=512 python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+IK2_SUFFIX=512 python3 src/tests/ik2_prefix_cache.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --chunk 512 --cancel-after 750 --cancel-request long-copy.requests
 ```
 
@@ -1592,11 +1592,11 @@ On 32 forced held-out steps, mean full-vocabulary KL was 0.002114 and top-1 agre
 ```sh
 # Export the Radeon preset environment, including IK2_DECODE_SUBWAVE=1 and IK2_GATE_TILE=256.
 ./build-ik2/ik2_kernels_test
-IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT=attention.f32 ./build-ik2/maya-ik2 \
+IK2_FORCE=heldout-teacher.force IK2_LOGITS_OUT=attention.f32 ./build-ik2/tintero \
     --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.prompt --gen 33
 oracle-env/bin/python src/tools/ik2_compare_decode.py attention.f32 --ref heldout-teacher-ref.npy \
     --tokens heldout-teacher.all --vocab 200058 --gen 33 --prompt-length 224
-IK2_WMMA_K=64 python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+IK2_WMMA_K=64 python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens water.force --depths 32,512,8192 --gen 257 --repeats 3 --chunk 2048
 ```
 
@@ -1618,10 +1618,10 @@ oracle-env/bin/python src/tests/ik2_retrieval.py --tokenizer ik2-tokenizer/token
     --depths 32768 >needle-32768.request
 python3 -c 'from pathlib import Path; ids=Path("needle-32768.request").read_text().splitlines()[0].split()[-1].split(","); Path("profile-pp-ids").write_text(",".join(ids[:8192]))'
 for rows in auto 64; do
-    IK2_WMMA_K=32 IK2_PREFILL_TILE=$rows python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 \
+    IK2_WMMA_K=32 IK2_PREFILL_TILE=$rows python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero \
         --model /weight.gguf --tokens profile-pp-ids --depths 16,32,64,128,256,512,1024,2048 --chunk 2048 --gen 3 --repeats 5
     for chunk in 64 256; do
-        IK2_WMMA_K=32 IK2_PREFILL_TILE=$rows IK2_PREFILL_LOGITS_OUT="tile-$chunk-$rows.f32" ./build-ik2/maya-ik2 \
+        IK2_WMMA_K=32 IK2_PREFILL_TILE=$rows IK2_PREFILL_LOGITS_OUT="tile-$chunk-$rows.f32" ./build-ik2/tintero \
             --model /weight.gguf --ctx 1024 --chunk "$chunk" --tokens @heldout-teacher.all --gen 0
     done
 done
@@ -1652,13 +1652,13 @@ The Radeon preset uses `IK2_PREFILL_DENSE=2` to keep just the 24 fused QKV proje
 ```sh
 # Use the preset environment and profile-pp-ids from the short-prompt test above.
 # Compare the workspace on commit 3b2e4ac and the compact build using the same 56-matrix cache.
-IK2_PREFILL_DENSE=1 python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+IK2_PREFILL_DENSE=1 python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
     --tokens profile-pp-ids --depths 512,8192,32768 --chunk 8192 --gen 3 --repeats 3
 
 for cache in 1 0 2; do
-    IK2_PREFILL_DENSE=$cache python3 src/tools/ik2_bench.py --engine ./build-ik2/maya-ik2 --model /weight.gguf \
+    IK2_PREFILL_DENSE=$cache python3 src/tools/ik2_bench.py --engine ./build-ik2/tintero --model /weight.gguf \
         --tokens profile-pp-ids --depths 64,256,512,2048,8192,32768 --chunk 2048 --gen 3 --repeats 3
-    IK2_PREFILL_DENSE=$cache IK2_PREFILL_LOGITS_OUT="cache-$cache.f32" ./build-ik2/maya-ik2 \
+    IK2_PREFILL_DENSE=$cache IK2_PREFILL_LOGITS_OUT="cache-$cache.f32" ./build-ik2/tintero \
         --model /weight.gguf --ctx 1024 --chunk 128 --tokens @heldout-teacher.all --gen 0
 done
 cmp cache-0.f32 cache-1.f32 && cmp cache-1.f32 cache-2.f32
@@ -1680,7 +1680,7 @@ with Path("mixed.requests").open("w") as out:
     print("QUIT", file=out)
 PY
 for pair in 0 1; do
-    IK2_GRAPH_PAIR=$pair ./build-ik2/maya-ik2 --model /weight.gguf --serve-ik2 --ctx 393216 --chunk 1024 \
+    IK2_GRAPH_PAIR=$pair ./build-ik2/tintero --model /weight.gguf --serve-ik2 --ctx 393216 --chunk 1024 \
         <mixed.requests >"mixed-$pair.log"
     grep '^@TOK ' "mixed-$pair.log" >"mixed-$pair.ids"
 done

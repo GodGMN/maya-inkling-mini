@@ -1,4 +1,4 @@
-"""Prepare greedy GSM8K requests or score the final answers from maya-ik2's server protocol."""
+"""Prepare greedy GSM8K requests or score the final answers from tintero's server protocol."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal

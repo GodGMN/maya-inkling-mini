@@ -298,7 +298,7 @@ Its engine settings: [SETTINGS.md](SETTINGS.md#hy4-flash).
 ## Inkling-2-Small (by hand, for now)
 
 **[Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small)** (thinkingmachines; 594 B, ~17 B active,
-Apache 2.0) runs on its own engine, `maya-ik2` (#974), from unsloth's GGUFs as they are - not from the setup yet: a
+Apache 2.0) runs on its own engine, `tintero` (#974), from unsloth's GGUFs as they are - not from the setup yet: a
 tokenizer folder and a run config by hand, then `serve/server.py` ([INKLING2.md](INKLING2.md) section 6).
 
 | Files | Size | Runs on |

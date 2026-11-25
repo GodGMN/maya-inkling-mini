@@ -2,7 +2,7 @@
 template detected and rendered at every level a client names (its effort_map's names, thinking off as "none"), the
 messages it refuses as clients send them (a tool call's arguments as a JSON string, None content) taken, its answers
 - typed segments, not tags - read into reasoning, answer and tool calls however the stream is cut, its end of turn
-a stop, a required tool call opened in its own form, and pictures refused in plain words (maya-ik2 has no vision
+a stop, a required tool call opened in its own form, and pictures refused in plain words (tintero has no vision
 tower yet).
 
     python -m unittest serve.test_inkling2_frontend
@@ -58,7 +58,7 @@ class InkTok(ByteTokenizer):
 
 class Scripted:
     """Request k's answer is scripts[k] (the last one again after that), then the end of sampling.  Records every
-    prompt.  Like maya-ik2: no logprobs, no logit bias, one conversation."""
+    prompt.  Like tintero: no logprobs, no logit bias, one conversation."""
 
     def __init__(self, tok, *scripts):
         self.tok, self.max_context, self.scripts = tok, 32768, scripts
@@ -294,7 +294,7 @@ class Serving(unittest.TestCase):
                 msgs, tools, kw = openai_to_messages({"messages": [PICTURE]})
                 with self.assertRaises(ValueError) as e:
                     svc.prepare(msgs, tools, kw, 100)
-                self.assertIn(f"{name} on maya-ik2 reads text only", str(e.exception))
+                self.assertIn(f"{name} on tintero reads text only", str(e.exception))
                 self.assertEqual(eng.prompts, [])
 
     def test_logprobs_and_bias_are_refused(self):   # (an engine whose INFO names neither)
@@ -306,7 +306,7 @@ class Serving(unittest.TestCase):
 
 
 class Defaults(unittest.TestCase):
-    CFG = {"exe": "/opt/maya/build/maya-ik2", "args": ["--model", "/models/Inkling-2-Small-UD-Q3_K_XL-00001-of-00005.gguf",
+    CFG = {"exe": "/opt/maya/build/tintero", "args": ["--model", "/models/Inkling-2-Small-UD-Q3_K_XL-00001-of-00005.gguf",
                                                        "--max-context", "32768"], "model_name": "inkling-2-small"}
 
     def test_models_own(self):
