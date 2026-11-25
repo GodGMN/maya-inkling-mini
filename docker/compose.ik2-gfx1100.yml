@@ -1,7 +1,7 @@
 name: inkling-2-mini
 services:
   llama:
-    image: hyperion/maya-ik2:gfx1100-service-r4
+    image: hyperion/maya-ik2:gfx1100-service-r5
     container_name: inkling-2-mini
     restart: unless-stopped
     mem_limit: 10g
@@ -13,6 +13,8 @@ services:
       - /dev/kfd:/dev/kfd
     environment:
       IK2_CACHE_SLOTS: "${IK2_CACHE_SLOTS:-1}"
+      IK2_TEXT_ONLY: "${IK2_TEXT_ONLY:-0}"
+      IK2_ABLATE_MODE: "${IK2_ABLATE_MODE:-off}"
       MAYA_IK2_PRESET: "${MAYA_IK2_PRESET:-}"
     volumes:
       - "${INKLING_MODEL_DIR:-../../models/inkling-2-mini}:/opt/maya/models:ro"

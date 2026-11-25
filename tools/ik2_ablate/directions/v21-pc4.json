@@ -1,0 +1,28 @@
+{
+  "name": "v21-pc4",
+  "architecture": "inkling2_loop",
+  "base_model": "Inkling-2-Mini-IQ4_NL.gguf",
+  "base_model_sha256": "cbdf3fa9dc50a4124977980f37da4f1fa764b0cfe800d275cd43d26ce2a81af4",
+  "file": "v21-pc4.f32",
+  "sha256": "89295f51c942e15e968f14b43adf4383de21cb31fc1a1fdc551e5b4570bd5aef",
+  "dtype": "float32",
+  "dim": 2304,
+  "method": "visit-21 refusal difference-in-means orthogonalized against top-4 coding+harmless singular vectors (fit_ortho.py)",
+  "recommended_env": {
+    "IK2_ABLATE_SCALE": "1.6",
+    "IK2_ABLATE_VISITS": "22:48",
+    "IK2_ABLATE_KEEP_NORM": "1"
+  },
+  "verified_metrics": {
+    "advbench_harmful_test_qwen3guard": "94/104 (90.4%, 8 refused, 0 broken)",
+    "harmless_test_over_refused": "0/104",
+    "mitre_120_at_4096_qwen3guard": "68/120 completed, 21 partial (74.2% comp+part), 10 refused",
+    "cybermetric_500": "463/500 (92.6%)",
+    "ctibench_mcq_250": "187/250 (74.8%)",
+    "ctibench_cve_cwe_100": "62/100 (62.0%)",
+    "humaneval_plus_164": "142/164 (12 length cap)",
+    "pi_bench_5_repos": "5/5 (14 tool calls, 47.1s)",
+    "gsm8k_128": "121/128 (94.5%)",
+    "mmlu_256": "207/256 (80.9%, 0 multi)"
+  }
+}

@@ -9,6 +9,7 @@ COPY serve/ serve/
 COPY tools/ tools/
 COPY tokenizer/ ik2/tokenizer/
 COPY vision/ vision/
+COPY ablate/ ablate/
 COPY ik2-mini-gfx1100*.json ./
 COPY start-ik2-gfx1100.sh ./
 ENTRYPOINT ["/bin/sh", "start-ik2-gfx1100.sh"]
