@@ -118,7 +118,19 @@ def make_collate(pad_id: int):
 
 
 def find_target_module_names(model: torch.nn.Module, layers: set[int], targets: set[str]) -> list[str]:
-    """Explicitly enumerate exact full module paths for layers.{L}.attn.{proj} so PEFT touches nothing else."""
+    """Explicitly enumerate exact full module paths for language-model attention projections."""
+    aliases = {
+        "wo_ud": {"wo_ud", "o_proj", "o_proj.linear"},
+        "o_proj": {"wo_ud", "o_proj", "o_proj.linear"},
+        "o_proj.linear": {"o_proj.linear"},
+        "wq_du": {"wq_du", "q_proj", "q_proj.linear"},
+        "wk_dv": {"wk_dv", "k_proj", "k_proj.linear"},
+        "wv_dv": {"wv_dv", "v_proj", "v_proj.linear"},
+    }
+    expanded: set[str] = set()
+    for t in targets:
+        expanded.update(aliases.get(t, {t}))
+
     matched: list[str] = []
     for name, mod in model.named_modules():
         if not isinstance(mod, torch.nn.Linear):
@@ -126,13 +138,17 @@ def find_target_module_names(model: torch.nn.Module, layers: set[int], targets: 
         parts = name.split(".")
         if len(parts) < 3:
             continue
-        leaf = parts[-1]
-        if leaf not in targets:
+        if "vision" in parts or "vision_tower" in parts or "mtp" in parts:
             continue
-        # Expect ...layers.<L>.attn.<leaf>
+        if "attn" not in parts and "self_attn" not in parts:
+            continue
+        leaf = parts[-1]
+        pair = f"{parts[-2]}.{parts[-1]}"
+        if leaf not in expanded and pair not in expanded:
+            continue
         for i, tok in enumerate(parts):
             if tok == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
-                if int(parts[i + 1]) in layers and "vision" not in parts and "mtp" not in parts:
+                if int(parts[i + 1]) in layers:
                     matched.append(name)
                 break
     return sorted(set(matched))
@@ -179,6 +195,9 @@ def main() -> int:
     ap.add_argument("--max-seq-len", type=int, default=2560)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-sanity", action="store_true")
+    ap.add_argument("--save-every-epoch", action="store_true", help="Save intermediate adapter checkpoints after each epoch")
+    ap.add_argument("--max-steps", type=int, default=0, help="Optional cap on optimizer steps (0 = full epochs)")
+    ap.add_argument("--log-every", type=int, default=2, help="Log every N optimizer steps")
     args = ap.parse_args()
 
     from peft import LoraConfig, get_peft_model
@@ -207,14 +226,22 @@ def main() -> int:
         else:
             skipped += 1
     random.shuffle(samples)
-    print(f"Prepared {len(samples)} SFT samples (skipped={skipped}, max_seq_len={args.max_seq_len})", flush=True)
-    if not samples:
+    lens = sorted(len(s["input_ids"]) for s in samples)
+    if lens:
+        p50 = lens[len(lens) // 2]
+        p90 = lens[int(0.9 * (len(lens) - 1))]
+        print(
+            f"Prepared {len(samples)} SFT samples (skipped={skipped}, max_seq_len={args.max_seq_len}, "
+            f"tok_len min={lens[0]} p50={p50} p90={p90} max={lens[-1]})",
+            flush=True,
+        )
+    else:
         raise SystemExit("No valid SFT samples produced.")
 
     model = AutoModelForMultimodalLM.from_pretrained(
         args.model_id,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
+        dtype=torch.bfloat16,
+        device_map={"": 0} if torch.cuda.is_available() else "auto",
         trust_remote_code=True,
     )
     model.config.use_cache = False
@@ -256,6 +283,8 @@ def main() -> int:
     )
     steps_per_epoch = math.ceil(len(loader) / args.grad_accum)
     total_steps = max(1, int(math.ceil(steps_per_epoch * args.epochs)))
+    if args.max_steps > 0:
+        total_steps = min(total_steps, args.max_steps)
     warmup_steps = max(1, int(0.06 * total_steps))
 
     opt = torch.optim.AdamW(
@@ -270,6 +299,7 @@ def main() -> int:
     opt.zero_grad(set_to_none=True)
     gstep = 0
     running_loss = 0.0
+    micro_in_step = 0
     t0 = time.monotonic()
 
     n_full_epochs = int(math.ceil(args.epochs))
@@ -280,6 +310,7 @@ def main() -> int:
             loss = out.loss / args.grad_accum
             loss.backward()
             running_loss += float(out.loss.detach().cpu())
+            micro_in_step += 1
 
             if step % args.grad_accum == 0 or step == len(loader):
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
@@ -287,17 +318,27 @@ def main() -> int:
                 sched.step()
                 opt.zero_grad(set_to_none=True)
                 gstep += 1
-                if gstep % 5 == 0 or gstep == 1 or gstep == total_steps:
-                    avg = running_loss / min(args.grad_accum, step)
+                if gstep % args.log_every == 0 or gstep == 1 or gstep == total_steps:
+                    avg = running_loss / max(1, micro_in_step)
                     elapsed = time.monotonic() - t0
+                    sec_per_step = elapsed / gstep
+                    eta = sec_per_step * (total_steps - gstep)
+                    peak_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
                     print(
                         f"step {gstep:4d}/{total_steps} | ep {ep+1} | loss={avg:.4f} | "
-                        f"lr={sched.get_last_lr()[0]:.2e} | elapsed={elapsed:.0f}s",
+                        f"lr={sched.get_last_lr()[0]:.2e} | {sec_per_step:.1f}s/step | "
+                        f"elapsed={elapsed:.0f}s | eta={eta:.0f}s | vram={peak_gb:.1f}GB",
                         flush=True,
                     )
                 running_loss = 0.0
+                micro_in_step = 0
                 if gstep >= total_steps:
                     break
+        if args.save_every_epoch and ep + 1 < n_full_epochs and gstep < total_steps:
+            ep_dir = args.outdir.parent / f"{args.outdir.name}-ep{ep+1}"
+            ep_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(ep_dir, safe_serialization=True)
+            print(f"Saved epoch {ep+1} checkpoint -> {ep_dir}/", flush=True)
         if gstep >= total_steps:
             break
 
