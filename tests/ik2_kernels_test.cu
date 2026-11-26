@@ -1682,8 +1682,67 @@ std::vector<uint8_t> page_cache(const std::vector<uint8_t>& linear, int heads, b
     return pages;
 }
 
-#ifdef STRATA_USE_HIP
-void test_rdna3_sparse_decode() {
+void test_sequence_kernels() {
+    constexpr int T = 5, N = 7, K = 256, ld = N + 3;
+    std::vector<int> slots = {5, 0, 3, 2, 1};
+    auto x = fvec(T * K), weights = fvec(N * 4), history = fvec(6 * 3 * N);
+    std::vector<int8_t> q(N * K);
+    std::vector<uint16_t> scale(N * K / 32);
+    for (size_t i = 0; i < q.size(); ++i) q[i] = int(i % 101) - 50;
+    for (size_t i = 0; i < scale.size(); ++i) scale[i] = f2h_host((1 + i % 7) / 64.f);
+    auto* dx = dev(x);
+    auto* dq = dev(q);
+    auto* ds = dev(scale);
+    auto* dy = dev_n<float>(T * ld);
+    auto* dw = dev(weights);
+    auto* dh = dev(history);
+    auto* ids = dev(slots);
+    auto* out = dev_n<float>(T * N);
+    cudaStream_t stream;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    CU(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CU(cudaDeviceSynchronize());
+    CU(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    k::mv_q8p_sequences(dq, ds, N, K, dx, T, dy, ld, stream);
+    k::conv_sequences(ids, T, dy, ld, {0, N, dh, dw, nullptr, 0, nullptr, out}, stream);
+    CU(cudaStreamEndCapture(stream, &graph));
+    CU(cudaGraphInstantiate(&exec, graph, 0));
+    std::vector<double> projected(T * ld), convolved(T * N), hist(history.begin(), history.end());
+    for (int t = 0; t < T; ++t) {
+        for (int n = 0; n < N; ++n) {
+            double& v = projected[t * ld + n];
+            for (int i = 0; i < K; ++i)
+                v += double(x[t * K + i]) * q[n * K + i] * h2f_host(scale[(n * K + i) / 32]);
+        }
+    }
+    for (int replay = 0; replay < 2; ++replay) {
+        CU(cudaMemcpy(ids, slots.data(), T * sizeof(int), cudaMemcpyHostToDevice));
+        CU(cudaGraphLaunch(exec, stream));
+        CU(cudaStreamSynchronize(stream));
+        for (int t = 0; t < T; ++t) {
+            for (int n = 0; n < N; ++n) {
+                const double v = projected[t * ld + n];
+                const int h = slots[t] * 3 * N + n;
+                double y = v * weights[n * 4 + 3];
+                for (int j = 0; j < 3; ++j) y += hist[h + j * N] * weights[n * 4 + j];
+                convolved[t * N + n] = y;
+                hist[h] = hist[h + N];
+                hist[h + N] = hist[h + 2 * N];
+                hist[h + 2 * N] = v;
+            }
+        }
+        expect("sequence convolution", host(out, T * N), convolved, 2e-5, 2e-5);
+        expect("sequence slot histories", host(dh, hist.size()), hist, 2e-5, 2e-5);
+        std::reverse(slots.begin(), slots.end());
+    }
+    expect("sequence projection and padding", host(dy, T * ld), projected, 2e-5, 2e-5);
+    CU(cudaGraphExecDestroy(exec)); CU(cudaGraphDestroy(graph)); CU(cudaStreamDestroy(stream));
+    CU(cudaFree(dx)); CU(cudaFree(dq)); CU(cudaFree(ds)); CU(cudaFree(dy)); CU(cudaFree(dw));
+    CU(cudaFree(dh)); CU(cudaFree(ids)); CU(cudaFree(out));
+}
+
+void test_sparse_decode() {
     // Different landmark keys win for each KV head. The last page has one live token.
     constexpr int H = 4, KV = 2, D = 128, n = 32769, page_size = 64;
     constexpr int budget = k::kSparsePages, total = (n + page_size - 1) / page_size;
@@ -1702,17 +1761,19 @@ void test_rdna3_sparse_decode() {
     auto* dk = dev(keys);
     auto* dv = dev(values);
     auto* pos = dev(std::vector<int>{n - 1});
-    auto* zero = dev(std::vector<float>(H, 0.f));
+    auto* rel = dev(std::vector<float>(H, 1.f));
+    auto* projection = dev(std::vector<float>{4.f, 2.f});
+    auto* sink = dev(std::vector<float>(H, 8.f));
     auto* pages = dev_n<int>(KV * budget);
     auto* out = dev_n<float>(H * D);
     auto* scratch = dev_n<float>(k::attn_decode_mma_scratch(H, 64));
-    k::rdna3_sparse_decode(dq, zero, zero, dk, dv, H, KV, pos, 1.f, 1.f, zero, 1, 1,
+    k::sparse_decode(dq, rel, sink, dk, dv, H, KV, pos, 1.f, 1.f, projection, 1, 2,
                             pages, scratch, out, nullptr, nullptr, nullptr);
     const auto actual = host(pages, KV * budget);
     std::vector<int> selected(KV * budget);
     std::vector<double> expected(H * D);
     for (int kv = 0; kv < KV; ++kv) {
-        double z[2] = {1., 1.}, sum[2] = {}; // sink
+        double z[2] = {std::exp(8.), std::exp(8.)}, sum[2] = {}; // sink
         for (int slot = 0; slot < budget; ++slot) {
             int page = slot;
             if (slot >= budget - 24) page = total - budget + slot;
@@ -1727,7 +1788,8 @@ void test_rdna3_sparse_decode() {
             for (int t = page * page_size; t < std::min(n, (page + 1) * page_size); ++t) {
                 const size_t row = (size_t(t) * KV + kv) * D;
                 for (int h = 0; h < 2; ++h) {
-                    const double w = keys[row + h] ? std::exp(4.) : 1.;
+                    const double bias = t == n - 1 ? 4. : t == n - 2 ? 2. : 0.;
+                    const double w = std::exp((keys[row + h] ? 4. : 0.) + bias);
                     z[h] += w;
                     sum[h] += w * (values[row] == 0x40 ? 2. : -1.);
                 }
@@ -1737,10 +1799,12 @@ void test_rdna3_sparse_decode() {
     }
     expect_true("sparse page ids by KV head", actual == selected);
     expect("sparse decode vs selected-key FP64", host(out, H * D), expected, 2e-3, 5e-5);
-    CU(cudaFree(dq)); CU(cudaFree(dk)); CU(cudaFree(dv)); CU(cudaFree(pos)); CU(cudaFree(zero));
+    CU(cudaFree(dq)); CU(cudaFree(dk)); CU(cudaFree(dv)); CU(cudaFree(pos));
+    CU(cudaFree(rel)); CU(cudaFree(projection)); CU(cudaFree(sink));
     CU(cudaFree(pages)); CU(cudaFree(out)); CU(cudaFree(scratch));
 }
 
+#ifdef STRATA_USE_HIP
 void test_rdna3_deep_attention() {
     constexpr int n = 392957, D = 128, H = 3, T = 2, splits = 512, padded = ((n + 15) / 16) * 16;
     const int marks[] = {n / 20, n / 2, 19 * n / 20, n - 1};
@@ -3768,8 +3832,9 @@ int main() {
     test_experts_mma(2304, 1152, 1);
     test_rdna3_speculative_kernels();
     test_rdna3_deep_attention();
-    test_rdna3_sparse_decode();
 #endif
+    test_sequence_kernels();
+    test_sparse_decode();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

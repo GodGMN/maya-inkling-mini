@@ -21,40 +21,6 @@ __device__ __forceinline__ AttnHalf16 cache_fragment(const KV* ptr) {
     return out;
 }
 
-// One wave chooses a page for one temporal bin and KV head. Sample two keys
-// per candidate and keep the strongest dot product across the grouped queries.
-__global__ void rdna3_select_pages(const uint16_t* q, const uint8_t* kc, int group, int Hkv,
-                                   const int* pos, int* pages) {
-    const int slot = blockIdx.x, head = blockIdx.y, lane = threadIdx.x;
-    const int total = *pos / kSparsePageSize + 1;
-    int* selected = pages + head * kSparsePages + slot;
-    if (slot < kSparseFirst || slot >= kSparsePages - kSparseRecent) {
-        if (!lane) *selected = slot < kSparseFirst ? slot : total - kSparsePages + slot;
-        return;
-    }
-    constexpr int bins = kSparsePages - kSparseFirst - kSparseRecent;
-    const int bin = slot - kSparseFirst, middle = total - kSparseFirst - kSparseRecent;
-    const int lo = kSparseFirst + int((int64_t)bin * middle / bins);
-    const int hi = kSparseFirst + int((int64_t)(bin + 1) * middle / bins);
-    float best = -INFINITY;
-    int chosen = lo;
-    for (int page = lo; page < hi; ++page) {
-        for (int sample = 16; sample < kSparsePageSize; sample += 32) {
-            const size_t row = (size_t)(page * kSparsePageSize + sample) * Hkv + head;
-            uint32_t bytes;
-            __builtin_memcpy(&bytes, kc + row * 128 + lane * 4, sizeof(bytes));
-            const float2 a = e4m3fnx2_to_f2((uint16_t)bytes), b = e4m3fnx2_to_f2(bytes >> 16);
-            for (int h = 0; h < group; ++h) {
-                const uint16_t* x = q + (head * group + h) * 128 + lane * 4;
-                float dot = h2f(x[0])*a.x + h2f(x[1])*a.y + h2f(x[2])*b.x + h2f(x[3])*b.y;
-                for (int shift = 16; shift; shift >>= 1) dot += __shfl_down(dot, shift, 32);
-                if (!lane && dot > best) { best = dot; chosen = page; }
-            }
-        }
-    }
-    if (!lane) *selected = chosen;
-}
-
 template <bool Prefill, bool Block = false, int Waves = 1, bool StageKV = (Waves > 1), bool Paged = false, bool Packed = false, bool Sparse = false, class KV>
 __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc, const KV* vc, int ring,
                                int H, int Hkv, const int* pos, int qpos, float qscale, const float* proj,

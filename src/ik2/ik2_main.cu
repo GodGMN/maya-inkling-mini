@@ -2471,13 +2471,11 @@ void decode_attention(const Config& c, const Layer& Ly, int attention_bucket, fl
         k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, kconv, Ly.kc8, vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                              c.qk_clip, c.rel_clip, c.eps, pos, !Ly.sliding, c.alpha, c.n_floor, Ly.fp8_layout(),
                              k_scale, v_scale, q16, g_s, sink_after_projection, xq, C, sink);
-#ifdef STRATA_USE_HIP
         if (sparse_pages && !Ly.sliding) {
-            k::rdna3_sparse_decode(q16, r_p, sink, Ly.kc8, Ly.vc8, c.H, c.KV, pos, qk_scale / k_scale,
-                                   1.f / v_scale, Ly.rel_proj, c.d_rel, extent, sparse_pages, lg, o, gate_p, x16, g_s);
+            k::sparse_decode(q16, r_p, sink, Ly.kc8, Ly.vc8, c.H, c.KV, pos, qk_scale / k_scale,
+                             1.f / v_scale, Ly.rel_proj, c.d_rel, extent, sparse_pages, lg, o, gate_p, x16, g_s);
             return;
         }
-#endif
         if (mma)
             k::attn_decode_mma_fp8(q16, r_p, sink, Ly.kc8, Ly.vc8, Ly.fp8_layout(), c.H, c.KV, pos, 0, ns,
                                    qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, lg,
@@ -2750,12 +2748,8 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
 
 // one token through the resident path: its logits appended to logits_out (kLogits) or its argmax (kArgmax)
 int decode_bucket(int pos) {
-#ifdef STRATA_USE_HIP
     return g_attn_mma != 3 ? 0 : pos < 1024 ? 1 : pos < 8192 ? 2 : pos < 32768 ? 3 :
                                  pos < 131072 ? 4 : pos < 262144 ? 5 : 6;
-#else
-    return 0;
-#endif
 }
 
 void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>& logits_out,
@@ -3162,6 +3156,29 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
             else
                 k::experts_down_g(buf.blob, buf.n, buf.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                                   g_s);
+#else
+        if (!rows) {
+            k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], buf.blob, buf.n,
+                           buf.tok, buf.row, buf.sg, buf.su, buf.wt, buf.inv, g_s);
+            if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
+                uint16_t* limbs = (uint16_t*) W.gu32;
+                k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
+                k::experts_block_gu(buf.blob, buf.n, buf.tok, buf.row, S, T, Ly.eb[0], C, c.F, limbs, buf.sg,
+                                    buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
+                k::experts_block_down(buf.blob, buf.n, buf.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
+            } else if (Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0 && C % 32 == 0 && c.F % 32 == 0) {
+                uint16_t* limbs = (uint16_t*) W.gu32;
+                k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
+                k::experts_block_gu_q8(buf.blob, buf.n, buf.tok, buf.row, S, T, Ly.eb[0], C, c.F, limbs, buf.sg,
+                                       buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
+                k::experts_block_down_q8(buf.blob, buf.n, buf.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
+            } else {
+                k::experts_gate_up_swiglu_g(buf.blob, buf.n, buf.tok, buf.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
+                                            C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
+                k::experts_down_g(buf.blob, buf.n, buf.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
+                                  g_s);
+            }
+#endif
         } else {
             k::route_gather(rtop, rw, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], S, c.K,
                             buf.blob, buf.tok, buf.inv, buf.sg, buf.su, buf.wt, g_s, rows && c.E == 128);
@@ -3169,28 +3186,6 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
                                       C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
             k::experts_down(buf.blob, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
         }
-#else
-        k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], buf.blob, buf.n,
-                       buf.tok, buf.row, buf.sg, buf.su, buf.wt, buf.inv, g_s);
-        if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
-            uint16_t* limbs = (uint16_t*) W.gu32;
-            k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
-            k::experts_block_gu(buf.blob, buf.n, buf.tok, buf.row, S, T, Ly.eb[0], C, c.F, limbs, buf.sg,
-                                buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
-            k::experts_block_down(buf.blob, buf.n, buf.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
-        } else if (Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 && Ly.ty[2] == k::kQ8_0 && C % 32 == 0 && c.F % 32 == 0) {
-            uint16_t* limbs = (uint16_t*) W.gu32;
-            k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
-            k::experts_block_gu_q8(buf.blob, buf.n, buf.tok, buf.row, S, T, Ly.eb[0], C, c.F, limbs, buf.sg,
-                                   buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
-            k::experts_block_down_q8(buf.blob, buf.n, buf.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
-        } else {
-            k::experts_gate_up_swiglu_g(buf.blob, buf.n, buf.tok, buf.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
-                                        C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
-            k::experts_down_g(buf.blob, buf.n, buf.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
-                              g_s);
-        }
-#endif
         k::moe_combine_f32(W.y32, buf.inv, buf.wt, T, c.K, C, W.tmp, false, g_s);
         if (rows) k::conv_sequences(rows->device_slots, T, W.tmp, C,
                                     {0, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, W.r, W.h}, g_s);
@@ -3491,7 +3486,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     k::enable_grouped_tensor_products(allow_short_batch_products());
     const Config& c = M.c;
     const int C = c.C;
-    if (g_fast && T == 1 && dump.empty() && !g_prof && !g_rec && !g_trace && g_pop.empty() && g_img.at(pos0) < 0) {
+    // A one-token prompt chunk uses prompt ablation, even just after a masked decode row.
+    const bool prompt_ablation = !generation && !g_abl_r.empty() && (!g_abl_decode || g_abl_tokens >= 0);
+    if (g_fast && !prompt_ablation && T == 1 && dump.empty() && !g_prof && !g_rec && !g_trace && g_pop.empty() && g_img.at(pos0) < 0) {
         fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out, generation);
         return;
     }
@@ -4614,9 +4611,7 @@ void embed_row(Model& M, int t, float* raw, float* out) {
     k::rms(raw, M.embd_norm, 1, C, M.c.eps, out, g_s);
 }
 
-#ifdef STRATA_USE_HIP
 #include "ik2_batch_serve.cuh"
-#endif
 
 }  // namespace
 
@@ -4708,17 +4703,11 @@ int main(int argc, char** argv) {
         g_sparse_decode = std::string(v) == "1";
     }
     if (g_sparse_decode) {
-#ifndef STRATA_USE_HIP
-        die("IK2_SPARSE_DECODE requires the gfx1100 backend");
-#endif
         if (batch_width != 1 || !draft_path.empty() || (getenv("IK2_SUFFIX") && atoi(getenv("IK2_SUFFIX"))))
             die("IK2_SPARSE_DECODE requires single-stream decode without speculation");
     }
     if (batch_width < 1 || batch_width > 32) die("IK2_BATCH must be between 1 and 32");
     if (batch_width > 1) {
-#ifndef STRATA_USE_HIP
-        die("IK2_BATCH requires the HIP engine");
-#endif
         if (!serve || !serve_maya || !draft_path.empty() || (cache_slots != 1 && cache_slots != batch_width))
             die("IK2_BATCH requires --serve without a drafter or a separate cache-slot count");
         cache_slots = batch_width;
@@ -5230,9 +5219,9 @@ int main(int argc, char** argv) {
     }
     // Each visit owns its KV. Sliding layers use ring buffers in both CLI and server mode.
     const bool paged_kv = getenv("IK2_PAGED_KV") && atoi(getenv("IK2_PAGED_KV"));
-#ifdef STRATA_USE_HIP
     if (g_sparse_decode && (paged_kv || g_kv_precision != KVPrecision::fp8 || c.D != 128 || g_attn_mma != 3))
         die("IK2_SPARSE_DECODE requires token-major IK2_KV=fp8 and IK2_ATTN_MMA=3 with 128-wide heads");
+#ifdef STRATA_USE_HIP
     if (g_kv_precision == KVPrecision::fp4_global && (paged_kv || c.D != 128))
         die("fp4-global requires token-major KV and 128-wide heads");
     if (paged_kv && (!byte_cache(false) || c.D != 128)) die("IK2_PAGED_KV requires global E4M3 KV with 128-wide heads");
@@ -5605,9 +5594,7 @@ int main(int argc, char** argv) {
         W.kv_k16 = work_alloc<uint16_t>((size_t)W.kv_tmp_cap * KD);
         W.kv_v16 = work_alloc<uint16_t>((size_t)W.kv_tmp_cap * KD);
     }
-#ifdef STRATA_USE_HIP
     if (g_sparse_decode) W.sparse_pages = work_alloc<int>(c.KV * k::kSparsePages);
-#endif
     W.pos = work_alloc<int>(T_buf);
     W.rlog = work_alloc<float>(T_buf * c.E), W.route_d = work_alloc<int>(S_buf * 2);
     W.ex16 = work_alloc<uint16_t>(T_buf * C),
@@ -5810,12 +5797,12 @@ int main(int argc, char** argv) {
     }
     std::fflush(stdout);
     }
-#ifdef STRATA_USE_HIP
     if (g_sparse_decode) {
         if (!g_fast || g_prof || g_rec || g_trace || !g_pop.empty() || !dump.empty())
             die("IK2_SPARSE_DECODE requires the resident decoder without tracing, profiling or dumps");
         std::fprintf(stderr, "sparse decode enabled: 224 x 64 global keys from position 32768; dense prefill\n");
     }
+#ifdef STRATA_USE_HIP
     if ((drafter || suffix_window) && g_block) {
         const bool planar = M.out_w.q8 && std::all_of(M.L.begin(), M.L.end(), [](const Layer& ly) {
             return ly.wo.q8 && (ly.sliding ? ly.wqkvrg.q8 != nullptr : ly.wqrg.q8 && ly.wk.q8 && ly.wv.q8);
@@ -5882,12 +5869,10 @@ int main(int argc, char** argv) {
             if (const auto* e = S.get("tokenizer.ggml.eos_token_id")) eos_ids.push_back((int) e->u);
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
-#ifdef STRATA_USE_HIP
         if (batch_width > 1) {
             serve_sequences(M, batch_width, ctx, chunk, image_token, eos_ids);
             return 0;
         }
-#endif
         // --serve: requests on stdin, a line each - "GEN max_new temperature top_p seed stop,stop ids,ids,..." - and
         // the answer on stdout as "@TOK id" lines then "@END reason prompt_tokens cached_tokens prompt_s gen_s".  The
         // tokens whose state the model holds are kept: a request that starts with them runs only what follows.

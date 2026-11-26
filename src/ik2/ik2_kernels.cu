@@ -1463,19 +1463,20 @@ __device__ __forceinline__ int wa_active(int qpos, int window, int nw, int& k_lo
     return min(nw, (n_steps + kWaMin - 1) / kWaMin);
 }
 
-template <class KVT>
+template <class KVT, bool Sparse = false>
 __global__ void __launch_bounds__(kWaNW * 32, 4)
 attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
                        int kv_cap, int H, int Hkv, const int* pos_d, int qpos, float qk_scale,
                        const float* __restrict__ r, const float* __restrict__ proj, int d_rel, bool rel4, int extent,
-                       int window, int n_split, float* __restrict__ o_part, float2* __restrict__ ml_part) {
+                       int window, int n_split, float* __restrict__ o_part, float2* __restrict__ ml_part, const int* pages = nullptr) {
     constexpr bool F8 = sizeof(KVT) == 1;
     if (pos_d) qpos = *pos_d;   // (a token of a replayed graph: its position read here)
     const int lane = threadIdx.x & 31, gr = lane >> 2, tq = lane & 3;
     const int g = blockIdx.x, R = H / Hkv, KD = Hkv * kFaD;
     const int w = blockIdx.y * kWaNW + (threadIdx.x >> 5);   // this warp of the K / V head's
     int k_lo, n_steps;
-    const int n_act = wa_active(qpos, window, n_split * kWaNW, k_lo, n_steps);
+    const int last_offset = Sparse ? (kSparsePages - 1) * kSparsePageSize + qpos % kSparsePageSize : qpos;
+    const int n_act = wa_active(last_offset, window, n_split * kWaNW, k_lo, n_steps);
     if (w >= n_act) return;
     const int per = (n_steps + n_act - 1) / n_act;
     const int st0 = min(n_steps, w * per), st1 = min(n_steps, st0 + per);
@@ -1504,7 +1505,10 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__
     const uint32_t psel = (gr & 1) ? 0x7632u : 0x5410u;
 
     for (int st = st0; st < st1; ++st) {
-        const int kt = k_lo + st * 16, kmax = qpos - kt;
+        int kt = k_lo + st * 16;
+        if constexpr (Sparse)
+            kt = pages[g * kSparsePages + kt / kSparsePageSize] * kSparsePageSize + kt % kSparsePageSize;
+        const int kmax = qpos - kt;
         const int row0 = kv_cap > 0 ? kt % kv_cap : kt;
         // a key's row in the cache (a key past the token's: the token's row, its logits masked below)
         auto row = [&](int key) {
@@ -5742,6 +5746,40 @@ void attn_probs_bias_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk
                                                                                    qk_scale, bias, extent, window, sink);
     check("attn_probs_bias_f16");
 }
+// One wave chooses a page for one temporal bin and KV head. Sample two keys
+// per candidate and keep the strongest dot product across the grouped queries.
+__global__ void select_sparse_pages(const uint16_t* q, const uint8_t* kc, int group, int Hkv,
+                                   const int* pos, int* pages) {
+    const int slot = blockIdx.x, head = blockIdx.y, lane = threadIdx.x;
+    const int total = *pos / kSparsePageSize + 1;
+    int* selected = pages + head * kSparsePages + slot;
+    if (slot < kSparseFirst || slot >= kSparsePages - kSparseRecent) {
+        if (!lane) *selected = slot < kSparseFirst ? slot : total - kSparsePages + slot;
+        return;
+    }
+    constexpr int bins = kSparsePages - kSparseFirst - kSparseRecent;
+    const int bin = slot - kSparseFirst, middle = total - kSparseFirst - kSparseRecent;
+    const int lo = kSparseFirst + int((int64_t)bin * middle / bins);
+    const int hi = kSparseFirst + int((int64_t)(bin + 1) * middle / bins);
+    float best = -INFINITY;
+    int chosen = lo;
+    for (int page = lo; page < hi; ++page) {
+        for (int sample = 16; sample < kSparsePageSize; sample += 32) {
+            const size_t row = (size_t)(page * kSparsePageSize + sample) * Hkv + head;
+            uint32_t bytes;
+            __builtin_memcpy(&bytes, kc + row * 128 + lane * 4, sizeof(bytes));
+            const float2 a = e4m3fnx2_to_f2((uint16_t)bytes), b = e4m3fnx2_to_f2(bytes >> 16);
+            for (int h = 0; h < group; ++h) {
+                const uint16_t* x = q + (head * group + h) * 128 + lane * 4;
+                float dot = h2f(x[0])*a.x + h2f(x[1])*a.y + h2f(x[2])*b.x + h2f(x[3])*b.y;
+                for (int shift = 16; shift; shift >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, shift);
+                if (!lane && dot > best) { best = dot; chosen = page; }
+            }
+        }
+    }
+    if (!lane) *selected = chosen;
+}
+
 #ifdef STRATA_USE_HIP
 #include "ik2_attention_rdna3.cuh"
 template <class KV>
@@ -6777,21 +6815,31 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
 }
 
 
-#ifdef STRATA_USE_HIP
-void rdna3_sparse_decode(const uint16_t* q, const float* r, const float* sink, const uint8_t* kc,
+void sparse_decode(const uint16_t* q, const float* r, const float* sink, const uint8_t* kc,
                          const uint8_t* vc, int H, int Hkv, const int* pos, float qscale, float v_inv,
                          const float* proj, int dr, int extent, int* pages, float* scratch, float* out,
                          const float* gate, uint16_t* out16, cudaStream_t stream) {
     constexpr int splits = 64;
-    rdna3_select_pages<<<dim3(kSparsePages, Hkv), 32, 0, stream>>>(q, kc, H / Hkv, Hkv, pos, pages);
-    check("rdna3_select_pages");
+    select_sparse_pages<<<dim3(kSparsePages, Hkv), 32, 0, stream>>>(q, kc, H / Hkv, Hkv, pos, pages);
+    check("select_sparse_pages");
+#ifdef STRATA_USE_HIP
     rdna3_attn_part<false, false, 1, true, false, false, true><<<dim3(Hkv, splits), 32, 0, stream>>>(
         q, r, kc, vc, 0, H, Hkv, pos, 0, qscale, proj, dr, extent, 1 << 30, scratch, 1, H * 128, nullptr, 0, pages);
     check("rdna3 sparse attention");
     combine_token_splits(sink, scratch, H, splits, v_inv, out, gate, out16, stream);
-    check("rdna3 sparse attention combine");
-}
+#else
+    constexpr int warps = splits * kWaNW;
+    float2* ml = reinterpret_cast<float2*>(scratch + size_t(warps) * H * kFaD);
+    const bool rel4 = dr % 4 == 0 && (((uintptr_t)r | (uintptr_t)proj) & 15) == 0;
+    attn_decode_mma_kernel<uint8_t, true><<<dim3(Hkv, splits), kWaNW * 32, 0, stream>>>(
+        q, kc, vc, 0, H, Hkv, pos, 0, qscale, r, proj, dr, rel4, extent, 1 << 30, splits, scratch, ml, pages);
+    check("sparse attention");
+    // Even a partial last page leaves more than one tile for every warp.
+    attn_decode_mma_combine_kernel<<<H, kFaD, (kFaD + warps) * sizeof(float), stream>>>(
+        scratch, ml, splits, H, sink, v_inv, nullptr, kSparsePages * kSparsePageSize - 1, 1 << 30, gate, out, out16);
 #endif
+    check("sparse attention combine");
+}
 
 int attn_decode_mma_blocks(int Hkv) {
 #ifdef STRATA_USE_HIP
