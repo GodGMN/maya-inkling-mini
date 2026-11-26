@@ -7,15 +7,16 @@ Tintero is a local Linux inference server for [Inkling-2-Mini](https://huggingfa
 
 ### Tested hardware
 
-| Backend | Target | Tested GPU | Single-stream decode (512p) | Abliterated (`v21-pc4`) | Batched / Prefill notes |
+| Backend | Target | Tested GPU | Single-stream decode (512p) | Abliterated (`v21-pc4`) | Batched / Prefill / Long-context notes |
 |---|---|---|---:|---:|---|
 | **AMD HIP** | `gfx1100` (RDNA3) | RX 7900 XTX (24 GB) | **117.1 tok/s** | 114.6 tok/s (`-3.4%`) | Up to **327.8 tok/s** across 32 streams (`IK2_BATCH`); 393K FP8 KV |
-| **NVIDIA CUDA** | `sm_80+` (Ampere–Blackwell) | A100-SXM4-80GB (`sm_80`) | **98.8 tok/s** | 95.6 tok/s (`-3.3%`) | **2,155–2,184 tok/s** prefill (4K–32K); 393K FP8 KV; single-stream (default CUDA flags) |
+| **NVIDIA CUDA** | `sm_80+` (Ampere–Blackwell) | A100-SXM4-80GB (`sm_80`) | **98.8 tok/s** | 95.6 tok/s (`-3.3%`) | **2,155–2,184 tok/s** prefill (4K–32K); 393K FP8 KV |
+| **NVIDIA CUDA** | `sm_121a` (Grace Blackwell, ARM64) | DGX Spark GB10 (121 GiB unified) | **49.1 tok/s** | 48.2 tok/s (`-1.8%`) | Up to **99.5 tok/s** across 32 streams (`IK2_BATCH`); **1,139 tok/s** peak prefill; **1M** FP8 KV (`16.2 GiB`); **40.9 tok/s** at 256K (`IK2_SPARSE_DECODE=1`); **0.6 s** resident load (`IK2_FAST_LOAD=1`) |
 
 [![RX 7900 XTX: one chat generates 117.1 tokens/s after a 512-token prompt. Total batched throughput reaches 327.8 tokens/s across 32 streams.](docs/assets/rx7900xtx-speed.svg)](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
 
 > [!NOTE]
-> The RX 7900 XTX (`gfx1100`) is currently the most heavily tuned backend (RDNA3 decode kernels, `IK2_BATCH` continuous batching, sparse long-context decode, and the r6 Docker image). NVIDIA CUDA (`sm_80+`, Linux x86_64 & ARM64) passes the full `ik2_kernels_test` suite and runs full-resident inference + runtime abliteration single-stream today, with CUDA decode tuning and `IK2_BATCH` parity planned next.
+> Both **AMD HIP (`gfx1100`)** and **NVIDIA CUDA (`sm_80`–`sm_121a`, Linux x86_64 & ARM64)** support full-resident inference, runtime abliteration, `IK2_BATCH` continuous batching (bit-exact greedy parity), and `IK2_SPARSE_DECODE=1` long-context FP8 decode. Blackwell `sm_120a`/`sm_121a` additionally supports native block-scaled FP4 MMA (`IK2_BLACKWELL_NVFP4=1`) and `2 × 64 MiB` pinned-staging fast loads (`IK2_FAST_LOAD=1`).
 
 ## Quick start
 
