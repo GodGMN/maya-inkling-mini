@@ -584,11 +584,15 @@ void prep_qkv_r_f16_block(float* q, int q_ld, const float* q_clip, const float* 
 /// route() for a window, a block a token (the same picks and weights to the bit).
 void route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
                 cudaStream_t s);
-/// experts_block_gu / _down over Q8_0 experts (a block's sum scaled in FP32: the int8 values exact).
-void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
+#ifndef STRATA_USE_HIP
+/// Selected NVFP4 grouped MMA products for verification (bit 0 gate/up, bit 1 down).
+int block_nvfp4_mma_mask();
+#endif
+/// Q8_0 and IQ4_NL grouped products apply each block scale to its FP32 sum.
+void experts_block_gu_linear(int type, const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                          size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su,
                          float gcap, float ucap, uint16_t* h, cudaStream_t s);
-void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
+void experts_block_down_linear(int type, const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
                            int F, const uint16_t* h, float* y, cudaStream_t s);
 /// attn_res_jobs for T tokens: job j's queries q + j nq C, its output out + j nq T C ([nq][T][C]).
 void attn_res_jobs_block(const ResStates& states, int n, const float* q, int nq, int jobs, int T, int C, float eps,

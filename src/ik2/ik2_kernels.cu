@@ -5564,25 +5564,38 @@ __global__ void route_rows_kernel(const float* __restrict__ logits, const float*
 // a lane's part of a Q8_0 block of its two rows (34 bytes: the FP16 scale, 32 int8): the scales, and the values
 // 8 t .. 8 t + 7 as four pairs (2-byte loads: a block is 2-byte aligned)
 #ifndef STRATA_USE_HIP
-struct Q8Step {
+struct LinearBlockStep {
     uint32_t sa, sb;
     uint32_t a[4], b[4];
 };
-__device__ __forceinline__ Q8Step q8_step_load(const uint8_t* a, const uint8_t* b, int k, int t) {
-    const uint16_t* ap = (const uint16_t*) (a + (size_t) k * 34);
-    const uint16_t* bp = (const uint16_t*) (b + (size_t) k * 34);
-    Q8Step r;
+template <bool IQ4>
+__device__ __forceinline__ LinearBlockStep block_step_load(const uint8_t* a, const uint8_t* b, int k, int t) {
+    constexpr int bytes = IQ4 ? 18 : 34;
+    const uint16_t* ap = (const uint16_t*) (a + (size_t) k * bytes);
+    const uint16_t* bp = (const uint16_t*) (b + (size_t) k * bytes);
+    LinearBlockStep r;
     r.sa = __ldg(ap), r.sb = __ldg(bp);
+    if constexpr (IQ4) {
+        // A lane consumes eight consecutive values. Low and high nibbles span 16 values each.
+        ap += 1 + 4 * (t & 1);
+        bp += 1 + 4 * (t & 1);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) r.a[i] = __ldg(ap + 1 + 4 * t + i), r.b[i] = __ldg(bp + 1 + 4 * t + i);
+        for (int i = 0; i < 2; ++i) {
+            const uint32_t av = iq4nl_lut4(__ldg(ap + 2 * i) | (uint32_t(__ldg(ap + 2 * i + 1)) << 16), t >= 2);
+            const uint32_t bv = iq4nl_lut4(__ldg(bp + 2 * i) | (uint32_t(__ldg(bp + 2 * i + 1)) << 16), t >= 2);
+            r.a[2 * i] = av, r.a[2 * i + 1] = av >> 16;
+            r.b[2 * i] = bv, r.b[2 * i + 1] = bv >> 16;
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) r.a[i] = __ldg(ap + 1 + 4 * t + i), r.b[i] = __ldg(bp + 1 + 4 * t + i);
+    }
     return r;
 }
-// experts_block_gu_kernel over Q8_0 blocks: a block's two MMA (values 8 t .. + 3, 8 t + 4 .. + 7 of the lane, B
-// taken in the same order) into a sum of its own, scaled by the row's block scale in FP32 - the int8 values exact
-// in FP16, nothing rounded but the input's limbs
-template <int SPLIT, int NT>
+// Each 32-value block contributes unscaled integer products, then its FP16 row scale in FP32.
+template <int SPLIT, int NT, bool IQ4>
 __global__ void __launch_bounds__(SPLIT * 32)
-experts_block_gu_q8_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n_g, const int* __restrict__ tok_g,
+experts_block_gu_linear_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n_g, const int* __restrict__ tok_g,
                            const int* __restrict__ row_g, size_t off_up, int C, int F, const uint16_t* __restrict__ limbs,
                            const float* __restrict__ sg, const float* __restrict__ su, float gcap, float ucap,
                            uint16_t* h) {
@@ -5591,7 +5604,7 @@ experts_block_gu_q8_kernel(const uint8_t* const* __restrict__ blob, const int* _
     if (n <= 0) return;
     const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, gr = lane >> 2, t = lane & 3;
     const int r = blockIdx.x * 8 + gr;
-    const size_t rb = (size_t) (C / 32) * 34;
+    const size_t rb = (size_t) (C / 32) * (IQ4 ? 18 : 34);
     const uint8_t* a = blob[grp] + (size_t) r * rb;
     const uint8_t* b = a + off_up;
     const uint4* xp[NT];
@@ -5607,10 +5620,11 @@ experts_block_gu_q8_kernel(const uint8_t* const* __restrict__ blob, const int* _
 #pragma unroll
     for (int j = 0; j < NT; ++j) v[j][0] = v[j][1] = v[j][2] = v[j][3] = 0.0f;
     const int nk = C / 32;
-    Q8Step cur = q8_step_load(a, b, split, t);
+    LinearBlockStep cur{};
+    if (split < nk) cur = block_step_load<IQ4>(a, b, split, t);
     for (int k = split; k < nk; k += SPLIT) {
-        Q8Step nxt = cur;
-        if (k + SPLIT < nk) nxt = q8_step_load(a, b, k + SPLIT, t);
+        LinearBlockStep nxt = cur;
+        if (k + SPLIT < nk) nxt = block_step_load<IQ4>(a, b, k + SPLIT, t);
         const float sa = h2f((uint16_t) cur.sa), sb = h2f((uint16_t) cur.sb);
         const uint32_t af0[4] = {q8_pair(cur.a[0]), q8_pair(cur.b[0]), q8_pair(cur.a[1]), q8_pair(cur.b[1])};
         const uint32_t af1[4] = {q8_pair(cur.a[2]), q8_pair(cur.b[2]), q8_pair(cur.a[3]), q8_pair(cur.b[3])};
@@ -5645,9 +5659,9 @@ experts_block_gu_q8_kernel(const uint8_t* const* __restrict__ blob, const int* _
         }
     }
 }
-template <int SPLIT>
+template <int SPLIT, bool IQ4>
 __global__ void __launch_bounds__(SPLIT * 32)
-experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n_g,
+experts_block_down_linear_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n_g,
                              const int* __restrict__ row_g, size_t off_down, int C, int F,
                              const uint16_t* __restrict__ h, float* y) {
     __shared__ float4 part[SPLIT][32];
@@ -5655,17 +5669,18 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
     if (n <= 0) return;
     const int lane = threadIdx.x & 31, split = threadIdx.x >> 5, gr = lane >> 2, t = lane & 3;
     const int r = blockIdx.x * 16 + gr;
-    const size_t rb = (size_t) (F / 32) * 34;
+    const size_t rb = (size_t) (F / 32) * (IQ4 ? 18 : 34);
     const uint8_t* a = blob[grp] + off_down + (size_t) r * rb;
     const uint8_t* b = a + 8 * rb;
     const bool x_ok = gr < n;
     const uint4* xp = (const uint4*) (h + (size_t) (x_ok ? row_g[grp * kGroupMax + gr] : 0) * F) + t;
     float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const int nk = F / 32;
-    Q8Step cur = q8_step_load(a, b, split, t);
+    LinearBlockStep cur{};
+    if (split < nk) cur = block_step_load<IQ4>(a, b, split, t);
     for (int k = split; k < nk; k += SPLIT) {
-        Q8Step nxt = cur;
-        if (k + SPLIT < nk) nxt = q8_step_load(a, b, k + SPLIT, t);
+        LinearBlockStep nxt = cur;
+        if (k + SPLIT < nk) nxt = block_step_load<IQ4>(a, b, k + SPLIT, t);
         const float sa = h2f((uint16_t) cur.sa), sb = h2f((uint16_t) cur.sb);
         const uint32_t af0[4] = {q8_pair(cur.a[0]), q8_pair(cur.b[0]), q8_pair(cur.a[1]), q8_pair(cur.b[1])};
         const uint32_t af1[4] = {q8_pair(cur.a[2]), q8_pair(cur.b[2]), q8_pair(cur.a[3]), q8_pair(cur.b[3])};
@@ -6465,6 +6480,7 @@ void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok,
 }
 // The serving engine can retain the original short-prompt arithmetic and enable
 // the grouped tensor-core path only in a window whose tokens are being verified.
+thread_local bool grouped_tensor_products = true;
 #ifndef STRATA_USE_HIP
 static bool use_blackwell_nvfp4() {
     static const bool enabled = getenv("IK2_BLACKWELL_NVFP4") && atoi(getenv("IK2_BLACKWELL_NVFP4"));
@@ -6475,8 +6491,12 @@ static bool use_blackwell_nvfp4() {
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) return false;
     return major == 12 && minor <= 1;
 }
+int block_nvfp4_mma_mask() {
+    static const int mask = getenv("IK2_GROUP_MMA") ? atoi(getenv("IK2_GROUP_MMA")) : 0;
+    if (!grouped_tensor_products) return 0;
+    return use_blackwell_nvfp4() ? 3 : mask & 3;
+}
 #endif
-thread_local bool grouped_tensor_products = true;
 void enable_grouped_tensor_products(bool enabled) { grouped_tensor_products = enabled; }
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
                     const uint16_t* h, int C, int F, float* y, cudaStream_t s) {
@@ -7311,7 +7331,7 @@ void route_rows(const float* logits, const float* bias, int T, int E, int K, flo
                                                                                                scale, top, w);
     check("route_rows");
 }
-void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
+void experts_block_gu_linear(int type, const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                          size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su,
                          float gcap, float ucap, uint16_t* h, cudaStream_t s) {
 #ifdef STRATA_USE_HIP
@@ -7319,20 +7339,30 @@ void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* to
 #else
     if (G <= 0) return;
     const dim3 g((unsigned) (F / 8), (unsigned) G);
-    if (T <= 4) experts_block_gu_q8_kernel<8, 1><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
-    else experts_block_gu_q8_kernel<8, 2><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
-    check("experts_block_gu_q8");
+    if (type == kIQ4_NL) {
+        if (T <= 4) experts_block_gu_linear_kernel<8, 1, true><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
+        else experts_block_gu_linear_kernel<8, 2, true><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
+    } else {
+        if (T <= 4) experts_block_gu_linear_kernel<8, 1, false><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
+        else experts_block_gu_linear_kernel<8, 2, false><<<g, 256, 0, s>>>(blob, n, tok, row, off_up, C, F, limbs, sg, su, gcap, ucap, h);
+    }
+    check("experts_block_gu_linear");
 #endif
 }
-void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
+void experts_block_down_linear(int type, const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
                            int F, const uint16_t* h, float* y, cudaStream_t s) {
 #ifdef STRATA_USE_HIP
     unavailable_mma(__func__);
 #else
     if (G <= 0) return;
-    experts_block_down_q8_kernel<4><<<dim3((unsigned) (C / 16), (unsigned) G), 128, 0, s>>>(blob, n, row, off_down, C,
-                                                                                            F, h, y);
-    check("experts_block_down_q8");
+    if (type == kIQ4_NL) {
+        experts_block_down_linear_kernel<4, true><<<dim3((unsigned) (C / 16), (unsigned) G), 128, 0, s>>>(blob, n, row, off_down, C,
+                                                                                                F, h, y);
+    } else {
+        experts_block_down_linear_kernel<4, false><<<dim3((unsigned) (C / 16), (unsigned) G), 128, 0, s>>>(blob, n, row, off_down, C,
+                                                                                                F, h, y);
+    }
+    check("experts_block_down_linear");
 #endif
 }
 
