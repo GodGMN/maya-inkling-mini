@@ -934,11 +934,10 @@ done
 
 ## Build on Prometheus without a GPU
 
-The source tree is under `~/ai/build/maya-ik2-hip/src`. The build container mounts its parent at `/work`. The following commands reproduce the environment from a synced source tree. The llama.cpp archive is the source revision pinned by Maya's top-level CMake file.
+The source tree is under `~/ai/build/maya-ik2-hip/src`. The build container mounts its parent at `/work`. The following commands reproduce the environment from a synced source tree.
 
 ```sh
 cd ~/ai/build/maya-ik2-hip
-curl -fLsS https://codeload.github.com/ggml-org/llama.cpp/tar.gz/3cf03257f219afbe7334045ff7c6a06ac68c627d | tar xz
 docker run -d --name maya-ik2-hip-build --memory 6g --memory-swap 6g --cpus 4 \
   -v "$PWD:/work" -w /work --entrypoint sleep ghcr.io/ggml-org/llama.cpp:server-rocm-b11176 infinity
 docker exec -it maya-ik2-hip-build bash
@@ -950,14 +949,13 @@ Run the following inside that container.
 apt-get update -qq
 apt-get install -y --no-install-recommends build-essential cmake ninja-build git python3 python3-pip libomp-dev
 cmake -S src -B build-ik2 -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DSTRATA_ENABLE_HIP=ON -DSTRATA_PREFILL_MMQ=ON -DSTRATA_BUILD_TESTS=ON \
+  -DSTRATA_ENABLE_HIP=ON -DSTRATA_BUILD_TESTS=ON \
   -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=/opt/rocm \
-  -DCMAKE_HIP_ARCHITECTURES=gfx1100 -DGPU_TARGETS=gfx1100 \
-  -DSTRATA_GGML_DIR=/work/llama.cpp-3cf03257f219afbe7334045ff7c6a06ac68c627d
+  -DCMAKE_HIP_ARCHITECTURES=gfx1100
 cmake --build build-ik2 -j4 --target tintero ik2_kernels_test ik2_host_ref_test
 ```
 
-The base library uses the same source and target architecture. For the separate base build directory on Prometheus, the build command is `cmake --build build -j4 --target strata_engine`. The engine links its own kernels and hipBLAS directly.
+The text engine links its own kernels and hipBLAS directly.
 
 ## Serve the IQ4_NL model on gfx1100
 

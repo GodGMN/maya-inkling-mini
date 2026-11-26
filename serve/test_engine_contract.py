@@ -45,7 +45,7 @@ READY_S = float(os.environ.get("MAYA_TEST_READY_S", "900"))
 TEXT_ONLY = os.environ.get("MAYA_TEST_TEXT_ONLY", "1") == "1"
 THINK_END = 154842                              # </think> (GLM-5.x's vocabulary)
 GLM_EOS = (154820, 154827, 154829)              # <|endoftext|>, <|user|>, <|observation|>
-# INFO keys of the GLM fast path (src/program/generate.cpp, the serve start): the Monitor, the calibration and the TUI
+# INFO keys of the GLM fast path (the upstream engine’s serve start): the Monitor, the calibration and the TUI
 INFO_KEYS = ("context", "kv", "expert_slots", "expert_cache_mib", "engine_kind", "experts", "vram_slots", "vram_gb",
              "ram_slots", "ram_gb", "mtp", "vision_lend", "cpu_threads", "pcie_share")
 A29_KEYS = ("engine", "arch", "vision", "spec")

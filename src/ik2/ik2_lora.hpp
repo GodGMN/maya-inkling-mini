@@ -1,6 +1,6 @@
 #pragma once
 
-#include "strata/artifact/gguf_reader.hpp"
+#include "gguf_reader.hpp"
 #include <cmath>
 #include <limits>
 

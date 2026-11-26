@@ -9,7 +9,7 @@ serve/test_engine_contract.py checks against the real engine:
           tokens, DONE with 10 fields (reused = the prompt's common prefix with the conversation it holds)
   stdin:  GEN <max_new> [key=value ...] <ids> (think_budget / think_end close the thinking as the engine does),
           STOP, WRAP, PAUSE [keep], QUIT
-The INFO and STAT lines carry the keys the real engine prints on GLM-5.3 (src/program/generate.cpp's serve start and
+The INFO and STAT lines carry the keys the real engine prints on GLM-5.3 (the upstream engine's serve start and
 its decode loop: the same lines GLM-5.3-Flash's engine prints; checked against a real GLM-5.3 run, 2026-11-07).
 
 Its answer is FAKE_ENGINE_IDS (comma-separated ids; default the bytes of "hello"), repeated up to max_new.

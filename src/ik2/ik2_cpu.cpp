@@ -1,12 +1,24 @@
 // src/ik2/ik2_cpu.cpp - tintero's CPU lane (the interface: ik2_cpu.hpp).
 #include "ik2_cpu.hpp"
 
+#if defined(__x86_64__)
 #include <immintrin.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
 
 namespace ik2::cpu {
+
+static inline void spin_pause() {
+#if defined(__x86_64__)
+    _mm_pause();
+#elif defined(__aarch64__)
+    __asm__ volatile("yield");
+#else
+    std::this_thread::yield();
+#endif
+}
 
 bool available() {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
@@ -32,7 +44,7 @@ Pool::Pool(int n) {
                             break;
                         }
                         lk.unlock();
-                        _mm_pause();
+                        spin_pause();
                     }
                     if (stop_ && q_.empty()) return;
                     f = std::move(q_.front());
@@ -68,7 +80,7 @@ void Pool::wait() {
         lk.lock();
         if (pending_ == 0) return;
         lk.unlock();
-        _mm_pause();
+        spin_pause();
     }
     lk.lock();
     done_.wait(lk, [this]() { return pending_ == 0; });

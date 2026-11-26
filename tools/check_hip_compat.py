@@ -1,6 +1,6 @@
 """tools/check_hip_compat.py - every CUDA runtime / cuBLAS name the AMD (HIP) build compiles must have a mapping in
 include/strata/hip_compat/*.h.  The HIP build compiles the same CUDA-shaped sources with those headers forced in
-(cmake/hip_backend.cmake), so a CUDA call added without its mapping breaks every AMD build - v1.0.21 did, with three
+(CMakeLists.txt), so a CUDA call added without its mapping breaks every AMD build - v1.0.21 did, with three
 device queries from #44 (fixed in v1.0.22 by #52).  No ROCm or GPU is needed: it reads the sources.
 
     python tools/check_hip_compat.py [repo]      # exit 1 and the file:line of each unmapped name
@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 NAME = re.compile(r"\b(cuda[A-Z]\w*|cublas[A-Z]\w*|CUBLAS_[A-Z0-9_]+|CUDA_R_\w+)\b")
-SOURCES = ("*.cu", "*.cuh", "*.cpp", "*.hpp", "*.h")
+SOURCES = ("*.hip", "*.cu", "*.cuh", "*.cpp", "*.hpp", "*.h")
 
 
 def mapped_names(compat: Path) -> set:

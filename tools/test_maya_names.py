@@ -5,7 +5,6 @@
 from pathlib import Path
 import json
 import os
-import re
 import sys
 import tempfile
 import unittest
@@ -63,33 +62,6 @@ class Names(unittest.TestCase):
 class EngineSeesMayaOnlySettings(unittest.TestCase):
     """Issue #686: a setting the engine reads as getenv("MAYA_...") alone must reach it when it is in a config's "env"."""
 
-    @staticmethod
-    def engine_maya_names():
-        """Every MAYA_* name the engines' sources read (getenv / env_count / env_int), so a new one is covered too."""
-        src = Path(__file__).resolve().parents[1]
-        names = set()
-        for top in ("src", "include"):
-            for f in (src / top).rglob("*"):
-                if f.suffix in (".cpp", ".cu", ".cuh", ".h", ".hpp", ".mm"):
-                    names.update(re.findall(r'(?:getenv|env_count|env_int|env)\("(MAYA_[A-Z0-9_]+)"',
-                                            f.read_text(encoding="utf-8", errors="replace")))
-        return sorted(names)
-
-    def test_config_env_reaches_the_engine_under_the_maya_name(self):
-        from serve.server import child_env
-        names = self.engine_maya_names()
-        self.assertIn("MAYA_DS4_READ_ORDER", names)               # (the audit finds the reporter's setting)
-        self.assertGreater(len(names), 30)
-        for backend in ("cuda", "hip", "metal"):
-            with self.subTest(backend=backend):
-                disk = {"exe": "x", "backend": backend, "gpu": [0], "env": {n: "7" for n in names}}
-                cfg = N.env_in(json.loads(json.dumps(disk)))      # as read from a config on disk
-                self.assertTrue(all(k.startswith("MAYA_") for k in cfg["env"]))
-                env = child_env(cfg)
-                for n in names:
-                    self.assertEqual(env.get(n), "7", n)           # what getenv("MAYA_...") reads
-                    self.assertEqual(env.get(N.read_as(n)), "7", n)   # and the older name
-
     def test_a_started_engine_reads_the_setting(self):
         """The real thing: a child started with the server's environment prints what getenv would give it."""
         import subprocess
@@ -110,14 +82,6 @@ class EngineSeesMayaOnlySettings(unittest.TestCase):
             S.apply_server_env(N.env_in({"env": {"MAYA_QUEUE_PING_S": "0.5", "MAYA_UPDATE_CHECK": "0"}}))
             self.assertEqual(S.queue_ping_seconds(), 0.5)
             self.assertEqual(os.environ["MAYA_UPDATE_CHECK"], "0")
-
-
-class EngineReadsTheConfigName(unittest.TestCase):
-    def test_the_in_place_trim_settings_are_read_under_the_config_name(self):
-        # #728: env_in leaves a config's MAYA_DS4_INPLACE_* settings under STRATA_; the engine must read that name too
-        src = (Path(__file__).resolve().parents[1] / "src" / "ds4" / "ds4_model.cu").read_text(encoding="utf-8")
-        for name in ("MAYA_DS4_INPLACE_TRIM_GB", "MAYA_DS4_INPLACE_TRIM_MS"):
-            self.assertIn(f'"{N.read_as(name)}"', src)
 
 
 if __name__ == "__main__":

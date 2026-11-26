@@ -27,17 +27,18 @@ class InklingPre(unittest.TestCase):
     CORPUS = ["hello world", "hello world 123456 and 9876", "I'M you're THEY'LL", "UTF-8: héllo, combining é",
               "tabs\tand\nnewlines\r\n  spaces   ", "emoji 👍🏽 and CJK 你好世界", "x = f(a)->b; // done"]
 
-    def test_both_names(self):
-        self.assertEqual(O200K, ("gpt-4o", "inkling"))
+    def test_gguf_names(self):
+        self.assertEqual(O200K, ("gpt-4o", "inkling", "inkling2"))
         tokens, merges = tiny_vocab()
-        a, b = (Tokenizer(tokens, merges, pre=p) for p in O200K)
-        for tk in (a, b):
+        reference = Tokenizer(tokens, merges, pre="gpt-4o")
+        for name in O200K:
+            tk = Tokenizer(tokens, merges, pre=name)
             self.assertTrue(tk.ignore_merges)
             self.assertFalse(tk._nfc)                      # (MiniMax's NFC is MiniMax's alone)
             self.assertEqual(tk._re.pattern, MINIMAX_PATTERN)
-        for s in self.CORPUS:
-            self.assertEqual(a.encode(s), b.encode(s), s)
-            self.assertEqual(a.decode(a.encode(s)), s, s)
+            for s in self.CORPUS:
+                self.assertEqual(tk.encode(s), reference.encode(s), name)
+                self.assertEqual(tk.decode(tk.encode(s)), s, name)
 
     def test_whole_vocabulary_hits(self):   # (ignore_merges: a piece that is a token is that token)
         tokens, merges = tiny_vocab()

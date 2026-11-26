@@ -5,7 +5,7 @@
 
 Some EXL3 quants (Diffbot's 3 bpw, among them) write each shard's tensors grouped by type: every expert's .trellis,
 then every .suh, every .svh, and so on.  The engine reads a layer's experts as one region an expert, taking expert
-0's piece offsets as the layout of every other (src/ds4/ds4_model.cu's expert_layout), so pack.py stops such a model
+0's piece offsets as the layout of every other (the upstream expert_layout function), so pack.py stops such a model
 with "its pieces are not together in their file".  This rewrites those shards with the same tensors in a new order:
 non-expert tensors first (their order kept), then expert by expert, each expert's w1 / w2 / w3 pieces back to back in
 the order LibertAIDAI's packs have - suh, svh, mul1 (or mcg, the drafter's codebook), trellis.  Only the order and

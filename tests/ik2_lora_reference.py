@@ -12,7 +12,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from gguf_reader import GGUFFile
-from glm_synth_gguf import kv_str, kv_f32, write_gguf
+from gguf_writer import GGUFWriter
 
 
 def overlay(folder, base, name, dims, blocks):
@@ -46,9 +46,14 @@ def check(base, exe, folder):
     b = np.zeros((rows, 2), dtype="f4")
     b[::2, 0], b[1::2, 1] = 0.5, -0.5
     adapter = folder / "rank-two.gguf"
-    write_gguf(adapter, [("general.type", kv_str("adapter")), ("adapter.type", kv_str("lora")),
-                         ("general.architecture", kv_str(model.metadata["general.architecture"])),
-                         ("adapter.lora.alpha", kv_f32(4))], [(layer + ".lora_a", a), (layer + ".lora_b", b)])
+    writer = GGUFWriter()
+    writer.add("general.type", "adapter")
+    writer.add("adapter.type", "lora")
+    writer.add("general.architecture", model.metadata["general.architecture"])
+    writer.add("adapter.lora.alpha", 4.0, "f32")
+    for suffix, matrix in [("a", a), ("b", b)]:
+        writer.add_f32(f"{layer}.lora_{suffix}", matrix, gguf_shape=list(reversed(matrix.shape)))
+    writer.write(adapter)
     base_fixture = overlay(folder / "zero", base, layer, tensor.shape, np.zeros_like(blocks))
     sources[1, :, 1] ^= 128
     golden = overlay(folder / "reference", base, layer, tensor.shape, sources[np.arange(rows) % 2])

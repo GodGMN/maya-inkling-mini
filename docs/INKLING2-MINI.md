@@ -6,7 +6,7 @@ For the experimental RX 7900 XTX build, see the [gfx1100 port notes](HIP-PORT.md
 
 ## Quick start
 
-You need Linux, an RTX 3090 or another 24 GB `sm_86` card, CUDA 12.8 with `nvcc` on the `PATH`, CMake 3.21 or newer, Ninja, and Python 3.10 or newer. The model takes 17.6 GB on disk and 23.6 GiB of VRAM at the full context.
+You need Linux, an RTX 3090 or another 24 GB `sm_86` card, CUDA 12.8 with `nvcc` on the `PATH`, CMake 3.24 or newer, Ninja, and Python 3.10 or newer. The model takes 17.6 GB on disk and 23.6 GiB of VRAM at the full context.
 
 ### 1. Build the engine
 
@@ -18,7 +18,9 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON 
 cmake --build build -j 24 --target tintero
 ```
 
-CMake downloads the pinned llama.cpp commit for ggml on its own. If the system has more than one CUDA, point CMake at the right one: `-DCUDAToolkit_ROOT=/usr/local/cuda-12.8 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc`.
+If the system has more than one CUDA, point CMake at the right one: `-DCUDAToolkit_ROOT=/usr/local/cuda-12.8 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc`.
+
+Set `CMAKE_CUDA_ARCHITECTURES` for the deployment GPU. Tintero accepts 80, 86, 89, 90a, 120 and 121, or a semicolon-separated list. A request for 90 builds 90a for Hopper’s warpgroup instructions. For DGX Spark, use a toolkit with `sm_121` support and set the architecture to 121. The ARM64 build uses the portable CPU lane.
 
 ### 2. Build the image encoder (optional)
 

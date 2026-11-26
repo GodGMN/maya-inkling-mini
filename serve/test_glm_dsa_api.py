@@ -482,7 +482,7 @@ class ThinkingBudget(_Glm53Api):
 
 # ---------------------------------------------------------------------------------------------- the Monitor's figures
 # The keys the engine printed on GLM-5.3 (glm-dsa) in a real run (2026-11-07; the values left out) - the very lines
-# GLM-5.3-Flash's engine prints (src/program/generate.cpp: the glm-fast serve start, its decode loop's STAT every 8
+# GLM-5.3-Flash's engine prints (the glm-fast serve start, its decode loop's STAT every 8
 # tokens, the 10-field DONE)
 REAL_INFO = ("context kv kv_resident expert_slots expert_cache_mib engine_kind experts vram_slots vram_gb ram_slots "
              "ram_gb mtp dflash vision_lend cpu_threads cpu_threads_max pcie_share logit_bias").split()
@@ -496,40 +496,10 @@ NOT_GLM_INFO = {"engram_lookups", "helper_allocated_bytes", "helper_slots", "gpu
                 "max_context"}
 
 
-def printf_keys(src: str, start: str, must: str = "") -> list[list[str]]:
-    """The key=... names of every printf in `src` whose format begins with `start` (its string literals joined, up to the
-    one that ends the line), and that holds `must`."""
-    import re
-    out = []
-    for m in re.finditer(re.escape('printf("' + start), src):
-        fmt, pos = "", m.start() + len("printf(")
-        while True:
-            lit = re.compile(r'\s*"((?:[^"\\]|\\.)*)"').match(src, pos)
-            if not lit:
-                break
-            fmt += lit.group(1)
-            pos = lit.end()
-            if fmt.endswith("\\n"):
-                break
-        if must in fmt:
-            out.append(re.findall(r"(\w+)=", fmt))
-    return out
-
-
 class MonitorFigures(_Glm53Api):
     """Every figure the Monitor and /metrics show for the GLM engine is printed on GLM-5.3's path: the engine's source
     (the glm-fast serve lines, shared with GLM-5.3-Flash), the real run's keys, the fake's lines, and what the server
     makes of them (/metrics).  The GPU day compares /metrics of GLM-5.3-Flash and GLM-5.3 on the real engine."""
-
-    def test_the_engine_source_prints_them(self):
-        src = (Path(__file__).resolve().parents[1] / "src/program/generate.cpp").read_text(encoding="utf-8")
-        self.assertEqual(printf_keys(src, "INFO context=", "engine_kind=glm-fast"), [REAL_INFO])
-        stats = printf_keys(src, "STAT tok_s=", " ram_slots=")  # (the GLM engine's: the Qwen path's has no RAM tier)
-        self.assertEqual(len(stats), 2)                      # one answer, and answers at once (--parallel)
-        self.assertEqual(stats[0], REAL_STAT)
-        self.assertEqual(stats[1], REAL_STAT + ["active"])
-        self.assertEqual(printf_keys(src, "VRAM dev="), [REAL_VRAM])
-        self.assertEqual(printf_keys(src, "INFO gpu_commit_capped_gb="), [["gpu_commit_capped_gb", "pagefile_hint_gb"]])
 
     def test_the_monitor_reads_only_what_the_engine_prints(self):
         import re

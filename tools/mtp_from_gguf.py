@@ -4,7 +4,7 @@ download.
 
     python tools/mtp_from_gguf.py --gguf <model>.gguf --out <pack>/mtp
 
-The block's tensors are dequantized (gguf-py) and written as the drafter reads them (src/core/mtp.cpp):
+The block's tensors are dequantized (gguf-py) and written as the drafter reads them:
   experts.bin   the 512 routed experts as Q2_0 blobs (gate/up rows interleaved, then down; codes, then scales) - the
                 drafter's only expert format.  A draft's quality only moves the acceptance rate: every drafted token is
                 checked by the model itself, so the answer is the same with or without the drafter.

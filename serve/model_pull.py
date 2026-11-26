@@ -97,6 +97,8 @@ def catalog(root: Path, glm_sizes: dict | None = None, cfg: dict | None = None, 
     their makers), "by", "note", "installed" (a config here runs it), "size_gb" (None when the setup tells it at its
     start)}].  cfg: the running model's config (its backend picks the other files offered); ccs: the NVIDIA GPUs'
     compute capabilities (None: read)."""
+    if Q.family_of(cfg or {}) == "ik2":
+        return []  # Tintero presets use a GGUF supplied by the operator.
     have = set()
     for p in models.config_paths(root):
         c = models.read(p)
