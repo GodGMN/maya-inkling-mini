@@ -272,8 +272,8 @@ struct Layer {
     bool paged_kv = false;
     bool fp4_kv = false;
     k::Fp8KvLayout fp8_layout() const {
-#ifdef STRATA_USE_HIP
         if (fp4_kv) return k::Fp8KvLayout::global_fp4();
+#ifdef STRATA_USE_HIP
         if (paged_kv) return k::Fp8KvLayout::global_pages();
 #endif
         return sliding ? kv_cap : 0;
@@ -4686,10 +4686,8 @@ int main(int argc, char** argv) {
         if (kv == "f16" || kv == "fp16") g_kv_precision = KVPrecision::f16;
         else if (kv == "fp8" || kv == "e4m3") g_kv_precision = KVPrecision::fp8;
         else if (kv == "fp8-global") g_kv_precision = KVPrecision::fp8_global;
-#ifdef STRATA_USE_HIP
         else if (kv == "fp4-global") g_kv_precision = KVPrecision::fp4_global;
-#endif
-        else die("unknown IK2_KV=" + kv + " (expected f16, fp8, fp8-global or gfx1100 fp4-global)");
+        else die("unknown IK2_KV=" + kv + " (expected f16, fp8, fp8-global or fp4-global)");
     }
     if (getenv("IK2_TRACE") && *getenv("IK2_TRACE")) {
         g_trace = std::fopen(getenv("IK2_TRACE"), "wb");
@@ -5221,9 +5219,9 @@ int main(int argc, char** argv) {
     const bool paged_kv = getenv("IK2_PAGED_KV") && atoi(getenv("IK2_PAGED_KV"));
     if (g_sparse_decode && (paged_kv || g_kv_precision != KVPrecision::fp8 || c.D != 128 || g_attn_mma != 3))
         die("IK2_SPARSE_DECODE requires token-major IK2_KV=fp8 and IK2_ATTN_MMA=3 with 128-wide heads");
-#ifdef STRATA_USE_HIP
     if (g_kv_precision == KVPrecision::fp4_global && (paged_kv || c.D != 128))
         die("fp4-global requires token-major KV and 128-wide heads");
+#ifdef STRATA_USE_HIP
     if (paged_kv && (!byte_cache(false) || c.D != 128)) die("IK2_PAGED_KV requires global E4M3 KV with 128-wide heads");
 #else
     if (paged_kv) die("IK2_PAGED_KV requires the gfx1100 backend");

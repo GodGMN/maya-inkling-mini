@@ -132,7 +132,7 @@ Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `IK2_KV` | `f16` | `fp8`: the KV cache in FP8 E4M3, half the bytes (the full layers' 32 KB a token -> 16 KB); against the reference it changed 5 of 48 top-1 tokens where FP16 changed none (docs/INKLING2.md 6.1) |
+| `IK2_KV` | `f16` | `fp8`: the KV cache in FP8 E4M3, half the bytes (the full layers' 32 KB a token -> 16 KB); against the reference it changed 5 of 48 top-1 tokens where FP16 changed none (docs/INKLING2.md 6.1). On CUDA (SM 80 and newer) and HIP (gfx1100), `fp4-global` stores global keys and values in token-major E2M1 blocks and keeps sliding layers in E4M3. Each 128-channel global head uses 72 bytes for K and 72 for V, including scales. Requires 128-wide heads and dense, unpaged attention. |
 | `IK2_WARM` | off | a profile of how often each expert is picked (written by `IK2_POP_OUT=FILE` over some prompts): the cache filled with the most picked at load, and the prompts' prefetch seeded with the counts. The first requests then do not start from an empty cache (a 600-token first request 7.0 -> 4.2 s on an H200) |
 | `IK2_EP` | off | `1` with `--gpus 2`: expert parallel - each layer's experts dealt to both GPUs by how often they are picked, each GPU its own cache and link; attention and the KV cache on GPU 0. Decode 22 -> 42 tok/s on two RTX PRO 6000s. Off, `--gpus 2` splits the layers |
 | `IK2_EP_SPLIT` | `0.55` | GPU 1's share of the picks under `IK2_EP` (GPU 0 also holds the dense weights and the cache of the KV) |
