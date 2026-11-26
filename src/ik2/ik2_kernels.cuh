@@ -400,14 +400,12 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
 /// (fixed, so the launches do not change with the position) - attn_decode_mma_blocks(Hkv) of them fill the device
 /// once, a window of w keys needs no more than w / 64.  scratch: attn_decode_mma_scratch(H, n_split) floats.
 /// gate [H][128] (or null): the output times its sigmoid (gate_mul's); out16 (or null): an FP16 copy of the output.
-#ifdef STRATA_USE_HIP
 constexpr int kSparsePages = 224, kSparsePageSize = 64;
 constexpr int kSparseFirst = 2, kSparseRecent = 24;
-void rdna3_sparse_decode(const uint16_t* q, const float* r, const float* sink, const uint8_t* kc,
+void sparse_decode(const uint16_t* q, const float* r, const float* sink, const uint8_t* kc,
                          const uint8_t* vc, int H, int Hkv, const int* pos, float qscale, float v_inv,
                          const float* proj, int dr, int extent, int* pages, float* scratch, float* out,
                          const float* gate, uint16_t* out16, cudaStream_t stream);
-#endif
 int attn_decode_mma_blocks(int Hkv);
 size_t attn_decode_mma_scratch(int H, int n_split);
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,

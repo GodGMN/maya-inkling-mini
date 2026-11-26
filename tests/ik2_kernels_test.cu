@@ -1682,8 +1682,67 @@ std::vector<uint8_t> page_cache(const std::vector<uint8_t>& linear, int heads, b
     return pages;
 }
 
-#ifdef STRATA_USE_HIP
-void test_rdna3_sparse_decode() {
+void test_sequence_kernels() {
+    constexpr int T = 5, N = 7, K = 256, ld = N + 3;
+    std::vector<int> slots = {5, 0, 3, 2, 1};
+    auto x = fvec(T * K), weights = fvec(N * 4), history = fvec(6 * 3 * N);
+    std::vector<int8_t> q(N * K);
+    std::vector<uint16_t> scale(N * K / 32);
+    for (size_t i = 0; i < q.size(); ++i) q[i] = int(i % 101) - 50;
+    for (size_t i = 0; i < scale.size(); ++i) scale[i] = f2h_host((1 + i % 7) / 64.f);
+    auto* dx = dev(x);
+    auto* dq = dev(q);
+    auto* ds = dev(scale);
+    auto* dy = dev_n<float>(T * ld);
+    auto* dw = dev(weights);
+    auto* dh = dev(history);
+    auto* ids = dev(slots);
+    auto* out = dev_n<float>(T * N);
+    cudaStream_t stream;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    CU(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CU(cudaDeviceSynchronize());
+    CU(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    k::mv_q8p_sequences(dq, ds, N, K, dx, T, dy, ld, stream);
+    k::conv_sequences(ids, T, dy, ld, {0, N, dh, dw, nullptr, 0, nullptr, out}, stream);
+    CU(cudaStreamEndCapture(stream, &graph));
+    CU(cudaGraphInstantiate(&exec, graph, 0));
+    std::vector<double> projected(T * ld), convolved(T * N), hist(history.begin(), history.end());
+    for (int t = 0; t < T; ++t) {
+        for (int n = 0; n < N; ++n) {
+            double& v = projected[t * ld + n];
+            for (int i = 0; i < K; ++i)
+                v += double(x[t * K + i]) * q[n * K + i] * h2f_host(scale[(n * K + i) / 32]);
+        }
+    }
+    for (int replay = 0; replay < 2; ++replay) {
+        CU(cudaMemcpy(ids, slots.data(), T * sizeof(int), cudaMemcpyHostToDevice));
+        CU(cudaGraphLaunch(exec, stream));
+        CU(cudaStreamSynchronize(stream));
+        for (int t = 0; t < T; ++t) {
+            for (int n = 0; n < N; ++n) {
+                const double v = projected[t * ld + n];
+                const int h = slots[t] * 3 * N + n;
+                double y = v * weights[n * 4 + 3];
+                for (int j = 0; j < 3; ++j) y += hist[h + j * N] * weights[n * 4 + j];
+                convolved[t * N + n] = y;
+                hist[h] = hist[h + N];
+                hist[h + N] = hist[h + 2 * N];
+                hist[h + 2 * N] = v;
+            }
+        }
+        expect("sequence convolution", host(out, T * N), convolved, 2e-5, 2e-5);
+        expect("sequence slot histories", host(dh, hist.size()), hist, 2e-5, 2e-5);
+        std::reverse(slots.begin(), slots.end());
+    }
+    expect("sequence projection and padding", host(dy, T * ld), projected, 2e-5, 2e-5);
+    CU(cudaGraphExecDestroy(exec)); CU(cudaGraphDestroy(graph)); CU(cudaStreamDestroy(stream));
+    CU(cudaFree(dx)); CU(cudaFree(dq)); CU(cudaFree(ds)); CU(cudaFree(dy)); CU(cudaFree(dw));
+    CU(cudaFree(dh)); CU(cudaFree(ids)); CU(cudaFree(out));
+}
+
+void test_sparse_decode() {
     // Different landmark keys win for each KV head. The last page has one live token.
     constexpr int H = 4, KV = 2, D = 128, n = 32769, page_size = 64;
     constexpr int budget = k::kSparsePages, total = (n + page_size - 1) / page_size;
@@ -1702,17 +1761,19 @@ void test_rdna3_sparse_decode() {
     auto* dk = dev(keys);
     auto* dv = dev(values);
     auto* pos = dev(std::vector<int>{n - 1});
-    auto* zero = dev(std::vector<float>(H, 0.f));
+    auto* rel = dev(std::vector<float>(H, 1.f));
+    auto* projection = dev(std::vector<float>{4.f, 2.f});
+    auto* sink = dev(std::vector<float>(H, 8.f));
     auto* pages = dev_n<int>(KV * budget);
     auto* out = dev_n<float>(H * D);
     auto* scratch = dev_n<float>(k::attn_decode_mma_scratch(H, 64));
-    k::rdna3_sparse_decode(dq, zero, zero, dk, dv, H, KV, pos, 1.f, 1.f, zero, 1, 1,
+    k::sparse_decode(dq, rel, sink, dk, dv, H, KV, pos, 1.f, 1.f, projection, 1, 2,
                             pages, scratch, out, nullptr, nullptr, nullptr);
     const auto actual = host(pages, KV * budget);
     std::vector<int> selected(KV * budget);
     std::vector<double> expected(H * D);
     for (int kv = 0; kv < KV; ++kv) {
-        double z[2] = {1., 1.}, sum[2] = {}; // sink
+        double z[2] = {std::exp(8.), std::exp(8.)}, sum[2] = {}; // sink
         for (int slot = 0; slot < budget; ++slot) {
             int page = slot;
             if (slot >= budget - 24) page = total - budget + slot;
@@ -1727,7 +1788,8 @@ void test_rdna3_sparse_decode() {
             for (int t = page * page_size; t < std::min(n, (page + 1) * page_size); ++t) {
                 const size_t row = (size_t(t) * KV + kv) * D;
                 for (int h = 0; h < 2; ++h) {
-                    const double w = keys[row + h] ? std::exp(4.) : 1.;
+                    const double bias = t == n - 1 ? 4. : t == n - 2 ? 2. : 0.;
+                    const double w = std::exp((keys[row + h] ? 4. : 0.) + bias);
                     z[h] += w;
                     sum[h] += w * (values[row] == 0x40 ? 2. : -1.);
                 }
@@ -1737,10 +1799,12 @@ void test_rdna3_sparse_decode() {
     }
     expect_true("sparse page ids by KV head", actual == selected);
     expect("sparse decode vs selected-key FP64", host(out, H * D), expected, 2e-3, 5e-5);
-    CU(cudaFree(dq)); CU(cudaFree(dk)); CU(cudaFree(dv)); CU(cudaFree(pos)); CU(cudaFree(zero));
+    CU(cudaFree(dq)); CU(cudaFree(dk)); CU(cudaFree(dv)); CU(cudaFree(pos));
+    CU(cudaFree(rel)); CU(cudaFree(projection)); CU(cudaFree(sink));
     CU(cudaFree(pages)); CU(cudaFree(out)); CU(cudaFree(scratch));
 }
 
+#ifdef STRATA_USE_HIP
 void test_rdna3_deep_attention() {
     constexpr int n = 392957, D = 128, H = 3, T = 2, splits = 512, padded = ((n + 15) / 16) * 16;
     const int marks[] = {n / 20, n / 2, 19 * n / 20, n - 1};
@@ -3706,7 +3770,67 @@ void test_rdna3_speculative_kernels() {
 }
 #endif
 
-int main() {
+#ifndef STRATA_USE_HIP
+// A forced peak of six fixes each vector's UE4M3 scale. Off-grid inputs
+// distinguish native quantization from the FP16 fallback.
+void test_blackwell_group(int members, int K, int N, bool gate) {
+    const int blocks = K / 64;
+    const size_t matrix = (size_t)N * blocks * 36;
+    auto weights = rand_blocks(k::kNVFP4, (size_t)2 * N * K);
+    for (size_t i = 0; i < weights.size(); i += 36)
+        for (int j = 0; j < 4; ++j)
+            weights[i+j] = (i / 36 + j) % 11 == 0 ? 0x7f : uint8_t(rng() % 30);
+    const float levels[] = {0, .5f, 1.125f, 1.5f, 1.875f, 3, 4, 6};
+    const double rounded[] = {0, .5, 1, 1.5, 2, 3, 4, 6};
+    std::vector<uint16_t> x(members * K);
+    std::vector<double> quant(x.size());
+    for (int m = 0; m < members; ++m) {
+        for (int k = 0; k < K; ++k) {
+            const int code = k % 16 == 0 ? 7 : rng() % 8;
+            const float scale = std::ldexp(1.f + (k / 16 % 4) * .125f, (m + k / 16) % 6 - 4) *
+                                ((rng() & 1) ? 1.f : -1.f);
+            x[m*K+k] = f2h_host(scale * (members == 1 ? rounded[code] : levels[code]));
+            quant[m*K+k] = scale * rounded[code];
+        }
+    }
+    std::vector<int> order(k::kGroupMax), token(k::kGroupMax);
+    for (int i = 0; i < members; ++i) order[i] = members - 1 - i, token[i] = i;
+    auto *dx = dev(x), *dh = dev_n<uint16_t>(members*N);
+    auto* dy = dev_n<float>(members*N);
+    auto* dw = dev(weights);
+    auto** blob = dev(std::vector<const uint8_t*>{dw});
+    auto* count = dev(std::vector<int>{members});
+    auto *row = dev(order), *tok = dev(token);
+    std::vector<float> actual;
+    if (gate) {
+        k::experts_gate_up_swiglu_g(blob, count, tok, row, 1, k::kNVFP4, k::kNVFP4, matrix, nullptr,
+                                    K, N, nullptr, nullptr, 20, 20, dh, 0, dx);
+        for (uint16_t h : host(dh, members*N)) actual.push_back(h2f_host(h));
+    } else {
+        k::experts_down_g(blob, count, row, 1, k::kNVFP4, matrix, dx, N, K, dy, 0);
+        actual = host(dy, members*N);
+    }
+    std::vector<double> expected(actual.size());
+    for (int m = 0; m < members; ++m) {
+        for (int r = 0; r < N; ++r) {
+            double a = 0, b = 0;
+            for (int k = 0; k < K; ++k) {
+                const double v = quant[m*K+k];
+                a += v * nvfp4_def(weights.data(), r*K+k);
+                b += v * nvfp4_def(weights.data()+matrix, r*K+k);
+            }
+            if (gate) expected[order[m]*N+r] = 20 * std::tanh(a/20) / (1 + std::exp(-a)) * 20 * std::tanh(b/20);
+            else expected[m*N+r] = b;
+        }
+    }
+    expect(gate ? "Blackwell FP4 SwiGLU vs FP64" : "Blackwell FP4 down vs FP64",
+           actual, expected, gate ? 6e-4 : 1e-5, gate ? 5e-5 : 1e-5);
+    CU(cudaFree(dx)); CU(cudaFree(dh)); CU(cudaFree(dy)); CU(cudaFree(dw));
+    CU(cudaFree(blob)); CU(cudaFree(count)); CU(cudaFree(row)); CU(cudaFree(tok));
+}
+#endif
+
+int main(int argc, char** argv) {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
     cudaDeviceProp p{};
@@ -3715,6 +3839,17 @@ int main() {
     std::printf("ik2_kernels_test on %s (%s)\n", p.name, p.gcnArchName);
 #else
     std::printf("ik2_kernels_test on %s (sm_%d%d)\n", p.name, p.major, p.minor);
+#endif
+#ifndef STRATA_USE_HIP
+    if (argc == 2 && !std::strcmp(argv[1], "--blackwell")) {
+        if (p.major != 12 || p.minor > 1) return 77;
+        setenv("IK2_BLACKWELL_NVFP4", "1", 1);
+        for (bool gate : {false, true}) {
+            test_blackwell_group(1, 64, gate ? 8 : 16, gate);
+            test_blackwell_group(7, 320, gate ? 24 : 48, gate);
+        }
+        return g_fail ? 1 : 0;
+    }
 #endif
     test_rms();
     test_project_out();
@@ -3768,8 +3903,9 @@ int main() {
     test_experts_mma(2304, 1152, 1);
     test_rdna3_speculative_kernels();
     test_rdna3_deep_attention();
-    test_rdna3_sparse_decode();
 #endif
+    test_sequence_kernels();
+    test_sparse_decode();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -437,7 +437,17 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
         const uint16_t* w = sink_w + (size_t) h * sink_k;
         const float* sx = sink_x + (size_t) t * sink_k;
         float a = 0.0f;
-        for (int j = lane; j < sink_k; j += 32) a += h2f(w[j]) * sx[j];
+#ifndef STRATA_USE_HIP
+        if ((sink_k & 127) == 0 && ((uintptr_t)w & 7) == 0 && ((uintptr_t)sx & 15) == 0) {
+            for (int j = lane * 4; j < sink_k; j += 128) {
+                const uint2 wh = *(const uint2*)(w + j);
+                const float2 w01 = u32_to_f2(wh.x), w23 = u32_to_f2(wh.y);
+                const float4 xv = *(const float4*)(sx + j);
+                a = fmaf(w01.x, xv.x, fmaf(w01.y, xv.y, fmaf(w23.x, xv.z, fmaf(w23.y, xv.w, a))));
+            }
+        } else
+#endif
+            for (int j = lane; j < sink_k; j += 32) a += h2f(w[j]) * sx[j];
         a = wsum(a);
         if (lane == 0) sink_y[(size_t) t * H + h] = a;
         return;
@@ -1463,19 +1473,20 @@ __device__ __forceinline__ int wa_active(int qpos, int window, int nw, int& k_lo
     return min(nw, (n_steps + kWaMin - 1) / kWaMin);
 }
 
-template <class KVT>
+template <class KVT, bool Sparse = false>
 __global__ void __launch_bounds__(kWaNW * 32, 4)
 attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
                        int kv_cap, int H, int Hkv, const int* pos_d, int qpos, float qk_scale,
                        const float* __restrict__ r, const float* __restrict__ proj, int d_rel, bool rel4, int extent,
-                       int window, int n_split, float* __restrict__ o_part, float2* __restrict__ ml_part) {
+                       int window, int n_split, float* __restrict__ o_part, float2* __restrict__ ml_part, const int* pages = nullptr) {
     constexpr bool F8 = sizeof(KVT) == 1;
     if (pos_d) qpos = *pos_d;   // (a token of a replayed graph: its position read here)
     const int lane = threadIdx.x & 31, gr = lane >> 2, tq = lane & 3;
     const int g = blockIdx.x, R = H / Hkv, KD = Hkv * kFaD;
     const int w = blockIdx.y * kWaNW + (threadIdx.x >> 5);   // this warp of the K / V head's
     int k_lo, n_steps;
-    const int n_act = wa_active(qpos, window, n_split * kWaNW, k_lo, n_steps);
+    const int last_offset = Sparse ? (kSparsePages - 1) * kSparsePageSize + qpos % kSparsePageSize : qpos;
+    const int n_act = wa_active(last_offset, window, n_split * kWaNW, k_lo, n_steps);
     if (w >= n_act) return;
     const int per = (n_steps + n_act - 1) / n_act;
     const int st0 = min(n_steps, w * per), st1 = min(n_steps, st0 + per);
@@ -1504,7 +1515,10 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__
     const uint32_t psel = (gr & 1) ? 0x7632u : 0x5410u;
 
     for (int st = st0; st < st1; ++st) {
-        const int kt = k_lo + st * 16, kmax = qpos - kt;
+        int kt = k_lo + st * 16;
+        if constexpr (Sparse)
+            kt = pages[g * kSparsePages + kt / kSparsePageSize] * kSparsePageSize + kt % kSparsePageSize;
+        const int kmax = qpos - kt;
         const int row0 = kv_cap > 0 ? kt % kv_cap : kt;
         // a key's row in the cache (a key past the token's: the token's row, its logits masked below)
         auto row = [&](int key) {
@@ -2899,11 +2913,18 @@ __device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) {
     return f;
 }
 
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
+#define IK2_HAS_NATIVE_NVFP4
+#include "ik2_blackwell.cuh"
+#endif
+#endif
+
 template <bool Gate, int Splits, bool Q8 = false>
 __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, size_t offset, int C, int F,
                                    const uint16_t* h, uint16_t* hidden, float* out, const float* sg, const float* su,
                                    float gcap, float ucap, const int* counts, const int* rows_out,
-                                   const uint16_t* input16 = nullptr) {
+                                   const uint16_t* input16 = nullptr, bool native_fp4 = false) {
     static constexpr int rows = Gate ? 8 : 16;
     const int lane = threadIdx.x & 31, split = threadIdx.x / 32, grp = lane / 4, sub = lane % 4;
     const int s = blockIdx.y, r = blockIdx.x * rows + grp, K = Gate ? C : F;
@@ -2945,6 +2966,14 @@ __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, 
         for (int k = split; k < K / 64; k += Splits) {
             const uint8_t* ap = a + k * 36;
             const uint8_t* bp = b + k * 36;
+#ifdef IK2_HAS_NATIVE_NVFP4
+            // 0xff is outside the serialized UE4M3 range, but the reference
+            // decoder accepts it. Preserve its legacy value on that block.
+            if (native_fp4 && __all_sync(0xffffffff, ap[sub] != 255 && bp[sub] != 255)) {
+                bw_nvfp4_dot(v, ap, bp, (Gate ? input16 : h) + (size_t)input_row * K + k * 64);
+                continue;
+            }
+#endif
             uint32_t sa = f2h(ue4m3(ap[sub])), sb = f2h(ue4m3(bp[sub]));
             sa |= sa << 16;
             sb |= sb << 16;
@@ -5742,6 +5771,40 @@ void attn_probs_bias_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk
                                                                                    qk_scale, bias, extent, window, sink);
     check("attn_probs_bias_f16");
 }
+// One wave chooses a page for one temporal bin and KV head. Sample two keys
+// per candidate and keep the strongest dot product across the grouped queries.
+__global__ void select_sparse_pages(const uint16_t* q, const uint8_t* kc, int group, int Hkv,
+                                   const int* pos, int* pages) {
+    const int slot = blockIdx.x, head = blockIdx.y, lane = threadIdx.x;
+    const int total = *pos / kSparsePageSize + 1;
+    int* selected = pages + head * kSparsePages + slot;
+    if (slot < kSparseFirst || slot >= kSparsePages - kSparseRecent) {
+        if (!lane) *selected = slot < kSparseFirst ? slot : total - kSparsePages + slot;
+        return;
+    }
+    constexpr int bins = kSparsePages - kSparseFirst - kSparseRecent;
+    const int bin = slot - kSparseFirst, middle = total - kSparseFirst - kSparseRecent;
+    const int lo = kSparseFirst + int((int64_t)bin * middle / bins);
+    const int hi = kSparseFirst + int((int64_t)(bin + 1) * middle / bins);
+    float best = -INFINITY;
+    int chosen = lo;
+    for (int page = lo; page < hi; ++page) {
+        for (int sample = 16; sample < kSparsePageSize; sample += 32) {
+            const size_t row = (size_t)(page * kSparsePageSize + sample) * Hkv + head;
+            uint32_t bytes;
+            __builtin_memcpy(&bytes, kc + row * 128 + lane * 4, sizeof(bytes));
+            const float2 a = e4m3fnx2_to_f2((uint16_t)bytes), b = e4m3fnx2_to_f2(bytes >> 16);
+            for (int h = 0; h < group; ++h) {
+                const uint16_t* x = q + (head * group + h) * 128 + lane * 4;
+                float dot = h2f(x[0])*a.x + h2f(x[1])*a.y + h2f(x[2])*b.x + h2f(x[3])*b.y;
+                for (int shift = 16; shift; shift >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, shift);
+                if (!lane && dot > best) { best = dot; chosen = page; }
+            }
+        }
+    }
+    if (!lane) *selected = chosen;
+}
+
 #ifdef STRATA_USE_HIP
 #include "ik2_attention_rdna3.cuh"
 template <class KV>
@@ -6332,6 +6395,17 @@ void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok,
 }
 // The serving engine can retain the original short-prompt arithmetic and enable
 // the grouped tensor-core path only in a window whose tokens are being verified.
+#ifndef STRATA_USE_HIP
+static bool use_blackwell_nvfp4() {
+    static const bool enabled = getenv("IK2_BLACKWELL_NVFP4") && atoi(getenv("IK2_BLACKWELL_NVFP4"));
+    if (!enabled) return false;
+    int dev, major, minor;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) return false;
+    return major == 12 && minor <= 1;
+}
+#endif
 thread_local bool grouped_tensor_products = true;
 void enable_grouped_tensor_products(bool enabled) { grouped_tensor_products = enabled; }
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
@@ -6339,9 +6413,10 @@ void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, in
     if (G <= 0) return;
 #ifndef STRATA_USE_HIP
     static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 2);
-    if (grouped_tensor_products && use_group_mma && ty_down == kNVFP4 && C % 16 == 0 && F % 64 == 0) {
+    const bool native_fp4 = use_blackwell_nvfp4();
+    if (grouped_tensor_products && (use_group_mma || native_fp4) && ty_down == kNVFP4 && C % 16 == 0 && F % 64 == 0) {
         grouped_expert_mma<false, 4><<<dim3(C / 16, G), 128, 0, s>>>(blob, nullptr, off_down, C, F, h, nullptr, y,
-                                                                     nullptr, nullptr, 0, 0, n, row);
+                                                                     nullptr, nullptr, 0, 0, n, row, nullptr, native_fp4);
         check("grouped_expert_mma (grouped)");
         return;
     }
@@ -6404,9 +6479,10 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
     if (G <= 0) return;
 #ifndef STRATA_USE_HIP
     static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 1);
-    if (grouped_tensor_products && use_group_mma && input16 && ty_gate == kNVFP4 && ty_up == kNVFP4 && F % 8 == 0 && C % 64 == 0) {
+    const bool native_fp4 = use_blackwell_nvfp4();
+    if (grouped_tensor_products && (use_group_mma || native_fp4) && input16 && ty_gate == kNVFP4 && ty_up == kNVFP4 && F % 8 == 0 && C % 64 == 0) {
         grouped_expert_mma<true, 4><<<dim3(F / 8, G), 128, 0, s>>>(blob, tok, eb0, C, F, nullptr, h, nullptr, sg, su,
-                                                                   gcap, ucap, n, row, input16);
+                                                                   gcap, ucap, n, row, input16, native_fp4);
         check("grouped_expert_mma (grouped)");
         return;
     }
@@ -6630,6 +6706,12 @@ void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStrea
         check("rdna3_mv_f16_row");
         return;
     }
+#else
+    if ((K & 127) == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)x & 15) == 0) {
+        mv_f16_rows_vec_kernel<1><<<(unsigned)((N + 3) / 4), 128, 0, s>>>(W, N, K, x, K, y, N);
+        check("mv_f16_vec");
+        return;
+    }
 #endif
     mv_f16_kernel<4><<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(W, N, K, x, y);
     check("mv_f16");
@@ -6777,21 +6859,31 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
 }
 
 
-#ifdef STRATA_USE_HIP
-void rdna3_sparse_decode(const uint16_t* q, const float* r, const float* sink, const uint8_t* kc,
+void sparse_decode(const uint16_t* q, const float* r, const float* sink, const uint8_t* kc,
                          const uint8_t* vc, int H, int Hkv, const int* pos, float qscale, float v_inv,
                          const float* proj, int dr, int extent, int* pages, float* scratch, float* out,
                          const float* gate, uint16_t* out16, cudaStream_t stream) {
     constexpr int splits = 64;
-    rdna3_select_pages<<<dim3(kSparsePages, Hkv), 32, 0, stream>>>(q, kc, H / Hkv, Hkv, pos, pages);
-    check("rdna3_select_pages");
+    select_sparse_pages<<<dim3(kSparsePages, Hkv), 32, 0, stream>>>(q, kc, H / Hkv, Hkv, pos, pages);
+    check("select_sparse_pages");
+#ifdef STRATA_USE_HIP
     rdna3_attn_part<false, false, 1, true, false, false, true><<<dim3(Hkv, splits), 32, 0, stream>>>(
         q, r, kc, vc, 0, H, Hkv, pos, 0, qscale, proj, dr, extent, 1 << 30, scratch, 1, H * 128, nullptr, 0, pages);
     check("rdna3 sparse attention");
     combine_token_splits(sink, scratch, H, splits, v_inv, out, gate, out16, stream);
-    check("rdna3 sparse attention combine");
-}
+#else
+    constexpr int warps = splits * kWaNW;
+    float2* ml = reinterpret_cast<float2*>(scratch + size_t(warps) * H * kFaD);
+    const bool rel4 = dr % 4 == 0 && (((uintptr_t)r | (uintptr_t)proj) & 15) == 0;
+    attn_decode_mma_kernel<uint8_t, true><<<dim3(Hkv, splits), kWaNW * 32, 0, stream>>>(
+        q, kc, vc, 0, H, Hkv, pos, 0, qscale, r, proj, dr, rel4, extent, 1 << 30, splits, scratch, ml, pages);
+    check("sparse attention");
+    // Even a partial last page leaves more than one tile for every warp.
+    attn_decode_mma_combine_kernel<<<H, kFaD, (kFaD + warps) * sizeof(float), stream>>>(
+        scratch, ml, splits, H, sink, v_inv, nullptr, kSparsePages * kSparsePageSize - 1, 1 << 30, gate, out, out16);
 #endif
+    check("sparse attention combine");
+}
 
 int attn_decode_mma_blocks(int Hkv) {
 #ifdef STRATA_USE_HIP
@@ -7038,17 +7130,22 @@ void rollback_block(const ConvRec* recs, int n_recs, int n, cudaStream_t s) {
 void mv_f16_rows(const uint16_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
                  cudaStream_t s) {
     if (N <= 0 || T <= 0) return;
-    if (T >= 1 && T <= 8 && (K & 127) == 0 && (x_ld & 3) == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)x & 15) == 0) {
+    if ((K & 127) == 0 && (x_ld & 3) == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)x & 15) == 0) {
         const unsigned blocks = (unsigned) ((N + 3) / 4);
-        switch (T) {
-            case 1: mv_f16_rows_vec_kernel<1><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 2: mv_f16_rows_vec_kernel<2><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 3: mv_f16_rows_vec_kernel<3><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 4: mv_f16_rows_vec_kernel<4><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 5: mv_f16_rows_vec_kernel<5><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 6: mv_f16_rows_vec_kernel<6><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 7: mv_f16_rows_vec_kernel<7><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 8: mv_f16_rows_vec_kernel<8><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
+        for (int off = 0; off < T; off += 8) {
+            const int chunk = std::min(8, T - off);
+            const float* xp = x + (size_t) off * x_ld;
+            float* yp = y + (size_t) off * y_ld;
+            switch (chunk) {
+                case 1: mv_f16_rows_vec_kernel<1><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 2: mv_f16_rows_vec_kernel<2><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 3: mv_f16_rows_vec_kernel<3><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 4: mv_f16_rows_vec_kernel<4><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 5: mv_f16_rows_vec_kernel<5><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 6: mv_f16_rows_vec_kernel<6><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 7: mv_f16_rows_vec_kernel<7><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 8: mv_f16_rows_vec_kernel<8><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+            }
         }
         check("mv_f16_rows_vec");
         return;
