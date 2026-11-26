@@ -24,10 +24,10 @@ struct Fp8KvLayout {
     const bool fp4;
 #ifdef STRATA_USE_HIP
     static constexpr Fp8KvLayout global_pages() { return Fp8KvLayout(true, false); }
+#endif
     static constexpr Fp8KvLayout global_fp4() { return Fp8KvLayout(false, true); }
 private:
     constexpr Fp8KvLayout(bool pages, bool packed) : ring_capacity(0), paged(pages), fp4(packed) {}
-#endif
 };
 
 // E2M1 cache block. The FP16 scale applies to 32 consecutive channels within a KV head.
