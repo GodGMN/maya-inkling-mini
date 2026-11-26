@@ -69,7 +69,20 @@ The answer is in `choices[0].message.content`. To connect a client, set its base
 
 - [Vision](docs/HIP-PORT.md#image-encoder-on-the-ryzen-5-3600) requires the image encoder and `mmproj-F16.gguf`. The r6 image includes the encoder.
 - [Runtime settings](docs/README.md#settings) cover context size, concurrent requests, sparse decode, and runtime ablation.
-- [CUDA on the RTX 3090](docs/HIP-PORT.md#cuda-build-check) compiled on an earlier revision. The current release has been tested on the RX 7900 XTX only.
+- **NVIDIA CUDA (`sm_80+`, Linux):** Verified on an **NVIDIA A100-SXM4-80GB** (CUDA 13.0, `sm_80`) with the current `tintero` release: `ik2_kernels_test` passes all checks, and `Inkling-2-Mini-IQ4_NL.gguf` (all 3,072 experts + 393,216-token FP8 KV cache in VRAM) runs single-stream at **98.8 tokens/s** decode (**95.6 tokens/s** with `v21-pc4` runtime abliteration, `-3.3%`) and **2,155–2,184 tokens/s** prefill (4K–32K) using the default CUDA flags. The RX 7900 XTX remains the heavily tuned primary target (117.1 tokens/s single-stream and up to 327.8 tokens/s with `IK2_BATCH`); CUDA currently runs single-stream (`IK2_BATCH` and sparse long-context decode are HIP-only for now) and has not had a CUDA-specific decode-tuning pass yet.
+
+<details>
+<summary>Build Tintero for NVIDIA CUDA (Ampere sm_80+ on Linux)</summary>
+
+```sh
+cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=native
+cmake --build build-cuda --target tintero ik2_kernels_test -j4
+./build-cuda/ik2_kernels_test
+```
+
+</details>
 
 ## Credits
 
