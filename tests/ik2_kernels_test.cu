@@ -3770,7 +3770,67 @@ void test_rdna3_speculative_kernels() {
 }
 #endif
 
-int main() {
+#ifndef STRATA_USE_HIP
+// A forced peak of six fixes each vector's UE4M3 scale. Off-grid inputs
+// distinguish native quantization from the FP16 fallback.
+void test_blackwell_group(int members, int K, int N, bool gate) {
+    const int blocks = K / 64;
+    const size_t matrix = (size_t)N * blocks * 36;
+    auto weights = rand_blocks(k::kNVFP4, (size_t)2 * N * K);
+    for (size_t i = 0; i < weights.size(); i += 36)
+        for (int j = 0; j < 4; ++j)
+            weights[i+j] = (i / 36 + j) % 11 == 0 ? 0x7f : uint8_t(rng() % 30);
+    const float levels[] = {0, .5f, 1.125f, 1.5f, 1.875f, 3, 4, 6};
+    const double rounded[] = {0, .5, 1, 1.5, 2, 3, 4, 6};
+    std::vector<uint16_t> x(members * K);
+    std::vector<double> quant(x.size());
+    for (int m = 0; m < members; ++m) {
+        for (int k = 0; k < K; ++k) {
+            const int code = k % 16 == 0 ? 7 : rng() % 8;
+            const float scale = std::ldexp(1.f + (k / 16 % 4) * .125f, (m + k / 16) % 6 - 4) *
+                                ((rng() & 1) ? 1.f : -1.f);
+            x[m*K+k] = f2h_host(scale * (members == 1 ? rounded[code] : levels[code]));
+            quant[m*K+k] = scale * rounded[code];
+        }
+    }
+    std::vector<int> order(k::kGroupMax), token(k::kGroupMax);
+    for (int i = 0; i < members; ++i) order[i] = members - 1 - i, token[i] = i;
+    auto *dx = dev(x), *dh = dev_n<uint16_t>(members*N);
+    auto* dy = dev_n<float>(members*N);
+    auto* dw = dev(weights);
+    auto** blob = dev(std::vector<const uint8_t*>{dw});
+    auto* count = dev(std::vector<int>{members});
+    auto *row = dev(order), *tok = dev(token);
+    std::vector<float> actual;
+    if (gate) {
+        k::experts_gate_up_swiglu_g(blob, count, tok, row, 1, k::kNVFP4, k::kNVFP4, matrix, nullptr,
+                                    K, N, nullptr, nullptr, 20, 20, dh, 0, dx);
+        for (uint16_t h : host(dh, members*N)) actual.push_back(h2f_host(h));
+    } else {
+        k::experts_down_g(blob, count, row, 1, k::kNVFP4, matrix, dx, N, K, dy, 0);
+        actual = host(dy, members*N);
+    }
+    std::vector<double> expected(actual.size());
+    for (int m = 0; m < members; ++m) {
+        for (int r = 0; r < N; ++r) {
+            double a = 0, b = 0;
+            for (int k = 0; k < K; ++k) {
+                const double v = quant[m*K+k];
+                a += v * nvfp4_def(weights.data(), r*K+k);
+                b += v * nvfp4_def(weights.data()+matrix, r*K+k);
+            }
+            if (gate) expected[order[m]*N+r] = 20 * std::tanh(a/20) / (1 + std::exp(-a)) * 20 * std::tanh(b/20);
+            else expected[m*N+r] = b;
+        }
+    }
+    expect(gate ? "Blackwell FP4 SwiGLU vs FP64" : "Blackwell FP4 down vs FP64",
+           actual, expected, gate ? 6e-4 : 1e-5, gate ? 5e-5 : 1e-5);
+    CU(cudaFree(dx)); CU(cudaFree(dh)); CU(cudaFree(dy)); CU(cudaFree(dw));
+    CU(cudaFree(blob)); CU(cudaFree(count)); CU(cudaFree(row)); CU(cudaFree(tok));
+}
+#endif
+
+int main(int argc, char** argv) {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
     cudaDeviceProp p{};
@@ -3779,6 +3839,17 @@ int main() {
     std::printf("ik2_kernels_test on %s (%s)\n", p.name, p.gcnArchName);
 #else
     std::printf("ik2_kernels_test on %s (sm_%d%d)\n", p.name, p.major, p.minor);
+#endif
+#ifndef STRATA_USE_HIP
+    if (argc == 2 && !std::strcmp(argv[1], "--blackwell")) {
+        if (p.major != 12 || p.minor > 1) return 77;
+        setenv("IK2_BLACKWELL_NVFP4", "1", 1);
+        for (bool gate : {false, true}) {
+            test_blackwell_group(1, 64, gate ? 8 : 16, gate);
+            test_blackwell_group(7, 320, gate ? 24 : 48, gate);
+        }
+        return g_fail ? 1 : 0;
+    }
 #endif
     test_rms();
     test_project_out();

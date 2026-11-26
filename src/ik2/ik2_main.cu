@@ -5768,9 +5768,44 @@ int main(int argc, char** argv) {
             const double tw = now();
             const uint64_t m0 = EC.misses, b0 = EC.bytes_up;
             int n = 0;
-            for (int l = 0; l < c.n_layer; ++l)
-                for (int e = 0; e < c.E; ++e)
-                    if (!EC.has(l, e)) EC.get(M.L[l], l, e, EC.tick, g_cs, nullptr, true, true), ++n;
+            int max_bulk_pitch = 0;
+#ifndef STRATA_USE_HIP
+            int integrated = 0;
+            CU(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, d));
+            const char* fast_load = getenv("IK2_FAST_LOAD");
+            if (host_mmap && EC.tp < 0 && (fast_load ? atoi(fast_load) != 0 : integrated != 0))
+                CU(cudaDeviceGetAttribute(&max_bulk_pitch, cudaDevAttrMaxPitch, d));
+#endif
+            for (int l = 0; l < c.n_layer; ++l) {
+                const Layer& ly = M.L[l];
+                const size_t pitch = EC.pools[EC.layer_pool[l]].slot_bytes;
+                const bool bulk = std::max({pitch, ly.stride[0], ly.stride[1], ly.stride[2]}) <= (size_t)max_bulk_pitch;
+                // Warm profiles can leave holes. Only combine consecutive missing
+                // experts that the allocator placed in consecutive physical slots.
+                uint8_t* first = nullptr;
+                int start = 0, count = 0;
+                auto flush = [&] {
+                    if (!count) return;
+                    size_t offset = 0;
+                    for (int r = 0; r < 3; ++r) {
+                        CU(cudaMemcpy2DAsync(first + offset, pitch, ly.host[r] + (size_t)start * ly.stride[r],
+                                             ly.stride[r], ly.eb[r], count, cudaMemcpyHostToDevice, g_cs));
+                        offset += ly.eb[r];
+                    }
+                    EC.bytes_up += count * offset;
+                    count = 0;
+                };
+                for (int e = 0; e < c.E; ++e) {
+                    if (EC.has(l, e)) continue;
+                    uint8_t* dst = EC.get(ly, l, e, EC.tick, g_cs, nullptr, !bulk, true);
+                    ++n;
+                    if (!bulk) continue;
+                    if (count && (e != start + count || dst != first + count * pitch)) flush();
+                    if (!count) first = dst, start = e;
+                    ++count;
+                }
+                flush();
+            }
             CU(cudaStreamSynchronize(g_cs));
             ++EC.tick;
             for (int l = 0; l < c.n_layer; ++l) {
