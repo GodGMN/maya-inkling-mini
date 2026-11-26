@@ -64,7 +64,15 @@ if host_vision.is_file():
         (directory / f"ik2-mini-gfx1100-fp4-{slots}.json").write_text(json.dumps(preset, indent=2) + "\n")
 PYCONFIG
 fi
-cp -R "$root/serve" "$root/tools" "$context/"
+cp -R "$root/serve" "$context/"
+mkdir "$context/tools" "$context/tests"
+cp "$root/tests"/ik2*.py "$context/tests/"
+cp -R "$root/ref" "$context/ref"
+cp -R "$root/tools"/ik2* "$context/tools/"
+for name in strata_tokenizer gguf_reader gguf_writer maya_quants maya_names ablate_fit needle_bench inkling2_gguf; do
+    cp "$root/tools/$name.py" "$context/tools/"
+done
+cp "$root/third_party/ggml/LICENSE" "$context/LICENSE.ggml"
 find "$context" -name __pycache__ -type d -prune -exec rm -rf '{}' +
 docker buildx build --load --resource memory=6g --resource memory-swap=6g \
     --resource cpu-period=100000 --resource cpu-quota=400000 \

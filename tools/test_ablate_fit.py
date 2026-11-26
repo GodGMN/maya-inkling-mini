@@ -127,7 +127,7 @@ class Eval(unittest.TestCase):
 
 class EndToEnd(unittest.TestCase):
     """prompts -> collect -> fit -> eval against a fake server whose 'engine' appends the read-out records the way
-    src/core/ablate_capture.hpp does (the harmful prompts' layer-2 attention write carries a planted direction)."""
+    the capture protocol specifies (the harmful prompts' layer-2 attention write carries a planted direction)."""
 
     def test_collect_fit_eval(self):
         import http.server

@@ -385,7 +385,7 @@ def main() -> int:
         # unsloth's "glm5next" - the KV PREFIX follows the same spelling, so it is read per file
         prefix = "glm5-next." if arch == "glm5-next" else "glm5next."
         print("%s: packing for the Glm5Model runner (quantized dense served natively; the driver "
-              "gate remains closed until the pack wiring lands - docs/GLM5-FLASH.md §9)" % arch)
+              "gate remains closed until the pack wiring lands)" % arch)
     block_count = None
     trunk = None
     # (a Qwen GGUF with its MTP block - qwen4exp, nextn_predict_layers 1, block_count 49 - the same: the trunk only)

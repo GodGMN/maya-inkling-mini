@@ -13,7 +13,7 @@ within fp32's rounding of transformers'.
 
     python ref/inkling2.py MODEL.gguf [--tokens 1,2,3] [--dump-dir DIR]
 
-Conventions (as ref/glm.py's where they apply): weights from ref/load.py as (out, in), y = W @ x; activations here
+Conventions: weights from ref/load.py as (out, in), y = W @ x; activations here
 (tokens, features) - torch's - with every intermediate a kernel needs recorded by cb() under the op's name
 (blk.V.<op>, V the layer visit: the layer itself without a loop), so a kernel's output can be compared with it a seam
 at a time. Float64 throughout: this is the spec, not a fast path. Teacher-forced over the whole sequence; decode and

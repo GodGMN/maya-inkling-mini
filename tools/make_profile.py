@@ -14,7 +14,7 @@ the top; `--no-base` drops the base entirely.
 WATCH THE BASE: `take()` skips a pair it has already ranked, and the shipped base ranks all 24,576, so a plain
 `--base` run cannot be moved by any trace - the output is the base again.  `--reorder` (traces first) or
 `--no-base` is what makes a trace decide the top.  Which ordering is in use is not cosmetic: the layer-split cost
-model reads this RANKING as if it were a frequency curve, and the coverage curve in src/program/generate.cpp
+model reads this RANKING as if it were a frequency curve, and the engine’s coverage curve
 carries the measured hit rates that say how far off that goes (94.9% claimed against 69.2% measured at 5,805 pairs
 held, on the IQ3_S 4-way rig).
 

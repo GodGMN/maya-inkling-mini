@@ -1,59 +1,18 @@
-# Contributing to Project Maya
+# Contributing to Tintero
 
-Reports and pull requests are welcome. These are what helps most.
+Base pull requests on `main` and keep each change to one topic. For a bug report, include the commit, GPU, driver and toolchain versions, model quant, preset, and the engine log around the failure.
 
-## A speed report or a new machine
+For performance changes, compare the same prompt, cache profile and output length before and after the change. Report prefill and decode separately. The [HIP guide](docs/HIP-PORT.md) describes the test conditions for the RX 7900 XTX.
 
-Open an issue with:
+Run the local checks from the repository root.
 
-- **`./maya.sh --bench`** (Maya stopped) **then `./maya.sh --report`**, and attach `maya-report.txt`. Windows:
-  `START-MAYA.bat --bench` / `--report`. The report includes the bench results.
-- **A build from source without the installer** is fine too. Send the same things by hand:
-  - the exact engine command and environment (`MAYA_GLM_*` settings);
-  - GPUs (model, VRAM, PCIe generation and width as `nvidia-smi` shows them), CPU, RAM, disk;
-  - model and context length;
-  - the engine log's `glm fast:`, `glm split`, `glm stat:` and `glm spec:` lines.
+```sh
+cmake -S . -B build-check -DSTRATA_ENABLE_HIP=OFF -DSTRATA_ENABLE_CUDA=OFF
+python tools/check_hip_compat.py
+python -m unittest discover -s serve -t .
+python -m unittest discover -s tools
+python tests/ik2_compare_decode_test.py
+node --test tools/test_*.mjs
+```
 
-  For numbers comparable with the README's [speed tables](README.md#how-fast-is-it), measure the way `--bench` does: three questions of 256 tokens,
-  greedy, thinking off, one short warm-up first; prefill (reading the prompt) at 2048 and 8192 tokens.
-- **Several conversations at once** (agents, `--parallel`): `--bench` measures one request at a time. Add runs of
-  `tools/agent_bench.py` against your running server ([docs/AGENT_BENCH.md](docs/AGENT_BENCH.md)): a scripted agent
-  workload, the same requests every run, with per-request decode, read speeds and latencies.
-
-Name your Maya version (`VERSION`, or the commit). Say what you measured and what you didn't.
-
-## A bug
-
-Run `./maya.sh --report` right after the failure and attach `maya-report.txt`. If the engine stopped, add the end
-of its log (the `.log` next to your `maya-*.json`).
-
-## A pull request
-
-- **Base it on `main`** and keep it to one topic.
-- **Measure before and after** on your hardware, same harness, and put the numbers in the description (a change for
-  several conversations at once: `tools/agent_bench.py`, each setting twice or more). If the output changes (it can: which expert runs on the CPU or the GPU changes the last bits), say so.
-- **New settings** are `MAYA_GLM_*` environment variables, off or at today's behaviour by default unless measured
-  better, with a row in [docs/SETTINGS.md](docs/SETTINGS.md).
-- **AMD (HIP) and other backends:** keep NVIDIA's code path unchanged (`#if defined(STRATA_USE_HIP)`). We can't test
-  AMD ourselves, so we merge AMD changes on your measurements once NVIDIA builds and behaves the same.
-- **A new CUDA call needs its AMD mapping.** The AMD build compiles the same sources with
-  `include/strata/hip_compat/` forced in. A CUDA runtime or cuBLAS name without a `#define` there breaks every AMD build,
-  as v1.0.21 did. `python tools/check_hip_compat.py` names any missing one.
-- **Every push and pull request runs the checks** (GitHub Actions, `.github/workflows/tests.yml`), with no GPU needed:
-  - the AMD-mapping check;
-  - the server tests;
-  - the installer and tools tests.
-  
-  A pull request is merged only when they pass.
-- **Before merging, we build every NVIDIA target** and run on Tesla V100s (one GPU and two):
-  - the engine's parity tests (`glm_*_parity --selftest`);
-  - a decode / prefill A/B;
-  - the server end to end.
-- **Areas where help is welcome:**
-  - decode speed when every expert fits in VRAM (kernel launches and host waits dominate there);
-  - Windows with NVIDIA GPUs;
-  - AMD;
-  - consumer GPUs from 12 to 32 GB;
-  - docs.
-
-Every merged change ships in a release (`CHANGELOG.md`), with credit.
+For kernel changes, build the engine and numerical tests for the affected backends. Include the GPU architecture, kernel test result and host-reference result in the pull request. [HIP verification](docs/HIP-PORT.md#verification) · [CUDA build](docs/INKLING2-MINI.md)

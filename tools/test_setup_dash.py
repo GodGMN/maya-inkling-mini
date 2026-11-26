@@ -6,6 +6,7 @@ import io
 import os
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -407,8 +408,11 @@ class Start(unittest.IsolatedAsyncioTestCase):
         info = {"model": "glm-5.3-flash", "quant": "Maya-L", "context": "32768", "dashboard": "http://127.0.0.1:9/",
                 "api": "http://127.0.0.1:9/v1", "log": None, "key": ""}
 
+        start_server = threading.Event()
+
         def body():
-            time.sleep(0.5)                                     # (what runs before Maya: an engine update's compile)
+            if not start_server.wait(timeout=20):
+                return 1
             return S.UI.serve([sys.executable, "-c", server], dict(os.environ, PYTHONUNBUFFERED="1"), info)
         bridge = Bridge(None)
         S.UI = bridge
@@ -417,6 +421,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(120, 40)) as pilot:
                 await pilot.pause(0.2)
                 self.assertIn("Starting Maya", app.query_one("#card").plain)
+                start_server.set()
                 t0 = time.time()
                 while app.state[T.SERVE] != "ready":
                     self.assertLess(time.time() - t0, 20, "the stand-in server did not get ready")

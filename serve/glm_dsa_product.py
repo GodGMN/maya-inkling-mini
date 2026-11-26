@@ -110,7 +110,7 @@ def geometry(pack) -> dict | None:
 
 def kv_bytes_per_token(pack, int8: bool = True, idx_fp16: bool = False) -> int | None:
     """What one context position of a glm-dsa model takes in its caches, as the engine lays them out
-    (src/core/glm_state_layout.cpp): every layer and the NextN block its latent - INT8 (the default: kv_lora codes and
+    (upstream GLM state layout): every layer and the NextN block its latent - INT8 (the default: kv_lora codes and
     an FP16 scale per 32) or FP16 - and its rope part k_pe (FP16); every full-indexer layer and the NextN block its index
     key (FP32; FP16 with MAYA_GLM_IDX_FP16=1).  GLM-5.3: 79 x 672 + 22 x 512 = 64,352 bytes (FP16 latent: 102,272).
     None for any other pack."""

@@ -5,7 +5,7 @@ CUDA context and the small buffers (the conversation snapshots, the KV streaming
 driver keeps outside every process (its reserve), that is "CUDA and the rest"."""
 from __future__ import annotations
 
-# the VRAM line's byte counts (Glm5Model::VramReport, src/program/generate.cpp; strata-ds4's info_lines, whose vision
+# the VRAM line's byte counts (Glm5Model::VramReport; strata-ds4's info_lines, whose vision
 # tower runs in the engine's own process: vision_own, and which also tells its prompt chunks' buffers apart (prompt)
 # and what its tensor parallel copies (tp, of a group of tp_n GPUs - out of its weights and kv))
 BYTES = ("total", "free", "weights", "kv", "kv_ram", "act", "drafter", "window", "pool", "tail", "borrow", "vision",

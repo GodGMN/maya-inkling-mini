@@ -44,9 +44,7 @@ class HipCompat(unittest.TestCase):
                 "}\n")
             self.assertEqual([(n, name) for _, n, name in C.unmapped(root)], [(3, "cudaDeviceGetPCIBusId")])
 
-    def test_glm_dsa_prompt_gemms_are_mapped(self):
-        # the glm-dsa prompt path (src/core/glm_prefill_dsa.cu) builds on HIP: its absorbed MLA products are
-        # strided-batched GemmEx calls, mapped like Maya's own GemmEx
+    def test_inkling_prompt_gemms_are_mapped(self):
         have = C.mapped_names(REPO / "include" / "strata" / "hip_compat")
         for name in ("cublasGemmStridedBatchedEx", "cublasGemmEx", "cublasSgemmStridedBatched", "CUBLAS_COMPUTE_32F",
                      "CUBLAS_GEMM_DEFAULT_TENSOR_OP", "CUDA_R_16F", "CUDA_R_32F"):

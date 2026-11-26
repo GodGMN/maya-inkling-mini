@@ -20,7 +20,7 @@ residual write (--ablate FILE) for the conversations that ask.
                                      whose config loads the direction (a normal start, no capture)
 
 Residual read-out: every hook writes one record (int32 T, int32 dim, float row[dim]) - the last row of the attention's
-or the FFN's output, two a layer, in layer order (src/core/ablate_capture.hpp).  The residual entering layer L at the
+or the FFN's output, two a layer, in layer order.  The residual entering layer L at the
 last token is the sum of the writes before it plus the token's embedding; the last token is the chat template's own
 (the same for every prompt), so its embedding drops out of the difference of the means.  On the models with
 hyper-connections (DeepSeek, GLM-5.3-Flash) the sum is the streams' mean up to each write's mixing weight - close

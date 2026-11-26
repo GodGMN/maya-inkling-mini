@@ -57,7 +57,7 @@ The conventions a kernel must follow (the conversion folds them in):
 
 ## 3. The reference: `ref/inkling2.py`
 
-The forward pass over any `inkling2` GGUF, op by op in float64, in ref/glm.py's conventions (weights `(out, in)` from
+The forward pass over any `inkling2` GGUF, op by op in float64, with the following conventions (weights `(out, in)` from
 `ref/load.py`, which now reads NVFP4 and unsloth's IQ types through gguf-py). Each intermediate a kernel produces is
 recorded under a seam name (`blk.L.k_conv`, `.q`, `.k`, `.v`, `.r`, `.attn_gated`, `.attn_out`, `.picks`,
 `.ffn_out`, `.out`, `logprobs`; `--dump-dir`), so a kernel is compared a seam at a time. Its docstring states the

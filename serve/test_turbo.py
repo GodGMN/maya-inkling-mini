@@ -48,27 +48,6 @@ class ResidentSkip(unittest.TestCase):
         N.export_env(exported, {"MAYA_GLM_RESIDENT_TOPK": "4"})
         self.assertEqual((exported["MAYA_GLM_RESIDENT_TOPK"], exported["STRATA_GLM_RESIDENT_TOPK"]), ("4", "4"))
 
-    def test_the_engines_read_the_options_and_the_docs_name_them(self):
-        src = {"DS4": (self.ROOT / "src/ds4/ds4_kernels.cu").read_text(encoding="utf-8"),
-               "GLM": (self.ROOT / "src/kernels/cuda/glm_fast.cu").read_text(encoding="utf-8")}
-        docs = (self.ROOT / "docs/SETTINGS.md").read_text(encoding="utf-8")
-        for prefix, text in src.items():
-            for opt in ("RESIDENT_TOPK", "RESIDENT_SKIP_W"):
-                self.assertIn(f'getenv("MAYA_{prefix}_{opt}")', text, (prefix, opt))
-                self.assertIn(f"MAYA_{prefix}_{opt}", docs)
-        self.assertEqual(docs.count("changes the answers - Turbo"), 2)
-
-    def test_a_dropped_expert_is_a_null_plan_entry_and_the_top_one_stays(self):
-        # (the rule itself runs on the GPU; this pins the pieces the kernels' comments and the docs promise)
-        ds = (self.ROOT / "src/ds4/ds4_kernels.cu").read_text(encoding="utf-8")
-        self.assertIn("rank == 0 || ((rs_k <= 0 || rank < rs_k)", ds)            # (top-1 always kept)
-        self.assertIn("kept ? vram[pick[r]] : 0ull", ds)                          # (dropped: off the device ...)
-        self.assertIn("kept ? pick[r] : -1", ds)                                  # ... and not on the CPU lane
-        glm = (self.ROOT / "src/kernels/cuda/glm_fast.cu").read_text(encoding="utf-8")
-        self.assertIn("const bool out = rank != 0 &&", glm)
-        self.assertIn("if (a.norm_w && drop != 0u) inv =", glm)                   # (renormalised only where the model does)
-        self.assertIn("resident_ok", (self.ROOT / "include/strata/kernels/glm_fast.hpp").read_text(encoding="utf-8"))
-
     def test_off_in_a_config_without_turbo(self):
         d = Path(tempfile.mkdtemp())
         try:

@@ -3,10 +3,12 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     python3-jinja2 python3-jsonschema python3-numpy python3-pil python3-regex python3-requests python3-yaml \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/maya
-COPY LICENSE VERSION ./
+COPY LICENSE LICENSE.ggml VERSION ./
 COPY tintero build-ik2/tintero
 COPY serve/ serve/
 COPY tools/ tools/
+COPY tests/ tests/
+COPY ref/ ref/
 COPY tokenizer/ ik2/tokenizer/
 COPY vision/ vision/
 COPY ablate/ ablate/

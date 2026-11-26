@@ -34,7 +34,7 @@ _GGUF_PY_NAME = {"Q4_0": "Q4_0", "Q8_0": "Q8_0", "Q4_K": "Q4_K", "Q5_K": "Q5_K",
                  "NVFP4": "NVFP4", "Q2_K": "Q2_K", "IQ1_S": "IQ1_S", "IQ1_M": "IQ1_M", "IQ2_XXS": "IQ2_XXS",
                  "IQ2_XS": "IQ2_XS", "IQ2_S": "IQ2_S", "IQ3_XXS": "IQ3_XXS", "IQ3_S": "IQ3_S"}
 
-# (elements per block, bytes per block) - mirrors block_geometry() in src/artifact/gguf_reader.cpp
+# (elements per block, bytes per block) - mirrors block_geometry() in src/ik2/gguf_reader.hpp
 GEOM = {"F32": (1, 4), "F16": (1, 2), "BF16": (1, 2),
         "Q4_0": (32, 18), "Q5_0": (32, 22), "Q8_0": (32, 34), "IQ4_NL": (32, 18),
         "Q3_K": (256, 110), "Q4_K": (256, 144), "Q5_K": (256, 176), "Q6_K": (256, 210),

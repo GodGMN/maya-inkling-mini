@@ -1,28 +1,14 @@
-"""A minimal GGUF v3 WRITER, including `Q2_0`.
+"""Read-compatible GGUF v3 writer for synthetic fixtures and ablation directions.
 
-Why this exists
----------------
-P1.S1 of the plan says the tiny synthetic model is "written as a real GGUF via `gguf-py`" using
-"at least `Q2_0`". That does not work: `gguf-py` has no `GGMLQuantizationType` member for type 42, so
-`GGMLQuantizationType(42)` raises `ValueError`. Verified in round 39 and again here.
-
-`src/artifact/` needs a writer regardless - P1.S2 requires a reader with no ggml dependency, and the
-writer is its companion - so this is that writer in Python, where it can be validated immediately
-against `tools/gguf_reader.py` and against llama.cpp.
-
-Scope: enough to build the P1.S1 tiny model. It is NOT a general-purpose quantizer; the only
-quantizer implemented is `Q2_0`, and its contract is `docs/q2_0-contract.md`:
-    block = 64 elements, fp16 scale, 16 bytes of 2-bit codes, LSB-first, 4 codes per byte
-    d = amax, code = clamp(round(w/d) + 1, 0, 3), symbol = code - 1  ->  {-1, 0, +1, +2}
-
-Self-checking: `python tools/gguf_writer.py` writes a synthetic v3 file, reads it back with
-`gguf_reader.py`, and asserts the tensors and metadata survived byte-exactly.
+The Q2_0 encoding uses 64 elements per block, a float16 scale, and 16 bytes
+of 2-bit codes. Run this module to round-trip a synthetic file.
 """
 from __future__ import annotations
 
 import dataclasses
 import pathlib
 import struct
+import tempfile
 import sys
 
 import numpy as np
@@ -104,9 +90,12 @@ class GGUFWriter:
         self.metadata[key] = (type_name, value)
 
     # ---- tensors
-    def add_f32(self, name: str, arr: np.ndarray) -> None:
+    def add_f32(self, name: str, arr: np.ndarray, *, gguf_shape: list[int] | None = None) -> None:
         a = np.ascontiguousarray(arr, dtype="<f4")
-        self.tensors.append(_Tensor(name, list(a.shape), "F32", a.tobytes()))
+        shape = list(a.shape) if gguf_shape is None else gguf_shape
+        if np.prod(shape) != a.size:
+            raise ValueError(f"{name}: GGUF shape {shape} does not cover {a.size} elements")
+        self.tensors.append(_Tensor(name, shape, "F32", a.tobytes()))
 
     def add_q2_0(self, name: str, arr: np.ndarray, shape: list[int]) -> None:
         """`arr` is (rows, in_features) row-major with every row `shape[0]` long; `shape` is the FULL
@@ -183,7 +172,7 @@ class GGUFWriter:
 
 
 # ------------------------------------------------------------------ self-check
-def _selfcheck() -> int:
+def _selfcheck(directory: pathlib.Path) -> int:
     rng = np.random.default_rng(7)
     w = GGUFWriter()
     w.add("general.architecture", "qwen4exp")
@@ -193,10 +182,10 @@ def _selfcheck() -> int:
 
     A = rng.standard_normal((16, 64)).astype(np.float32)
     B = rng.standard_normal((4, 8)).astype(np.float32)
-    w.add_q2_0("blk.0.ffn_gate_exps.weight", A, 64)
+    w.add_q2_0("blk.0.ffn_gate_exps.weight", A, [64, 16])
     w.add_f32("blk.0.ssm_a", B)
 
-    p = pathlib.Path(__file__).resolve().parent.parent / "bench" / "tiny-selftest.gguf"
+    p = directory / "tiny-selftest.gguf"
     w.write(p)
     print(f"wrote {p.name}  ({p.stat().st_size} B)")
 
@@ -231,4 +220,5 @@ def _selfcheck() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(_selfcheck())
+    with tempfile.TemporaryDirectory() as tmp:
+        raise SystemExit(_selfcheck(pathlib.Path(tmp)))
