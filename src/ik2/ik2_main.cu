@@ -1305,6 +1305,7 @@ struct Work {
     int *gidx, *inv;
     const uint8_t** blob;
     int* tok;
+    int* batch_group_row = nullptr;
     uint8_t *pack_h[kPackRing] = {}, *pack_d[kPackRing] = {};   // ring-buffered token path tables
     uint16_t* tp_h = nullptr;   // IK2_TP: the whole h, [S][F] FP16 (each GPU fills its half, then the other's)
     uint8_t* tp_pk = nullptr;   // (the decode's tables of this layer on the device: canonical blobs at +1536)
@@ -3123,7 +3124,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
                 const k::LoopGate gt{W.xq, msg + (size_t) 3 * TC, Ly.lp_down[3], Ly.lp_forget[3], Ly.lp_gain[3], W.xq,
                                      {Ly.lp_bf[3][0], Ly.lp_bf[3][1], Ly.lp_bf[3][2]}};
                 k::loop_gates(&gt, 1, T, C, c.rank, 1e-6f, W.lp_g, g_s, rows != nullptr);
-                if (rows) k::rms(W.xq, Ly.ffn_norm, T, C, c.eps, W.xq, g_s);
+                if (rows && !buf.row) k::rms(W.xq, Ly.ffn_norm, T, C, c.eps, W.xq, g_s);
                 else k::rms_f16(W.xq, Ly.ffn_norm, T, C, c.eps, W.x16, W.xq, g_s);
             } else {
                 k::RmsOuts outs{};
@@ -3157,10 +3158,18 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
                 k::experts_down_g(buf.blob, buf.n, buf.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                                   g_s);
 #else
-        if (!rows) {
+        if (!rows || (buf.row && S <= k::kGroupRouteSlots)) {
             k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], buf.blob, buf.n,
                            buf.tok, buf.row, buf.sg, buf.su, buf.wt, buf.inv, g_s);
-            if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
+            if (rows) {
+                // Each expert's first group needs one pick and each extra group needs eight more.
+                const int distinct = std::min(c.E, S);
+                const int groups = distinct + (S - distinct) / k::kGroupMax;
+                k::experts_gate_up_swiglu_g(buf.blob, buf.n, buf.tok, buf.row, groups, Ly.ty[0], Ly.ty[1], Ly.eb[0],
+                                            W.xq, C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s, W.x16);
+                k::experts_down_g(buf.blob, buf.n, buf.row, groups, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F,
+                                  W.y32, g_s);
+            } else if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
                 uint16_t* limbs = (uint16_t*) W.gu32;
                 k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
                 k::experts_block_gu(buf.blob, buf.n, buf.tok, buf.row, S, T, Ly.eb[0], C, c.F, limbs, buf.sg,
@@ -5612,7 +5621,16 @@ int main(int argc, char** argv) {
     W.wtr = work_alloc<float>(S_buf);
     W.sg = work_alloc<float>(S_buf), W.su = work_alloc<float>(S_buf), W.wt = work_alloc<float>(S_buf);
     W.gidx = work_alloc<int>(S_buf), W.inv = work_alloc<int>(S_buf);
-    W.blob = work_alloc<const uint8_t*>(S8), W.tok = work_alloc<int>(S8);
+    size_t token_entries = S8;
+#ifndef STRATA_USE_HIP
+    const char* group_moe = getenv("IK2_BATCH_GROUP_MOE");
+    if (batch_width > 1 && group_moe && std::atoi(group_moe)) {
+        const size_t entries = size_t(std::min(batch_width * c.K, k::kGroupRouteSlots)) * k::kGroupMax;
+        token_entries = std::max(token_entries, entries);
+        W.batch_group_row = work_alloc<int>(entries);
+    }
+#endif
+    W.blob = work_alloc<const uint8_t*>(S8), W.tok = work_alloc<int>(token_entries);
     for (int i = 0; i < Work::kPackRing; ++i) {
         CU(cudaHostAlloc(&W.pack_h[i], 8192, cudaHostAllocPortable));
         W.pack_d[i] = work_alloc<uint8_t>(8192);
