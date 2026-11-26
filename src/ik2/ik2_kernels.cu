@@ -38,7 +38,7 @@ __device__ __forceinline__ float2 u32_to_f2(uint32_t u) {
     return __half22float2(h2);
 }
 __host__ __device__ __forceinline__ float bits_to_float(uint32_t u) {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     return __uint_as_float(u);
 #else
     float f;
@@ -47,7 +47,7 @@ __host__ __device__ __forceinline__ float bits_to_float(uint32_t u) {
 #endif
 }
 __host__ __device__ __forceinline__ uint32_t float_to_bits(float f) {
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
     return __float_as_uint(f);
 #else
     uint32_t u;
@@ -4413,31 +4413,46 @@ constexpr int kDraftQ = 8;
 __device__ __forceinline__ float ld_f(const float* p) { return *p; }
 __device__ __forceinline__ float ld_f(const uint16_t* p) { return h2f(*p); }
 template <class KVT>
-__global__ void draft_attn_part_kernel(const float* q, const KVT* kc, const KVT* vc, int k_lo, int k_hi,
-                                       const float* kb, const float* vb, int nq, int H, int Hkv, float scale, int per,
-                                       float* lgs, float* part_o, float2* part_ml, int cap) {
-    __shared__ float sh[128];
+__global__ void draft_attn_online_part_kernel(const float* __restrict__ q, const KVT* __restrict__ kc,
+                                              const KVT* __restrict__ vc, const int* __restrict__ d_P, int k_lo_arg,
+                                              int k_hi_arg, int window, const float* __restrict__ kb,
+                                              const float* __restrict__ vb, int nq, int H, int Hkv, float scale,
+                                              float* __restrict__ part_o, float2* __restrict__ part_ml, int cap) {
     __shared__ float qs[kDraftQ][128];
-    __shared__ float mrow[kDraftQ];
-    const int h = blockIdx.x, sp = blockIdx.y, S = gridDim.y, g = h / (H / Hkv), tid = threadIdx.x, lane = tid & 31,
-              warp = tid >> 5;
+    __shared__ float wm[4];
+    __shared__ float wl[4];
+    __shared__ float wo[4][128];
+    const int h = blockIdx.x, sp = blockIdx.y, S = gridDim.y, g = h / (H / Hkv);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int k_hi = d_P ? *d_P : k_hi_arg;
+    const int k_lo = d_P ? max(0, k_hi - window) : k_lo_arg;
     const int KD = Hkv * 128, nc = k_hi - k_lo, nk = nc + nq;
+    const int per = (nk + S - 1) / S;
     const int j0 = min(nk, sp * per), j1 = min(nk, j0 + per), n = j1 - j0;
     for (int qi = 0; qi < nq; ++qi) qs[qi][tid] = q[((size_t) qi * H + h) * 128 + tid];
     __syncthreads();
-    float* lg = lgs + ((size_t) h * S + sp) * kDraftQ * per;   // [nq][per]
-    float mx[kDraftQ];
+    float mx[kDraftQ], sm[kDraftQ], o0[kDraftQ], o1[kDraftQ], o2[kDraftQ], o3[kDraftQ];
 #pragma unroll
-    for (int qi = 0; qi < kDraftQ; ++qi) mx[qi] = -INFINITY;
+    for (int qi = 0; qi < kDraftQ; ++qi) {
+        mx[qi] = -INFINITY;
+        sm[qi] = 0.0f;
+        o0[qi] = 0.0f; o1[qi] = 0.0f; o2[qi] = 0.0f; o3[qi] = 0.0f;
+    }
     for (int jj = warp; jj < n; jj += 4) {
         const int j = j0 + jj;
-        float k0, k1, k2, k3;
+        float k0, k1, k2, k3, v0, v1, v2, v3;
         if (j < nc) {
-            const KVT* kr = kc + (size_t) ((k_lo + j) % cap) * KD + (size_t) g * 128;
-            k0 = ld_f(kr + lane), k1 = ld_f(kr + lane + 32), k2 = ld_f(kr + lane + 64), k3 = ld_f(kr + lane + 96);
+            const size_t off = (size_t) ((k_lo + j) % cap) * KD + (size_t) g * 128;
+            const KVT* kr = kc + off;
+            const KVT* vr = vc + off;
+            k0 = ld_f(kr + lane); k1 = ld_f(kr + lane + 32); k2 = ld_f(kr + lane + 64); k3 = ld_f(kr + lane + 96);
+            v0 = ld_f(vr + lane); v1 = ld_f(vr + lane + 32); v2 = ld_f(vr + lane + 64); v3 = ld_f(vr + lane + 96);
         } else {
-            const float* kr = kb + (size_t) (j - nc) * KD + (size_t) g * 128;
-            k0 = kr[lane], k1 = kr[lane + 32], k2 = kr[lane + 64], k3 = kr[lane + 96];
+            const size_t off = (size_t) (j - nc) * KD + (size_t) g * 128;
+            const float* kr = kb + off;
+            const float* vr = vb + off;
+            k0 = kr[lane]; k1 = kr[lane + 32]; k2 = kr[lane + 64]; k3 = kr[lane + 96];
+            v0 = vr[lane]; v1 = vr[lane + 32]; v2 = vr[lane + 64]; v3 = vr[lane + 96];
         }
 #pragma unroll
         for (int qi = 0; qi < kDraftQ; ++qi) {
@@ -4446,35 +4461,36 @@ __global__ void draft_attn_part_kernel(const float* q, const KVT* kc, const KVT*
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
             a *= scale;
-            if (lane == 0) lg[(size_t) qi * per + jj] = a;
-            mx[qi] = fmaxf(mx[qi], a);
+            const float m_new = fmaxf(mx[qi], a);
+            const float alpha = mx[qi] == -INFINITY ? 0.0f : expf(mx[qi] - m_new);
+            const float beta = expf(a - m_new);
+            sm[qi] = sm[qi] * alpha + beta;
+            mx[qi] = m_new;
+            o0[qi] = fmaf(o0[qi], alpha, v0 * beta);
+            o1[qi] = fmaf(o1[qi], alpha, v1 * beta);
+            o2[qi] = fmaf(o2[qi], alpha, v2 * beta);
+            o3[qi] = fmaf(o3[qi], alpha, v3 * beta);
         }
     }
-    __syncthreads();
     for (int qi = 0; qi < nq; ++qi) {
-        const float m = bmax(mx[qi], sh);
-        float a = 0.0f;
-        for (int jj = tid; jj < n; jj += 128) {
-            const float e = m == -INFINITY ? 0.0f : expf(lg[(size_t) qi * per + jj] - m);
-            lg[(size_t) qi * per + jj] = e;
-            a += e;
-        }
-        const float l = bsum(a, sh);
-        if (tid == 0) mrow[qi] = m, part_ml[((size_t) sp * H + h) * kDraftQ + qi] = make_float2(m, l);
+        if (lane == 0) wm[warp] = mx[qi], wl[warp] = sm[qi];
+        wo[warp][lane] = o0[qi];
+        wo[warp][lane + 32] = o1[qi];
+        wo[warp][lane + 64] = o2[qi];
+        wo[warp][lane + 96] = o3[qi];
+        __syncthreads();
+        const float bm = fmaxf(fmaxf(wm[0], wm[1]), fmaxf(wm[2], wm[3]));
+        const float c0 = wm[0] == -INFINITY ? 0.0f : expf(wm[0] - bm);
+        const float c1 = wm[1] == -INFINITY ? 0.0f : expf(wm[1] - bm);
+        const float c2 = wm[2] == -INFINITY ? 0.0f : expf(wm[2] - bm);
+        const float c3 = wm[3] == -INFINITY ? 0.0f : expf(wm[3] - bm);
+        if (tid == 0)
+            part_ml[((size_t) sp * H + h) * kDraftQ + qi] =
+                make_float2(bm, wl[0] * c0 + wl[1] * c1 + wl[2] * c2 + wl[3] * c3);
+        part_o[(((size_t) sp * H + h) * kDraftQ + qi) * 128 + tid] =
+            wo[0][tid] * c0 + wo[1][tid] * c1 + wo[2][tid] * c2 + wo[3][tid] * c3;
+        __syncthreads();
     }
-    __syncthreads();
-    float o[kDraftQ];
-#pragma unroll
-    for (int qi = 0; qi < kDraftQ; ++qi) o[qi] = 0.0f;
-    for (int jj = 0; jj < n; ++jj) {
-        const int j = j0 + jj;
-        const float v = j < nc ? ld_f(vc + (size_t) ((k_lo + j) % cap) * KD + (size_t) g * 128 + tid)
-                               : vb[(size_t) (j - nc) * KD + (size_t) g * 128 + tid];
-#pragma unroll
-        for (int qi = 0; qi < kDraftQ; ++qi)
-            if (qi < nq) o[qi] += lg[(size_t) qi * per + jj] * v;
-    }
-    for (int qi = 0; qi < nq; ++qi) part_o[(((size_t) sp * H + h) * kDraftQ + qi) * 128 + tid] = o[qi];
 }
 __global__ void draft_attn_merge_kernel(const float* part_o, const float2* part_ml, int S, int H, float* out) {
     const int h = blockIdx.x, qi = blockIdx.y, tid = threadIdx.x;
@@ -5207,6 +5223,30 @@ __global__ void mv_f16_rows_kernel(const uint16_t* __restrict__ W, int N, int K,
     for (int i = lane; i < K; i += 32) a += h2f(w[i]) * xt[i];
     a = wsum(a);
     if (lane == 0) y[(size_t) t * y_ld + row] = a;
+}
+
+template <int TFixed>
+__global__ void mv_f16_rows_vec_kernel(const uint16_t* __restrict__ W, int N, int K, const float* __restrict__ x,
+                                       int x_ld, float* __restrict__ y, int y_ld) {
+    constexpr int WARPS = 4;
+    const int row = blockIdx.x * WARPS + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= N) return;
+    const uint16_t* w = W + (size_t) row * K;
+    float acc[TFixed] = {};
+    for (int i = lane * 4; i < K; i += 128) {
+        const uint2 wh = *(const uint2*)(w + i);
+        const float2 w01 = u32_to_f2(wh.x), w23 = u32_to_f2(wh.y);
+#pragma unroll
+        for (int t = 0; t < TFixed; ++t) {
+            const float4 xv = *(const float4*)(x + (size_t) t * x_ld + i);
+            acc[t] = fmaf(w01.x, xv.x, fmaf(w01.y, xv.y, fmaf(w23.x, xv.z, fmaf(w23.y, xv.w, acc[t]))));
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TFixed; ++t) {
+        const float a = wsum(acc[t]);
+        if (lane == 0) y[(size_t) t * y_ld + row] = a;
+    }
 }
 
 // x [T][C] as two FP16 limbs a token, out [T][2][C] (hi, lo; x = hi + lo)
@@ -5980,6 +6020,20 @@ void loop_gates(const LoopGate* gt, int n, int T, int C, int R, float eps, float
         check("rdna3_gate_apply");
         return;
     }
+    if ((tile == 256 || tile == 0) && T >= 2 && T <= 8 && R == 64 && C % 64 == 0 && compact && aligned) {
+        const dim3 dg(R, n), ag(C / 64, n);
+        switch (T) {
+            case 2: rdna3_gate_dots_block<2><<<dg, 128, 0, s>>>(a, n, C, sc); rdna3_gate_apply_block<2><<<ag, 256, 0, s>>>(a, n, C, eps, sc); break;
+            case 3: rdna3_gate_dots_block<3><<<dg, 128, 0, s>>>(a, n, C, sc); rdna3_gate_apply_block<3><<<ag, 256, 0, s>>>(a, n, C, eps, sc); break;
+            case 4: rdna3_gate_dots_block<4><<<dg, 128, 0, s>>>(a, n, C, sc); rdna3_gate_apply_block<4><<<ag, 256, 0, s>>>(a, n, C, eps, sc); break;
+            case 5: rdna3_gate_dots_block<5><<<dg, 128, 0, s>>>(a, n, C, sc); rdna3_gate_apply_block<5><<<ag, 256, 0, s>>>(a, n, C, eps, sc); break;
+            case 6: rdna3_gate_dots_block<6><<<dg, 128, 0, s>>>(a, n, C, sc); rdna3_gate_apply_block<6><<<ag, 256, 0, s>>>(a, n, C, eps, sc); break;
+            case 7: rdna3_gate_dots_block<7><<<dg, 128, 0, s>>>(a, n, C, sc); rdna3_gate_apply_block<7><<<ag, 256, 0, s>>>(a, n, C, eps, sc); break;
+            case 8: rdna3_gate_dots_block<8><<<dg, 128, 0, s>>>(a, n, C, sc); rdna3_gate_apply_block<8><<<ag, 256, 0, s>>>(a, n, C, eps, sc); break;
+        }
+        check("rdna3_gate_block");
+        return;
+    }
 #endif
     const dim3 dots(R, n, T);
     if (compact)
@@ -6056,33 +6110,43 @@ void rope_neox(float* x, int rows, int heads, const int* pos, float theta, cudaS
     check("rope_neox");
 }
 template <class KVT>
-static void draft_attn_impl(const float* q, const KVT* kc, const KVT* vc, int k_lo, int k_hi, const float* kb,
-                            const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out,
-                            cudaStream_t s, int cap) {
-    // scratch: the logits [H][S][8][per], the chunks' outputs [S][H][8][128] and (max, sum)
+static void draft_attn_online_impl(const float* q, const KVT* kc, const KVT* vc, const int* d_P, int k_lo, int k_hi,
+                                   int window, const float* kb, const float* vb, int nq, int H, int Hkv, float scale,
+                                   int S, float* scratch, float* out, cudaStream_t s, int cap) {
     if (nq > kDraftQ) {
         std::fprintf(stderr, "ik2::k::draft_attn: %d queries (at most %d)\n", nq, kDraftQ);
         std::abort();
     }
-    const int nk = k_hi - k_lo + nq;
-    const int S = std::max(1, std::min(64, (nk + 255) / 256)), per = (nk + S - 1) / S;
-    float* lgs = scratch;
-    float* part_o = lgs + (size_t) H * S * kDraftQ * per;
+    float* part_o = scratch;
     float2* part_ml = (float2*) (part_o + (size_t) S * H * kDraftQ * 128);
-    draft_attn_part_kernel<KVT><<<dim3((unsigned) H, (unsigned) S), 128, 0, s>>>(
-        q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, per, lgs, part_o, part_ml, cap > 0 ? cap : (1 << 30));
-    check("draft_attn (chunks)");
+    draft_attn_online_part_kernel<KVT><<<dim3((unsigned) H, (unsigned) S), 128, 0, s>>>(
+        q, kc, vc, d_P, k_lo, k_hi, window, kb, vb, nq, H, Hkv, scale, part_o, part_ml, cap > 0 ? cap : (1 << 30));
+    check("draft_attn_online (chunks)");
     draft_attn_merge_kernel<<<dim3((unsigned) H, (unsigned) nq), 128, 0, s>>>(part_o, part_ml, S, H, out);
-    check("draft_attn (merge)");
+    check("draft_attn_online (merge)");
 }
 void draft_attn(const float* q, const float* kc, const float* vc, int k_lo, int k_hi, const float* kb, const float* vb,
                 int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s, int cap) {
-    draft_attn_impl<float>(q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap);
+    const int nk = k_hi - k_lo + nq;
+    const int S = std::max(1, std::min(64, (nk + 255) / 256));
+    draft_attn_online_impl<float>(q, kc, vc, nullptr, k_lo, k_hi, 0, kb, vb, nq, H, Hkv, scale, S, scratch, out, s, cap);
 }
 void draft_attn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, int k_lo, int k_hi, const float* kb,
                     const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
                     int cap) {
-    draft_attn_impl<uint16_t>(q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, scratch, out, s, cap);
+    const int nk = k_hi - k_lo + nq;
+    const int S = std::max(1, std::min(64, (nk + 255) / 256));
+    draft_attn_online_impl<uint16_t>(q, kc, vc, nullptr, k_lo, k_hi, 0, kb, vb, nq, H, Hkv, scale, S, scratch, out, s, cap);
+}
+void draft_attn_graph(const float* q, const float* kc, const float* vc, const int* d_P, int window, const float* kb,
+                      const float* vb, int nq, int H, int Hkv, float scale, int S, float* scratch, float* out,
+                      cudaStream_t s, int cap) {
+    draft_attn_online_impl<float>(q, kc, vc, d_P, 0, 0, window, kb, vb, nq, H, Hkv, scale, S, scratch, out, s, cap);
+}
+void draft_attn_f16_graph(const float* q, const uint16_t* kc, const uint16_t* vc, const int* d_P, int window,
+                          const float* kb, const float* vb, int nq, int H, int Hkv, float scale, int S, float* scratch,
+                          float* out, cudaStream_t s, int cap) {
+    draft_attn_online_impl<uint16_t>(q, kc, vc, d_P, 0, 0, window, kb, vb, nq, H, Hkv, scale, S, scratch, out, s, cap);
 }
 void silu_mul_bf16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s) {
     silu_mul_bf16_kernel<<<grid((size_t) T * F), kBlk, 0, s>>>(gu, T, F, out);
@@ -6246,6 +6310,11 @@ void experts_down(const uint8_t* const* blob, int S, int ty_down, size_t off_dow
 
     if (S <= 0) return;
 #ifdef STRATA_USE_HIP
+    static const bool nvfp4_mv = !getenv("IK2_NVFP4_MV") || atoi(getenv("IK2_NVFP4_MV"));
+    if (nvfp4_mv && ty_down == kNVFP4 && F % 64 == 0 && ((uintptr_t)h & 15) == 0) {
+        rdna3_nvfp4_token_down(blob, S, off_down, h, C, F, y, s);
+        return;
+    }
     if (try_rdna3_expert<false>(ty_down, blob, S, off_down, nullptr, nullptr, h, F, C, nullptr, nullptr,
                                 0, 0, nullptr, y, s)) return;
 #endif
@@ -6315,6 +6384,11 @@ void experts_gate_up_swiglu(const uint8_t* const* blob, const int* tok, int S, i
 
     if (S <= 0) return;
 #ifdef STRATA_USE_HIP
+    static const bool nvfp4_mv = !getenv("IK2_NVFP4_MV") || atoi(getenv("IK2_NVFP4_MV"));
+    if (nvfp4_mv && ty_gate == kNVFP4 && ty_up == kNVFP4 && C % 64 == 0 && ((uintptr_t)x & 15) == 0) {
+        rdna3_nvfp4_token_gu(blob, tok, S, eb0, x, C, F, sg, su, gcap, ucap, h, s);
+        return;
+    }
     if (ty_gate == ty_up && try_rdna3_expert<true>(ty_gate, blob, S, eb0, tok, x, nullptr, C, F, sg, su,
                                                   gcap, ucap, h, nullptr, s)) return;
 #endif
@@ -6964,6 +7038,21 @@ void rollback_block(const ConvRec* recs, int n_recs, int n, cudaStream_t s) {
 void mv_f16_rows(const uint16_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
                  cudaStream_t s) {
     if (N <= 0 || T <= 0) return;
+    if (T >= 1 && T <= 8 && (K & 127) == 0 && (x_ld & 3) == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)x & 15) == 0) {
+        const unsigned blocks = (unsigned) ((N + 3) / 4);
+        switch (T) {
+            case 1: mv_f16_rows_vec_kernel<1><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
+            case 2: mv_f16_rows_vec_kernel<2><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
+            case 3: mv_f16_rows_vec_kernel<3><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
+            case 4: mv_f16_rows_vec_kernel<4><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
+            case 5: mv_f16_rows_vec_kernel<5><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
+            case 6: mv_f16_rows_vec_kernel<6><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
+            case 7: mv_f16_rows_vec_kernel<7><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
+            case 8: mv_f16_rows_vec_kernel<8><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
+        }
+        check("mv_f16_rows_vec");
+        return;
+    }
     mv_f16_rows_kernel<4><<<dim3((unsigned) ((N + 3) / 4), (unsigned) T), 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld);
     check("mv_f16_rows");
 }

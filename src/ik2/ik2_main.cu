@@ -2837,7 +2837,7 @@ struct BlockBufs {
     int *cand_d = nullptr, *cand_h = nullptr;   // kCand: each row's k::cand_topk out, [kBlockMax][2 + 2 kCandCap]
 };
 BlockBufs g_blk;
-FastGraph g_bgraph[kBlockMax + 1][4];   // by window size and OutMode
+FastGraph g_bgraph[kBlockMax + 1][4][3];   // by window size, OutMode, and attention depth bucket
 
 void block_init(Model& M) {
     if (g_blk.ready) return;
@@ -2965,7 +2965,7 @@ void sequence_attention(Model& M, Work& W, int vis, bool sep, const SequenceRows
 }
 
 void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& buf = g_blk,
-                         const SequenceRows* rows = nullptr) {
+                         const SequenceRows* rows = nullptr, int attn_bkt = 2) {
     AblDecodeScope abl_decode;
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel, S = T * c.K;
@@ -3045,10 +3045,22 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
                 if (!sep) {
                     tile_rows(m, 0, N, W.x16, T, W.qkv, N);
                 } else {
+#ifdef STRATA_USE_HIP
+                    if (m.q8 && T >= 1 && T <= 8 && m.K % 128 == 0 && ((uintptr_t)m.q8 & 3) == 0 &&
+                        ((uintptr_t)W.x16 & 7) == 0 && ((uintptr_t)W.xk16 & 7) == 0 && ((uintptr_t)W.xv16 & 7) == 0) {
+                        k::rdna3_q8_tile_qkv_sep(m.q8, m.q8d, N, m.K, HD, KD, W.x16, W.xk16, W.xv16, T, W.qkv, N, g_s);
+                    } else {
+                        tile_rows(m, 0, HD, W.x16, T, W.qkv, N);
+                        tile_rows(m, HD, KD, W.xk16, T, W.qkv + HD, N);
+                        tile_rows(m, HD + KD, KD, W.xv16, T, W.qkv + HD + KD, N);
+                        tile_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.x16, T, W.qkv + HD + 2 * KD, N);
+                    }
+#else
                     tile_rows(m, 0, HD, W.x16, T, W.qkv, N);
                     tile_rows(m, HD, KD, W.xk16, T, W.qkv + HD, N);
                     tile_rows(m, HD + KD, KD, W.xv16, T, W.qkv + HD + KD, N);
                     tile_rows(m, HD + 2 * KD, N - HD - 2 * KD, W.x16, T, W.qkv + HD + 2 * KD, N);
+#endif
                 }
                 q_p = W.qkv, r_p = W.qkv + HD + 2 * KD, gate_p = r_p + HR;
                 q_ld = r_ld = gate_ld = N;
@@ -3077,7 +3089,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
             const int extent = Ly.sliding ? c.extent_swa : c.extent;
             const int window = Ly.sliding ? c.window : (1 << 30);
             const int ring = Ly.sliding ? Ly.kv_cap : 0;
-            const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
+            const int ns_full = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
+            const int ns = attn_bkt == 0 ? std::min(ns_full, 2) : (attn_bkt == 1 ? std::min(ns_full, 8) : ns_full);
             uint16_t* q16 = W.x16;
             if (Ly.kc8) {
                 k::prep_qkv_r_fp8_block(q_p, q_ld, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, r_ld, Ly.r_clip, T, c.H,
@@ -3116,7 +3129,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
                 const k::LoopGate gt{W.xq, msg + (size_t) 3 * TC, Ly.lp_down[3], Ly.lp_forget[3], Ly.lp_gain[3], W.xq,
                                      {Ly.lp_bf[3][0], Ly.lp_bf[3][1], Ly.lp_bf[3][2]}};
                 k::loop_gates(&gt, 1, T, C, c.rank, 1e-6f, W.lp_g, g_s, rows != nullptr);
-                k::rms(W.xq, Ly.ffn_norm, T, C, c.eps, W.xq, g_s);
+                if (rows) k::rms(W.xq, Ly.ffn_norm, T, C, c.eps, W.xq, g_s);
+                else k::rms_f16(W.xq, Ly.ffn_norm, T, C, c.eps, W.x16, W.xq, g_s);
             } else {
                 k::RmsOuts outs{};
                 outs.w[0] = Ly.ffn_norm, outs.y16[0] = W.x16, outs.y32[0] = W.xq;
@@ -3128,11 +3142,33 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
         float* rw = (float*) (W.route_d + S);
         k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
 #ifdef STRATA_USE_HIP
-        k::route_gather(rtop, rw, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], S, c.K,
-                        buf.blob, buf.tok, buf.inv, buf.sg, buf.su, buf.wt, g_s, rows && c.E == 128);
-        k::experts_gate_up_swiglu(buf.blob, buf.tok, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
-                                  C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
-        k::experts_down(buf.blob, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+        if (!rows && buf.n && buf.row && S <= 64) {
+            k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], buf.blob, buf.n,
+                           buf.tok, buf.row, buf.sg, buf.su, buf.wt, buf.inv, g_s);
+            const bool rdna_gu = Ly.ty[0] == Ly.ty[1] &&
+                                 ((Ly.ty[0] == k::kNVFP4 && C % 64 == 0 && ((uintptr_t)W.x16 & 15) == 0) ||
+                                  ((Ly.ty[0] == k::kQ8_0 || Ly.ty[0] == k::kIQ4_NL) && C % 32 == 0 && ((uintptr_t)W.x16 & 7) == 0));
+            if (rdna_gu)
+                k::rdna3_experts_block_gu(Ly.ty[0], buf.blob, buf.n, buf.tok, buf.row, S, T, Ly.eb[0], C, c.F,
+                                          W.x16, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            else
+                k::experts_gate_up_swiglu_g(buf.blob, buf.n, buf.tok, buf.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
+                                            C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            const bool rdna_dn = ((Ly.ty[2] == k::kNVFP4 && c.F % 64 == 0 && ((uintptr_t)W.h16 & 15) == 0) ||
+                                  ((Ly.ty[2] == k::kQ8_0 || Ly.ty[2] == k::kIQ4_NL) && c.F % 32 == 0 && ((uintptr_t)W.h16 & 7) == 0));
+            if (rdna_dn)
+                k::rdna3_experts_block_down(Ly.ty[2], buf.blob, buf.n, buf.row, S, T, Ly.eb[0] + Ly.eb[1], C, c.F,
+                                            W.h16, W.y32, g_s);
+            else
+                k::experts_down_g(buf.blob, buf.n, buf.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
+                                  g_s);
+        } else {
+            k::route_gather(rtop, rw, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], S, c.K,
+                            buf.blob, buf.tok, buf.inv, buf.sg, buf.su, buf.wt, g_s, rows && c.E == 128);
+            k::experts_gate_up_swiglu(buf.blob, buf.tok, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
+                                      C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_down(buf.blob, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+        }
 #else
         k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], buf.blob, buf.n,
                        buf.tok, buf.row, buf.sg, buf.su, buf.wt, buf.inv, g_s);
@@ -3209,13 +3245,14 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
         k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, c.C, g_blk.emb_h + (size_t) t * c.C);
         g_blk.pos_h[t] = pos0 + t;
     }
+    const int attn_bkt = (pos0 + T) < 256 ? 0 : ((pos0 + T) < 1024 ? 1 : 2);
     if (!g_graph) {
-        fast_block_launches(M, W, T, out_mode);
+        fast_block_launches(M, W, T, out_mode, g_blk, nullptr, attn_bkt);
     } else {
-        FastGraph& G = g_bgraph[T][(int) out_mode];
+        FastGraph& G = g_bgraph[T][(int) out_mode][attn_bkt];
         if (!G.exec) {
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
-            fast_block_launches(M, W, T, out_mode);
+            fast_block_launches(M, W, T, out_mode, g_blk, nullptr, attn_bkt);
             CU(cudaStreamEndCapture(g_s, &G.graph));
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
         }
@@ -3310,7 +3347,12 @@ struct SpecCtl {
     uint64_t steps = 0, plain = 0, drafted = 0, accepted = 0;
     uint64_t hist[kBlockMax] = {};
     SpecCtl() {
+#ifdef STRATA_USE_HIP
+        const double prior[kBlockMax + 1] = {0, 8.4e-3, 13.8e-3, 16.0e-3, 17.8e-3, 19.2e-3, 21.2e-3, 23.2e-3, 25.0e-3};
+        c_plain = 8.4e-3;
+#else
         const double prior[kBlockMax + 1] = {0, 7.8e-3, 13.3e-3, 15.1e-3, 16.7e-3, 18.2e-3, 19.8e-3, 21.3e-3, 22.8e-3};
+#endif
         for (int b = 0; b <= kBlockMax; ++b) c[b] = prior[b];
     }
     int choose(int room) {   // room: the widest a step may be (1: plain)
@@ -3328,11 +3370,11 @@ struct SpecCtl {
         return best;
     }
     void took_plain(double t) {
-        c_plain = 0.9 * c_plain + 0.1 * t;
+        if (t < 0.04 || t < 2.5 * c_plain) c_plain = 0.9 * c_plain + 0.1 * t;
         ++plain, ++plain_run;
     }
     void took_spec(int B, int acc, double t) {
-        c[B] = 0.8 * c[B] + 0.2 * t;
+        if (t < 0.06 || t < 2.5 * c[B]) c[B] = 0.8 * c[B] + 0.2 * t;
         S = decay * S + acc, F = decay * F + (acc < B - 1 ? 1 : 0);
         ++steps, drafted += B - 1, accepted += acc, ++hist[acc];
         plain_run = 0;
@@ -6403,9 +6445,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "suffix: %d target forwards verified %d inputs, accepted %d/%d proposals\n",
                              suffix_stats.forwards, suffix_stats.inputs, suffix_stats.accepted, suffix_stats.offered);
             if (spec_on && getenv("IK2_STATS"))
-                std::fprintf(stderr, "speculative: %llu windows, %llu of %llu drafts accepted, %llu plain tokens\n",
+                std::fprintf(stderr, "speculative: %llu windows, %llu of %llu drafts accepted (%.2f tok/win), %llu plain; win %.1f ms (2..6: %.1f %.1f %.1f %.1f %.1f), plain %.1f ms\n",
                              (unsigned long long) sctl.steps, (unsigned long long) sctl.accepted,
-                             (unsigned long long) sctl.drafted, (unsigned long long) sctl.plain);
+                             (unsigned long long) sctl.drafted,
+                             sctl.steps ? 1.0 + (double) sctl.accepted / sctl.steps : 0.0,
+                             (unsigned long long) sctl.plain,
+                             sctl.c[std::min(sctl.wmax, kBlockMax)] * 1e3,
+                             sctl.c[2] * 1e3, sctl.c[3] * 1e3, sctl.c[4] * 1e3, sctl.c[5] * 1e3, sctl.c[6] * 1e3,
+                             sctl.c_plain * 1e3);
             if (serve_maya)
                 std::printf("DONE %d %zu %.1f %.1f %s %d %d %d\n", n_out, ids.size(), (t1 - t0) * 1e3,
                             (now() - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason,

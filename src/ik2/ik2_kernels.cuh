@@ -441,6 +441,13 @@ void draft_attn(const float* q, const float* kc, const float* vc, int k_lo, int 
 void draft_attn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, int k_lo, int k_hi, const float* kb,
                     const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out, cudaStream_t s,
                     int cap);
+/// Graph-capturable online-softmax draft attention (reads P from device pointer d_P, fixed split count S).
+void draft_attn_graph(const float* q, const float* kc, const float* vc, const int* d_P, int window, const float* kb,
+                      const float* vb, int nq, int H, int Hkv, float scale, int S, float* scratch, float* out,
+                      cudaStream_t s, int cap);
+void draft_attn_f16_graph(const float* q, const uint16_t* kc, const uint16_t* vc, const int* d_P, int window,
+                          const float* kb, const float* vb, int nq, int H, int Hkv, float scale, int S, float* scratch,
+                          float* out, cudaStream_t s, int cap);
 /// out [T][F] BF16 = silu(gu[t][f]) * gu[t][F + f] (gu [T][2 F] F32: gate's then up's).
 void silu_mul_bf16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s);
 /// The Markov head's input [state (R); emb[prev] (R, BF16 table); hidden (C); f (C)] as BF16 into out [2 R + 2 C].
@@ -490,6 +497,22 @@ void rdna3_expert_gemm(int type, const uint8_t* const* experts, size_t offset, E
 void rdna3_expert_swiglu(int type, const uint8_t* const* experts, ExpertTiles tiles, const uint16_t* input,
                          int K, int F, const float* sg, const float* su, float gate_cap, float up_cap,
                          uint16_t* hidden, cudaStream_t stream);
+/// Native RDNA3 single-token NVFP4 experts (no LDS staging, direct v_perm_b32 decode).
+void rdna3_nvfp4_token_gu(const uint8_t* const* blob, const int* tok, int S, size_t eb0, const float* x, int C, int F,
+                          const float* sg, const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s);
+void rdna3_nvfp4_token_down(const uint8_t* const* blob, int S, size_t off_down, const uint16_t* h, int C, int F,
+                            float* y, cudaStream_t s);
+/// Native RDNA3 grouped block experts (NVFP4 / Q8_0 / IQ4_NL) for speculative verification windows (<= 8 tokens/group).
+void rdna3_experts_block_gu(int type, const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G,
+                            int T, size_t off_up, int C, int F, const uint16_t* x16, const float* sg, const float* su,
+                            float gcap, float ucap, uint16_t* h, cudaStream_t s);
+void rdna3_experts_block_down(int type, const uint8_t* const* blob, const int* n, const int* row, int G, int T,
+                              size_t off_down, int C, int F, const uint16_t* h, float* y, cudaStream_t s);
+/// Coalesced small-T BF16 matrix product: Y [T][N] (ldy) = X [T][K] BF16 . W [N][K]^T BF16 (F32 sums, T <= 8).
+void rdna3_bf16_gemm(const uint16_t* W, int N, int K, const uint16_t* X, int T, float* Y, int ldy, cudaStream_t s);
+/// Fused separate-input sliding QKV/R/G planar Q8 projection for T <= 8 block verification.
+void rdna3_q8_tile_qkv_sep(const int8_t* q, const uint16_t* d, int N, int K, int HD, int KD, const uint16_t* xq,
+                           const uint16_t* xk, const uint16_t* xv, int T, float* y, int ldy, cudaStream_t s);
 #endif
 /// values a block / bytes a block (0: not one of the above).
 int block_values(int type);

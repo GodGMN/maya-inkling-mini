@@ -374,6 +374,553 @@ __global__ void dense_q8_wmma(const int8_t* weights, const uint16_t* scales, int
     }
 }
 
+__device__ __forceinline__ float wsum32(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o, 32);
+    return v;
+}
+
+__device__ __forceinline__ float nv_ue4m3_f32(uint8_t x) {
+    const uint32_t e = (x >> 3) & 0xFu;
+    const uint32_t m = x & 7u;
+    const float norm_f = __uint_as_float(((e + 119u) << 23) | (m << 20));
+    const float sub_f = (float)m * 0x1.0p-10f;
+    const float v = (e == 0u) ? sub_f : norm_f;
+    return (x == 0x7Fu) ? 0.0f : v;
+}
+
+__device__ __forceinline__ float2 h2u_to_f2(uint32_t u) {
+    const Half2 h = __builtin_bit_cast(Half2, u);
+    return make_float2((float)h[0], (float)h[1]);
+}
+
+__device__ __forceinline__ float fdot2_u32(uint32_t a, uint32_t b, float acc) {
+#if __has_builtin(__builtin_amdgcn_fdot2)
+    return __builtin_amdgcn_fdot2(__builtin_bit_cast(Half2, a), __builtin_bit_cast(Half2, b), acc, false);
+#else
+    const float2 fa = h2u_to_f2(a), fb = h2u_to_f2(b);
+    return fmaf(fa.x, fb.x, fmaf(fa.y, fb.y, acc));
+#endif
+}
+
+// Four E2M1 nibbles (in the low nibbles of each byte of `codes`) -> four FP32 weights (scaled by 2x,
+// matched by nv_ue4m3_f32's 0.5x bias).
+__device__ __forceinline__ float4 nv4_f32(uint32_t codes) {
+    const uint32_t mag = __builtin_amdgcn_perm(0x4a484644u, 0x42403c00u, codes & 0x07070707u);
+    const uint32_t hi = mag | ((codes & 0x08080808u) << 4);
+    const float2 lo = h2u_to_f2(__builtin_amdgcn_perm(0u, hi, 0x01040004u));
+    const float2 h2 = h2u_to_f2(__builtin_amdgcn_perm(0u, hi, 0x03040204u));
+    return make_float4(lo.x, lo.y, h2.x, h2.y);
+}
+
+__device__ __forceinline__ float dot4_f4(float4 a, float4 b) {
+    return fmaf(a.x, b.x, fmaf(a.y, b.y, fmaf(a.z, b.z, a.w * b.w)));
+}
+
+// Coalesced small-T planar Q8 matrix product: 1 wave per output row, 128-byte coalesced weight reads,
+// exact FP32 scale & FMA (matches single-token decode numerics) with low VGPR count (~28-38 VGPRs).
+template <int TFixed>
+__global__ void rdna3_q8_mv_rows(const int8_t* __restrict__ q, const uint16_t* __restrict__ scales, int N, int K,
+                                 const uint16_t* __restrict__ input, float* __restrict__ output, int ld) {
+    constexpr int warps = 4;
+    const int row = blockIdx.x * warps + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= N) return;
+    const uint32_t* qr = (const uint32_t*)(q + (size_t)row * K);
+    const uint16_t* dr = scales + (size_t)row * (K >> 5);
+    float acc[TFixed] = {};
+    const int n_it = K >> 7;
+#pragma unroll 1
+    for (int it = 0; it < n_it; ++it) {
+        const int off32 = it * 32 + lane;
+        const uint32_t w = qr[off32];
+        const float dv = (float)__builtin_bit_cast(_Float16, dr[it * 4 + (lane >> 3)]);
+        const float w0 = dv * (float)(int8_t)(w & 0xFFu);
+        const float w1 = dv * (float)(int8_t)((w >> 8) & 0xFFu);
+        const float w2 = dv * (float)(int8_t)((w >> 16) & 0xFFu);
+        const float w3 = dv * (float)(int8_t)(w >> 24);
+        const size_t xoff = (size_t)off32 * 4;
+#pragma unroll
+        for (int t = 0; t < TFixed; ++t) {
+            const uint2 xh = *(const uint2*)(input + (size_t)t * K + xoff);
+            const float2 x01 = h2u_to_f2(xh.x), x23 = h2u_to_f2(xh.y);
+            acc[t] = fmaf(w0, x01.x, fmaf(w1, x01.y, fmaf(w2, x23.x, fmaf(w3, x23.y, acc[t]))));
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TFixed; ++t) {
+        const float s = wsum32(acc[t]);
+        if (lane == 0) output[(size_t)t * ld + row] = s;
+    }
+}
+
+// Fused separate-input sliding QKV/R/G planar Q8 projection: replaces 4 small launches with 1 full-occupancy launch.
+template <int TFixed>
+__global__ void rdna3_q8_mv_rows_sep(const int8_t* __restrict__ q, const uint16_t* __restrict__ scales, int N, int K,
+                                     int HD, int KD, const uint16_t* __restrict__ xq, const uint16_t* __restrict__ xk,
+                                     const uint16_t* __restrict__ xv, float* __restrict__ output, int ld) {
+    constexpr int warps = 4;
+    const int row = blockIdx.x * warps + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= N) return;
+    const uint16_t* input = (row < HD || row >= HD + 2 * KD) ? xq : (row < HD + KD ? xk : xv);
+    const uint32_t* qr = (const uint32_t*)(q + (size_t)row * K);
+    const uint16_t* dr = scales + (size_t)row * (K >> 5);
+    float acc[TFixed] = {};
+    const int n_it = K >> 7;
+#pragma unroll 1
+    for (int it = 0; it < n_it; ++it) {
+        const int off32 = it * 32 + lane;
+        const uint32_t w = qr[off32];
+        const float dv = (float)__builtin_bit_cast(_Float16, dr[it * 4 + (lane >> 3)]);
+        const float w0 = dv * (float)(int8_t)(w & 0xFFu);
+        const float w1 = dv * (float)(int8_t)((w >> 8) & 0xFFu);
+        const float w2 = dv * (float)(int8_t)((w >> 16) & 0xFFu);
+        const float w3 = dv * (float)(int8_t)(w >> 24);
+        const size_t xoff = (size_t)off32 * 4;
+#pragma unroll
+        for (int t = 0; t < TFixed; ++t) {
+            const uint2 xh = *(const uint2*)(input + (size_t)t * K + xoff);
+            const float2 x01 = h2u_to_f2(xh.x), x23 = h2u_to_f2(xh.y);
+            acc[t] = fmaf(w0, x01.x, fmaf(w1, x01.y, fmaf(w2, x23.x, fmaf(w3, x23.y, acc[t]))));
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TFixed; ++t) {
+        const float s = wsum32(acc[t]);
+        if (lane == 0) output[(size_t)t * ld + row] = s;
+    }
+}
+
+// Coalesced small-T BF16 matrix product: Y [T][N] (ld) = X [T][K] BF16 . W [N][K]^T BF16, F32 sums.
+template <int TFixed>
+__global__ void rdna3_bf16_mv_rows(const uint16_t* __restrict__ W, int N, int K,
+                                   const uint16_t* __restrict__ X, float* __restrict__ Y, int ld) {
+    constexpr int warps = 4;
+    const int row = blockIdx.x * warps + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= N) return;
+    const uint16_t* wr = W + (size_t)row * K;
+    float acc[TFixed] = {};
+#pragma unroll 1
+    for (int k = lane * 4; k < K; k += 128) {
+        const uint2 w4 = *(const uint2*)(wr + k);
+        const float w0 = __uint_as_float((w4.x & 0xFFFFu) << 16);
+        const float w1 = __uint_as_float(w4.x & 0xFFFF0000u);
+        const float w2 = __uint_as_float((w4.y & 0xFFFFu) << 16);
+        const float w3 = __uint_as_float(w4.y & 0xFFFF0000u);
+#pragma unroll
+        for (int t = 0; t < TFixed; ++t) {
+            const uint2 x4 = *(const uint2*)(X + (size_t)t * K + k);
+            acc[t] = fmaf(w0, __uint_as_float((x4.x & 0xFFFFu) << 16),
+                     fmaf(w1, __uint_as_float(x4.x & 0xFFFF0000u),
+                     fmaf(w2, __uint_as_float((x4.y & 0xFFFFu) << 16),
+                     fmaf(w3, __uint_as_float(x4.y & 0xFFFF0000u), acc[t]))));
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TFixed; ++t) {
+        const float s = wsum32(acc[t]);
+        if (lane == 0) Y[(size_t)t * ld + row] = s;
+    }
+}
+
+// Single-token NVFP4 gate/up + SwiGLU: no LDS staging, 2 output channels per wave to reuse x in registers.
+template <int Rows>
+__global__ void rdna3_nvfp4_gu_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ tok,
+                                      size_t eb0, const float* __restrict__ x, int C, int F,
+                                      const float* __restrict__ sg, const float* __restrict__ su,
+                                      float gcap, float ucap, uint16_t* __restrict__ h) {
+    constexpr int warps = 4;
+    const int slot = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int first = (blockIdx.x * warps + (threadIdx.x >> 5)) * Rows;
+    if (first >= F) return;
+    const size_t rb = (size_t)(C / 64) * 36;
+    const uint8_t* base = blob[slot] + (size_t)first * rb;
+    const float* xp = x + (size_t)tok[slot] * C;
+    float ag[Rows] = {}, au[Rows] = {};
+    const int nsub = C / 16;
+    for (int sb = lane; sb < nsub; sb += 32) {
+        const float4 x0 = *(const float4*)(xp + sb * 16 + 0);
+        const float4 x1 = *(const float4*)(xp + sb * 16 + 4);
+        const float4 x2 = *(const float4*)(xp + sb * 16 + 8);
+        const float4 x3 = *(const float4*)(xp + sb * 16 + 12);
+        const size_t blk_off = (size_t)(sb >> 2) * 36;
+        const int sub = sb & 3;
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            if (first + r >= F) break;
+            const uint8_t* bg = base + (size_t)r * rb + blk_off;
+            const float dg = nv_ue4m3_f32((uint8_t)(*(const uint32_t*)bg >> (8 * sub)));
+            const uint32_t g0 = *(const uint32_t*)(bg + 4 + sub * 8);
+            const uint32_t g1 = *(const uint32_t*)(bg + 8 + sub * 8);
+            ag[r] += dg * (dot4_f4(nv4_f32(g0), x0) + dot4_f4(nv4_f32(g1), x1) +
+                           dot4_f4(nv4_f32(g0 >> 4), x2) + dot4_f4(nv4_f32(g1 >> 4), x3));
+
+            const uint8_t* bu = bg + eb0;
+            const float du = nv_ue4m3_f32((uint8_t)(*(const uint32_t*)bu >> (8 * sub)));
+            const uint32_t u0 = *(const uint32_t*)(bu + 4 + sub * 8);
+            const uint32_t u1 = *(const uint32_t*)(bu + 8 + sub * 8);
+            au[r] += du * (dot4_f4(nv4_f32(u0), x0) + dot4_f4(nv4_f32(u1), x1) +
+                           dot4_f4(nv4_f32(u0 >> 4), x2) + dot4_f4(nv4_f32(u1 >> 4), x3));
+        }
+    }
+    const float sgs = sg ? sg[slot] : 1.0f;
+    const float sus = su ? su[slot] : 1.0f;
+#pragma unroll
+    for (int r = 0; r < Rows; ++r) {
+        if (first + r >= F) break;
+        const float vg = wsum32(ag[r]);
+        const float vu = wsum32(au[r]);
+        if (lane == 0) {
+            const float g = vg * sgs, u = vu * sus;
+            const float v = gcap * tanhf(g / gcap) * (1.f / (1.f + expf(-g))) * ucap * tanhf(u / ucap);
+            h[(size_t)slot * F + first + r] = __builtin_bit_cast(uint16_t, (_Float16)v);
+        }
+    }
+}
+
+// Single-token NVFP4 down projection: FP16 activations via v_dot2_f32_f16, 4 rows per wave, zero LDS.
+template <int Rows>
+__global__ void rdna3_nvfp4_down_kernel(const uint8_t* const* __restrict__ blob, size_t off_down,
+                                        const uint16_t* __restrict__ h, int C, int F, float* __restrict__ y) {
+    constexpr int warps = 4;
+    const int slot = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int first = (blockIdx.x * warps + (threadIdx.x >> 5)) * Rows;
+    if (first >= C) return;
+    const size_t rb = (size_t)(F / 64) * 36;
+    const uint8_t* base = blob[slot] + off_down + (size_t)first * rb;
+    const uint16_t* hp = h + (size_t)slot * F;
+    float acc[Rows] = {};
+    const int nsub = F / 16;
+    for (int sb = lane; sb < nsub; sb += 32) {
+        const uint4 x0 = *(const uint4*)(hp + sb * 16 + 0);
+        const uint4 x1 = *(const uint4*)(hp + sb * 16 + 8);
+        const size_t blk_off = (size_t)(sb >> 2) * 36;
+        const int sub = sb & 3;
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            if (first + r >= C) break;
+            const uint8_t* b = base + (size_t)r * rb + blk_off;
+            const _Float16 sc = nv_scale((uint8_t)(*(const uint32_t*)b >> (8 * sub)));
+            const uint32_t q0 = *(const uint32_t*)(b + 4 + sub * 8);
+            const uint32_t q1 = *(const uint32_t*)(b + 8 + sub * 8);
+            const uint2 w01 = nv_four_halves(q0, sc);
+            const uint2 w23 = nv_four_halves(q1, sc);
+            const uint2 w45 = nv_four_halves(q0 >> 4, sc);
+            const uint2 w67 = nv_four_halves(q1 >> 4, sc);
+            float a = acc[r];
+            a = fdot2_u32(w01.x, x0.x, a);
+            a = fdot2_u32(w01.y, x0.y, a);
+            a = fdot2_u32(w23.x, x0.z, a);
+            a = fdot2_u32(w23.y, x0.w, a);
+            a = fdot2_u32(w45.x, x1.x, a);
+            a = fdot2_u32(w45.y, x1.y, a);
+            a = fdot2_u32(w67.x, x1.z, a);
+            a = fdot2_u32(w67.y, x1.w, a);
+            acc[r] = a;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Rows; ++r) {
+        if (first + r >= C) break;
+        const float v = wsum32(acc[r]);
+        if (lane == 0) y[(size_t)slot * C + first + r] = v;
+    }
+}
+
+// Grouped block-verify NVFP4 gate/up + SwiGLU:
+// Separate __global__ per MaxT (2..8), FP16 activations via v_dot2_f32_f16, sequential gate/up decode,
+// SGPR tok_g indexing -> ~36-44 VGPRs, 0 spills, high CU occupancy!
+template <int MaxT>
+__global__ void rdna3_block_gu_nvfp4_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n,
+                                            const int* __restrict__ tok, const int* __restrict__ row, size_t off_up,
+                                            int C, int F, const uint16_t* __restrict__ x16, const float* __restrict__ sg,
+                                            const float* __restrict__ su, float gcap, float ucap,
+                                            uint16_t* __restrict__ h) {
+    constexpr int warps = 4;
+    const int g = blockIdx.y, ng = n[g];
+    if (ng <= 0) return;
+    const int r = blockIdx.x * warps + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (r >= F) return;
+    const uint8_t* bl = blob[g];
+    const int* tok_g = tok + g * kGroupMax;
+    const int* row_g = row + g * kGroupMax;
+    const size_t rb = (size_t)(C / 64) * 36;
+    const uint8_t* wg = bl + (size_t)r * rb;
+    const uint8_t* wu = wg + off_up;
+    float ag[MaxT] = {}, au[MaxT] = {};
+    const int nsub = C / 16;
+    for (int sb = lane; sb < nsub; sb += 32) {
+        const size_t blk_off = (size_t)(sb >> 2) * 36;
+        const int sub = sb & 3;
+        const int koff = sb * 16;
+        {
+            const uint8_t* bg = wg + blk_off;
+            const _Float16 dg = nv_scale((uint8_t)(*(const uint32_t*)bg >> (8 * sub)));
+            const uint32_t g0 = *(const uint32_t*)(bg + 4 + sub * 8);
+            const uint32_t g1 = *(const uint32_t*)(bg + 8 + sub * 8);
+            const uint2 w01 = nv_four_halves(g0, dg);
+            const uint2 w23 = nv_four_halves(g1, dg);
+            const uint2 w45 = nv_four_halves(g0 >> 4, dg);
+            const uint2 w67 = nv_four_halves(g1 >> 4, dg);
+#pragma unroll
+            for (int t = 0; t < MaxT; ++t) {
+                if (t >= ng) break;
+                const uint16_t* xp = x16 + (size_t)tok_g[t] * C + koff;
+                const uint4 x0 = *(const uint4*)(xp + 0);
+                const uint4 x1 = *(const uint4*)(xp + 8);
+                float a = ag[t];
+                a = fdot2_u32(w01.x, x0.x, a); a = fdot2_u32(w01.y, x0.y, a);
+                a = fdot2_u32(w23.x, x0.z, a); a = fdot2_u32(w23.y, x0.w, a);
+                a = fdot2_u32(w45.x, x1.x, a); a = fdot2_u32(w45.y, x1.y, a);
+                a = fdot2_u32(w67.x, x1.z, a); a = fdot2_u32(w67.y, x1.w, a);
+                ag[t] = a;
+            }
+        }
+        {
+            const uint8_t* bu = wu + blk_off;
+            const _Float16 du = nv_scale((uint8_t)(*(const uint32_t*)bu >> (8 * sub)));
+            const uint32_t u0 = *(const uint32_t*)(bu + 4 + sub * 8);
+            const uint32_t u1 = *(const uint32_t*)(bu + 8 + sub * 8);
+            const uint2 w01 = nv_four_halves(u0, du);
+            const uint2 w23 = nv_four_halves(u1, du);
+            const uint2 w45 = nv_four_halves(u0 >> 4, du);
+            const uint2 w67 = nv_four_halves(u1 >> 4, du);
+#pragma unroll
+            for (int t = 0; t < MaxT; ++t) {
+                if (t >= ng) break;
+                const uint16_t* xp = x16 + (size_t)tok_g[t] * C + koff;
+                const uint4 x0 = *(const uint4*)(xp + 0);
+                const uint4 x1 = *(const uint4*)(xp + 8);
+                float a = au[t];
+                a = fdot2_u32(w01.x, x0.x, a); a = fdot2_u32(w01.y, x0.y, a);
+                a = fdot2_u32(w23.x, x0.z, a); a = fdot2_u32(w23.y, x0.w, a);
+                a = fdot2_u32(w45.x, x1.x, a); a = fdot2_u32(w45.y, x1.y, a);
+                a = fdot2_u32(w67.x, x1.z, a); a = fdot2_u32(w67.y, x1.w, a);
+                au[t] = a;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MaxT; ++t) {
+        if (t >= ng) break;
+        const float vg = wsum32(ag[t]);
+        const float vu = wsum32(au[t]);
+        if (lane == 0) {
+            const int slot = row_g[t];
+            const float g_val = vg * (sg ? sg[slot] : 1.0f);
+            const float u_val = vu * (su ? su[slot] : 1.0f);
+            const float v = gcap * tanhf(g_val / gcap) * (1.f / (1.f + expf(-g_val))) * ucap * tanhf(u_val / ucap);
+            h[(size_t)slot * F + r] = __builtin_bit_cast(uint16_t, (_Float16)v);
+        }
+    }
+}
+
+// Grouped block-verify NVFP4 down projection: separate __global__ per MaxT (2..8), ~32-40 VGPRs, 0 spills.
+template <int MaxT>
+__global__ void rdna3_block_down_nvfp4_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n,
+                                              const int* __restrict__ row, size_t off_down, int C, int F,
+                                              const uint16_t* __restrict__ h, float* __restrict__ y) {
+    constexpr int warps = 4;
+    const int g = blockIdx.y, ng = n[g];
+    if (ng <= 0) return;
+    const int r = blockIdx.x * warps + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (r >= C) return;
+    const uint8_t* w = blob[g] + off_down;
+    const int* row_g = row + g * kGroupMax;
+    const size_t rb = (size_t)(F / 64) * 36;
+    const uint8_t* wr = w + (size_t)r * rb;
+    float acc[MaxT] = {};
+    const int nsub = F / 16;
+    for (int sb = lane; sb < nsub; sb += 32) {
+        const uint8_t* b = wr + (size_t)(sb >> 2) * 36;
+        const int sub = sb & 3;
+        const int koff = sb * 16;
+        const _Float16 sc = nv_scale((uint8_t)(*(const uint32_t*)b >> (8 * sub)));
+        const uint32_t q0 = *(const uint32_t*)(b + 4 + sub * 8);
+        const uint32_t q1 = *(const uint32_t*)(b + 8 + sub * 8);
+        const uint2 w01 = nv_four_halves(q0, sc);
+        const uint2 w23 = nv_four_halves(q1, sc);
+        const uint2 w45 = nv_four_halves(q0 >> 4, sc);
+        const uint2 w67 = nv_four_halves(q1 >> 4, sc);
+#pragma unroll
+        for (int t = 0; t < MaxT; ++t) {
+            if (t >= ng) break;
+            const uint16_t* hp = h + (size_t)row_g[t] * F + koff;
+            const uint4 x0 = *(const uint4*)(hp + 0);
+            const uint4 x1 = *(const uint4*)(hp + 8);
+            float a = acc[t];
+            a = fdot2_u32(w01.x, x0.x, a); a = fdot2_u32(w01.y, x0.y, a);
+            a = fdot2_u32(w23.x, x0.z, a); a = fdot2_u32(w23.y, x0.w, a);
+            a = fdot2_u32(w45.x, x1.x, a); a = fdot2_u32(w45.y, x1.y, a);
+            a = fdot2_u32(w67.x, x1.z, a); a = fdot2_u32(w67.y, x1.w, a);
+            acc[t] = a;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MaxT; ++t) {
+        if (t >= ng) break;
+        const float v = wsum32(acc[t]);
+        if (lane == 0) y[(size_t)row_g[t] * C + r] = v;
+    }
+}
+
+// Grouped block-verify 32-weight block (Q8_0 / IQ4_NL) gate/up + SwiGLU: scaled_byte_pair + v_dot2_f32_f16.
+template <int Type, int MaxT>
+__global__ void rdna3_block_gu_32_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n,
+                                         const int* __restrict__ tok, const int* __restrict__ row, size_t off_up,
+                                         int C, int F, const uint16_t* __restrict__ x16, const float* __restrict__ sg,
+                                         const float* __restrict__ su, float gcap, float ucap,
+                                         uint16_t* __restrict__ h) {
+    static_assert(Type == kQ8_0 || Type == kIQ4_NL);
+    constexpr int warps = 4;
+    constexpr int kBlkBytes = Type == kIQ4_NL ? 18 : 34;
+    const int g = blockIdx.y, ng = n[g];
+    if (ng <= 0) return;
+    const int r = blockIdx.x * warps + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, word = lane & 3;
+    if (r >= F) return;
+    const uint8_t* bl = blob[g];
+    const int* tok_g = tok + g * kGroupMax;
+    const int* row_g = row + g * kGroupMax;
+    const size_t rb = (size_t)(C / 32) * kBlkBytes;
+    const uint8_t* wg = bl + (size_t)r * rb;
+    const uint8_t* wu = wg + off_up;
+    float ag[MaxT] = {}, au[MaxT] = {};
+    for (int b = lane >> 2; b < C / 32; b += 8) {
+        const int koff = b * 32 + word * 4;
+        {
+            const uint8_t* bg = wg + (size_t)b * kBlkBytes;
+            uint16_t dg16; uint32_t gl, gh;
+            __builtin_memcpy(&dg16, bg, 2);
+            if constexpr (Type == kIQ4_NL) {
+                uint32_t packed;
+                __builtin_memcpy(&packed, bg + 2 + word * 4, 4);
+                gl = iq4_values(packed);
+                gh = iq4_values(packed >> 4);
+            } else {
+                __builtin_memcpy(&gl, bg + 2 + word * 4, 4);
+                __builtin_memcpy(&gh, bg + 18 + word * 4, 4);
+            }
+            const _Float16 dg = __builtin_bit_cast(_Float16, dg16);
+            const uint32_t w0 = scaled_byte_pair<false>(gl, dg), w1 = scaled_byte_pair<true>(gl, dg);
+            const uint32_t w2 = scaled_byte_pair<false>(gh, dg), w3 = scaled_byte_pair<true>(gh, dg);
+#pragma unroll
+            for (int t = 0; t < MaxT; ++t) {
+                if (t >= ng) break;
+                const uint16_t* xp = x16 + (size_t)tok_g[t] * C + koff;
+                const uint2 xl = *(const uint2*)(xp);
+                const uint2 xh = *(const uint2*)(xp + 16);
+                float a = ag[t];
+                a = fdot2_u32(w0, xl.x, a); a = fdot2_u32(w1, xl.y, a);
+                a = fdot2_u32(w2, xh.x, a); a = fdot2_u32(w3, xh.y, a);
+                ag[t] = a;
+            }
+        }
+        {
+            const uint8_t* bu = wu + (size_t)b * kBlkBytes;
+            uint16_t du16; uint32_t ul, uh;
+            __builtin_memcpy(&du16, bu, 2);
+            if constexpr (Type == kIQ4_NL) {
+                uint32_t packed;
+                __builtin_memcpy(&packed, bu + 2 + word * 4, 4);
+                ul = iq4_values(packed);
+                uh = iq4_values(packed >> 4);
+            } else {
+                __builtin_memcpy(&ul, bu + 2 + word * 4, 4);
+                __builtin_memcpy(&uh, bu + 18 + word * 4, 4);
+            }
+            const _Float16 du = __builtin_bit_cast(_Float16, du16);
+            const uint32_t w0 = scaled_byte_pair<false>(ul, du), w1 = scaled_byte_pair<true>(ul, du);
+            const uint32_t w2 = scaled_byte_pair<false>(uh, du), w3 = scaled_byte_pair<true>(uh, du);
+#pragma unroll
+            for (int t = 0; t < MaxT; ++t) {
+                if (t >= ng) break;
+                const uint16_t* xp = x16 + (size_t)tok_g[t] * C + koff;
+                const uint2 xl = *(const uint2*)(xp);
+                const uint2 xh = *(const uint2*)(xp + 16);
+                float a = au[t];
+                a = fdot2_u32(w0, xl.x, a); a = fdot2_u32(w1, xl.y, a);
+                a = fdot2_u32(w2, xh.x, a); a = fdot2_u32(w3, xh.y, a);
+                au[t] = a;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MaxT; ++t) {
+        if (t >= ng) break;
+        const float vg = wsum32(ag[t]);
+        const float vu = wsum32(au[t]);
+        if (lane == 0) {
+            const int slot = row_g[t];
+            const float g_val = vg * (sg ? sg[slot] : 1.0f);
+            const float u_val = vu * (su ? su[slot] : 1.0f);
+            const float v = gcap * tanhf(g_val / gcap) * (1.f / (1.f + expf(-g_val))) * ucap * tanhf(u_val / ucap);
+            h[(size_t)slot * F + r] = __builtin_bit_cast(uint16_t, (_Float16)v);
+        }
+    }
+}
+
+// Grouped block-verify 32-weight block (Q8_0 / IQ4_NL) down projection: scaled_byte_pair + v_dot2_f32_f16.
+template <int Type, int MaxT>
+__global__ void rdna3_block_down_32_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n,
+                                           const int* __restrict__ row, size_t off_down, int C, int F,
+                                           const uint16_t* __restrict__ h, float* __restrict__ y) {
+    static_assert(Type == kQ8_0 || Type == kIQ4_NL);
+    constexpr int warps = 4;
+    constexpr int kBlkBytes = Type == kIQ4_NL ? 18 : 34;
+    const int g = blockIdx.y, ng = n[g];
+    if (ng <= 0) return;
+    const int r = blockIdx.x * warps + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, word = lane & 3;
+    if (r >= C) return;
+    const uint8_t* w = blob[g] + off_down;
+    const int* row_g = row + g * kGroupMax;
+    const size_t rb = (size_t)(F / 32) * kBlkBytes;
+    const uint8_t* wr = w + (size_t)r * rb;
+    float acc[MaxT] = {};
+    for (int b = lane >> 2; b < F / 32; b += 8) {
+        const uint8_t* blk = wr + (size_t)b * kBlkBytes;
+        uint16_t d16; uint32_t wl, wh;
+        __builtin_memcpy(&d16, blk, 2);
+        if constexpr (Type == kIQ4_NL) {
+            uint32_t packed;
+            __builtin_memcpy(&packed, blk + 2 + word * 4, 4);
+            wl = iq4_values(packed);
+            wh = iq4_values(packed >> 4);
+        } else {
+            __builtin_memcpy(&wl, blk + 2 + word * 4, 4);
+            __builtin_memcpy(&wh, blk + 18 + word * 4, 4);
+        }
+        const _Float16 d = __builtin_bit_cast(_Float16, d16);
+        const uint32_t w0 = scaled_byte_pair<false>(wl, d), w1 = scaled_byte_pair<true>(wl, d);
+        const uint32_t w2 = scaled_byte_pair<false>(wh, d), w3 = scaled_byte_pair<true>(wh, d);
+        const int koff = b * 32 + word * 4;
+#pragma unroll
+        for (int t = 0; t < MaxT; ++t) {
+            if (t >= ng) break;
+            const uint16_t* hp = h + (size_t)row_g[t] * F + koff;
+            const uint2 hl = *(const uint2*)(hp);
+            const uint2 hh = *(const uint2*)(hp + 16);
+            float a = acc[t];
+            a = fdot2_u32(w0, hl.x, a); a = fdot2_u32(w1, hl.y, a);
+            a = fdot2_u32(w2, hh.x, a); a = fdot2_u32(w3, hh.y, a);
+            acc[t] = a;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MaxT; ++t) {
+        if (t >= ng) break;
+        const float v = wsum32(acc[t]);
+        if (lane == 0) y[(size_t)row_g[t] * C + r] = v;
+    }
+}
+
 }  // namespace
 
 void rdna3_dense_gemm(const uint16_t* weights, int N, int K, const uint16_t* input, int T, float* output,
@@ -392,8 +939,159 @@ void rdna3_planar_gemm(const int8_t* weights, const uint16_t* scales, int N, int
 
 void q8_tile(const int8_t* q, const uint16_t* scales, int N, int K, const uint16_t* input, int T,
              float* output, int ld, cudaStream_t stream) {
+    static const bool use_mv = !getenv("IK2_Q8_TILE_MV") || atoi(getenv("IK2_Q8_TILE_MV"));
+    if (use_mv && T >= 1 && T <= 8 && K % 128 == 0 && ((uintptr_t)q & 3) == 0 && ((uintptr_t)input & 7) == 0) {
+        const unsigned blocks = (unsigned)((N + 3) / 4);
+        switch (T) {
+            case 1: rdna3_q8_mv_rows<1><<<blocks, 128, 0, stream>>>(q, scales, N, K, input, output, ld); break;
+            case 2: rdna3_q8_mv_rows<2><<<blocks, 128, 0, stream>>>(q, scales, N, K, input, output, ld); break;
+            case 3: rdna3_q8_mv_rows<3><<<blocks, 128, 0, stream>>>(q, scales, N, K, input, output, ld); break;
+            case 4: rdna3_q8_mv_rows<4><<<blocks, 128, 0, stream>>>(q, scales, N, K, input, output, ld); break;
+            case 5: rdna3_q8_mv_rows<5><<<blocks, 128, 0, stream>>>(q, scales, N, K, input, output, ld); break;
+            case 6: rdna3_q8_mv_rows<6><<<blocks, 128, 0, stream>>>(q, scales, N, K, input, output, ld); break;
+            case 7: rdna3_q8_mv_rows<7><<<blocks, 128, 0, stream>>>(q, scales, N, K, input, output, ld); break;
+            case 8: rdna3_q8_mv_rows<8><<<blocks, 128, 0, stream>>>(q, scales, N, K, input, output, ld); break;
+        }
+        check_launch("rdna3_q8_mv_rows");
+        return;
+    }
     dense_q8_wmma<<<dim3((N + 63) / 64, (T + 15) / 16), 128, 0, stream>>>(q, scales, N, K, input, T, output, ld);
     check_launch("dense_q8_wmma");
+}
+
+void rdna3_bf16_gemm(const uint16_t* W, int N, int K, const uint16_t* X, int T, float* Y, int ldy,
+                     cudaStream_t stream) {
+    const unsigned blocks = (unsigned)((N + 3) / 4);
+    switch (T) {
+        case 1: rdna3_bf16_mv_rows<1><<<blocks, 128, 0, stream>>>(W, N, K, X, Y, ldy); break;
+        case 2: rdna3_bf16_mv_rows<2><<<blocks, 128, 0, stream>>>(W, N, K, X, Y, ldy); break;
+        case 3: rdna3_bf16_mv_rows<3><<<blocks, 128, 0, stream>>>(W, N, K, X, Y, ldy); break;
+        case 4: rdna3_bf16_mv_rows<4><<<blocks, 128, 0, stream>>>(W, N, K, X, Y, ldy); break;
+        case 5: rdna3_bf16_mv_rows<5><<<blocks, 128, 0, stream>>>(W, N, K, X, Y, ldy); break;
+        case 6: rdna3_bf16_mv_rows<6><<<blocks, 128, 0, stream>>>(W, N, K, X, Y, ldy); break;
+        case 7: rdna3_bf16_mv_rows<7><<<blocks, 128, 0, stream>>>(W, N, K, X, Y, ldy); break;
+        case 8: rdna3_bf16_mv_rows<8><<<blocks, 128, 0, stream>>>(W, N, K, X, Y, ldy); break;
+    }
+    check_launch("rdna3_bf16_gemm");
+}
+
+void rdna3_q8_tile_qkv_sep(const int8_t* q, const uint16_t* scales, int N, int K, int HD, int KD, const uint16_t* xq,
+                           const uint16_t* xk, const uint16_t* xv, int T, float* y, int ldy, cudaStream_t stream) {
+    const unsigned blocks = (unsigned)((N + 3) / 4);
+    switch (T) {
+        case 1: rdna3_q8_mv_rows_sep<1><<<blocks, 128, 0, stream>>>(q, scales, N, K, HD, KD, xq, xk, xv, y, ldy); break;
+        case 2: rdna3_q8_mv_rows_sep<2><<<blocks, 128, 0, stream>>>(q, scales, N, K, HD, KD, xq, xk, xv, y, ldy); break;
+        case 3: rdna3_q8_mv_rows_sep<3><<<blocks, 128, 0, stream>>>(q, scales, N, K, HD, KD, xq, xk, xv, y, ldy); break;
+        case 4: rdna3_q8_mv_rows_sep<4><<<blocks, 128, 0, stream>>>(q, scales, N, K, HD, KD, xq, xk, xv, y, ldy); break;
+        case 5: rdna3_q8_mv_rows_sep<5><<<blocks, 128, 0, stream>>>(q, scales, N, K, HD, KD, xq, xk, xv, y, ldy); break;
+        case 6: rdna3_q8_mv_rows_sep<6><<<blocks, 128, 0, stream>>>(q, scales, N, K, HD, KD, xq, xk, xv, y, ldy); break;
+        case 7: rdna3_q8_mv_rows_sep<7><<<blocks, 128, 0, stream>>>(q, scales, N, K, HD, KD, xq, xk, xv, y, ldy); break;
+        case 8: rdna3_q8_mv_rows_sep<8><<<blocks, 128, 0, stream>>>(q, scales, N, K, HD, KD, xq, xk, xv, y, ldy); break;
+    }
+    check_launch("rdna3_q8_tile_qkv_sep");
+}
+
+void rdna3_nvfp4_token_gu(const uint8_t* const* blob, const int* tok, int S, size_t eb0, const float* x, int C, int F,
+                          const float* sg, const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s) {
+    if (S <= 0) return;
+    constexpr int rows = 2, warps = 4;
+    rdna3_nvfp4_gu_kernel<rows><<<dim3((unsigned)((F + rows * warps - 1) / (rows * warps)), (unsigned)S),
+                                  warps * 32, 0, s>>>(blob, tok, eb0, x, C, F, sg, su, gcap, ucap, h);
+    check_launch("rdna3_nvfp4_token_gu");
+}
+
+void rdna3_nvfp4_token_down(const uint8_t* const* blob, int S, size_t off_down, const uint16_t* h, int C, int F,
+                            float* y, cudaStream_t s) {
+    if (S <= 0) return;
+    constexpr int rows = 4, warps = 4;
+    rdna3_nvfp4_down_kernel<rows><<<dim3((unsigned)((C + rows * warps - 1) / (rows * warps)), (unsigned)S),
+                                    warps * 32, 0, s>>>(blob, off_down, h, C, F, y);
+    check_launch("rdna3_nvfp4_token_down");
+}
+
+void rdna3_experts_block_gu(int type, const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G,
+                            int T, size_t off_up, int C, int F, const uint16_t* x16, const float* sg, const float* su,
+                            float gcap, float ucap, uint16_t* h, cudaStream_t s) {
+    if (G <= 0) return;
+    const dim3 g((unsigned)((F + 3) / 4), (unsigned)G);
+    const int mt = T < 1 ? 1 : (T > kGroupMax ? kGroupMax : T);
+    if (type == kNVFP4) {
+        switch (mt) {
+            case 1: rdna3_block_gu_nvfp4_kernel<1><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 2: rdna3_block_gu_nvfp4_kernel<2><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 3: rdna3_block_gu_nvfp4_kernel<3><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 4: rdna3_block_gu_nvfp4_kernel<4><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 5: rdna3_block_gu_nvfp4_kernel<5><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 6: rdna3_block_gu_nvfp4_kernel<6><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 7: rdna3_block_gu_nvfp4_kernel<7><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            default: rdna3_block_gu_nvfp4_kernel<8><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+        }
+    } else if (type == kQ8_0) {
+        switch (mt) {
+            case 1: rdna3_block_gu_32_kernel<kQ8_0, 1><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 2: rdna3_block_gu_32_kernel<kQ8_0, 2><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 3: rdna3_block_gu_32_kernel<kQ8_0, 3><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 4: rdna3_block_gu_32_kernel<kQ8_0, 4><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 5: rdna3_block_gu_32_kernel<kQ8_0, 5><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 6: rdna3_block_gu_32_kernel<kQ8_0, 6><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 7: rdna3_block_gu_32_kernel<kQ8_0, 7><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            default: rdna3_block_gu_32_kernel<kQ8_0, 8><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+        }
+    } else if (type == kIQ4_NL) {
+        switch (mt) {
+            case 1: rdna3_block_gu_32_kernel<kIQ4_NL, 1><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 2: rdna3_block_gu_32_kernel<kIQ4_NL, 2><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 3: rdna3_block_gu_32_kernel<kIQ4_NL, 3><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 4: rdna3_block_gu_32_kernel<kIQ4_NL, 4><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 5: rdna3_block_gu_32_kernel<kIQ4_NL, 5><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 6: rdna3_block_gu_32_kernel<kIQ4_NL, 6><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            case 7: rdna3_block_gu_32_kernel<kIQ4_NL, 7><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+            default: rdna3_block_gu_32_kernel<kIQ4_NL, 8><<<g, 128, 0, s>>>(blob, n, tok, row, off_up, C, F, x16, sg, su, gcap, ucap, h); break;
+        }
+    }
+    check_launch("rdna3_experts_block_gu");
+}
+
+void rdna3_experts_block_down(int type, const uint8_t* const* blob, const int* n, const int* row, int G, int T,
+                              size_t off_down, int C, int F, const uint16_t* h, float* y, cudaStream_t s) {
+    if (G <= 0) return;
+    const dim3 g((unsigned)((C + 3) / 4), (unsigned)G);
+    const int mt = T < 1 ? 1 : (T > kGroupMax ? kGroupMax : T);
+    if (type == kNVFP4) {
+        switch (mt) {
+            case 1: rdna3_block_down_nvfp4_kernel<1><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 2: rdna3_block_down_nvfp4_kernel<2><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 3: rdna3_block_down_nvfp4_kernel<3><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 4: rdna3_block_down_nvfp4_kernel<4><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 5: rdna3_block_down_nvfp4_kernel<5><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 6: rdna3_block_down_nvfp4_kernel<6><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 7: rdna3_block_down_nvfp4_kernel<7><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            default: rdna3_block_down_nvfp4_kernel<8><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+        }
+    } else if (type == kQ8_0) {
+        switch (mt) {
+            case 1: rdna3_block_down_32_kernel<kQ8_0, 1><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 2: rdna3_block_down_32_kernel<kQ8_0, 2><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 3: rdna3_block_down_32_kernel<kQ8_0, 3><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 4: rdna3_block_down_32_kernel<kQ8_0, 4><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 5: rdna3_block_down_32_kernel<kQ8_0, 5><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 6: rdna3_block_down_32_kernel<kQ8_0, 6><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 7: rdna3_block_down_32_kernel<kQ8_0, 7><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            default: rdna3_block_down_32_kernel<kQ8_0, 8><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+        }
+    } else if (type == kIQ4_NL) {
+        switch (mt) {
+            case 1: rdna3_block_down_32_kernel<kIQ4_NL, 1><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 2: rdna3_block_down_32_kernel<kIQ4_NL, 2><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 3: rdna3_block_down_32_kernel<kIQ4_NL, 3><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 4: rdna3_block_down_32_kernel<kIQ4_NL, 4><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 5: rdna3_block_down_32_kernel<kIQ4_NL, 5><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 6: rdna3_block_down_32_kernel<kIQ4_NL, 6><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            case 7: rdna3_block_down_32_kernel<kIQ4_NL, 7><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+            default: rdna3_block_down_32_kernel<kIQ4_NL, 8><<<g, 128, 0, s>>>(blob, n, row, off_down, C, F, h, y); break;
+        }
+    }
+    check_launch("rdna3_experts_block_down");
 }
 
 void experts_gate_up_swiglu_mma(const uint8_t* const* blob, int slots, size_t offset, const uint16_t* x,
