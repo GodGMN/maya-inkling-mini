@@ -3771,6 +3771,114 @@ void test_rdna3_speculative_kernels() {
 #endif
 
 #ifndef STRATA_USE_HIP
+// Replay the same graph with fully distinct picks, then with hot experts. This also
+// checks that a smaller group count clears the unused groups from the previous replay.
+void test_batch_groups(int T, int ty) {
+    constexpr int K = 8, C = 320, F = 64;
+    const int S = T * K, E = S + 3;
+    const size_t matrix = C * F / k::block_values(ty) * k::block_bytes(ty);
+    auto weights = rand_blocks(ty, size_t(E) * 3 * C * F);
+    for (size_t off = 0; off < weights.size(); off += k::block_bytes(ty)) {
+        if (ty == k::kNVFP4) std::fill_n(weights.data() + off, 4, uint8_t(0x18));
+        else {
+            const uint16_t scale = f2h_host(1.f / 256);
+            std::memcpy(weights.data() + off, &scale, 2);
+        }
+    }
+    auto* pool = dev(weights);
+    std::vector<const uint8_t*> table(E);
+    for (int e = 0; e < E; ++e) table[e] = pool + e * 3 * matrix;
+    auto** tab = dev(table);
+    auto scales = fvec(E), weights_in = fvec(S);
+    auto* scale = dev(scales);
+    auto* w = dev(weights_in);
+    auto* top = dev_n<int>(S);
+    auto** blobs = dev_n<const uint8_t*>(S);
+    auto* n = dev_n<int>(S);
+    auto* tok = dev_n<int>(S * k::kGroupMax);
+    auto* row = dev_n<int>(S * k::kGroupMax);
+    auto* sg = dev_n<float>(S);
+    auto* su = dev_n<float>(S);
+    auto* wt = dev_n<float>(S);
+    auto* inv = dev_n<int>(S);
+    auto* x = dev(fvec(T * C));
+    auto* x16 = dev_n<uint16_t>(T * C);
+    k::to_f16(x, T * C, x16, 0);
+    auto* h = dev_n<uint16_t>(S * F);
+    auto* y = dev_n<float>(S * C);
+    auto* href = dev_n<uint16_t>(S * F);
+    auto* yref = dev_n<float>(S * C);
+    cudaStream_t stream;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    CU(cudaStreamCreate(&stream));
+    CU(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    k::group_route(top, w, S, K, tab, scale, nullptr, scale, blobs, n, tok, row, sg, su, wt, inv, stream);
+    k::experts_gate_up_swiglu_g(blobs, n, tok, row, S, ty, ty, matrix, x, C, F, sg, su, 20, 20, h, stream, x16);
+    k::experts_down_g(blobs, n, row, S, ty, 2 * matrix, h, C, F, y, stream);
+    CU(cudaStreamEndCapture(stream, &graph));
+    CU(cudaGraphInstantiate(&exec, graph, 0));
+    for (bool skew : {false, true}) {
+        std::vector<int> picks(S), tokens(S);
+        std::vector<const uint8_t*> per_slot(S);
+        std::vector<std::vector<int>> members(E);
+        for (int i = 0; i < S; ++i) {
+            const int t = i / K, rank = i % K;
+            // Expert E-1 receives 19 picks at T=32. Experts 1..7 receive all T.
+            const int e = skew ? (rank ? rank : t < 19 ? E - 1 : t + K) : i + 2;
+            picks[i] = e;
+            members[e].push_back(i);
+            per_slot[i] = table[e];
+            tokens[i] = t;
+        }
+        CU(cudaMemcpy(top, picks.data(), S * sizeof(int), cudaMemcpyHostToDevice));
+        CU(cudaGraphLaunch(exec, stream));
+        auto counts = host(n, S), rows = host(row, S * k::kGroupMax), toks = host(tok, S * k::kGroupMax);
+        auto ptrs = host(blobs, S);
+        auto gates = host(sg, S), ups = host(su, S), scaled = host(wt, S);
+        auto inverse = host(inv, S);
+        bool ok = true;
+        int groups = 0;
+        for (int i = 0; i < S; ++i) {
+            int e = picks[i];
+            ok &= gates[i] == scales[e] && ups[i] == 1 && scaled[i] == weights_in[i] * scales[e] && inverse[i] == i;
+            if (members[e].front() != i) continue;
+            for (int j = 0; j < int(members[e].size()); ++j) {
+                if (j % k::kGroupMax == 0) {
+                    ok &= ptrs[groups] == table[e] && counts[groups] == std::min(k::kGroupMax, int(members[e].size()) - j);
+                    ++groups;
+                }
+                int idx = (groups - 1) * k::kGroupMax + j % k::kGroupMax;
+                ok &= rows[idx] == members[e][j] && toks[idx] == members[e][j] / K;
+            }
+        }
+        expect_true("wide route chunks, scales and slot order", ok && std::all_of(counts.begin() + groups, counts.end(),
+                                                                                  [](int v) { return v == 0; }));
+        auto** refs = dev(per_slot);
+        auto* rt = dev(tokens);
+        k::experts_gate_up_swiglu(refs, rt, S, ty, ty, matrix, x, C, F, sg, su, 20, 20, href, 0);
+        k::experts_down(refs, S, ty, 2 * matrix, href, C, F, yref, 0);
+        auto actual_h = host(h, S * F), ref_h = host(href, S * F);
+        auto actual_y = host(y, S * C), ref_y = host(yref, S * C);
+        if (ty == k::kIQ4_NL) {
+            expect_true("wide IQ4_NL grouped SwiGLU bits", actual_h == ref_h);
+            expect_true("wide IQ4_NL grouped down bits", !std::memcmp(actual_y.data(), ref_y.data(), ref_y.size() * sizeof(float)));
+        } else {
+            std::vector<float> hidden(actual_h.size());
+            std::vector<double> reference(ref_h.size());
+            std::transform(actual_h.begin(), actual_h.end(), hidden.begin(), h2f_host);
+            std::transform(ref_h.begin(), ref_h.end(), reference.begin(), h2f_host);
+            expect(ty == k::kNVFP4 ? "wide NVFP4 grouped SwiGLU" : "wide Q8_0 grouped SwiGLU", hidden, reference, 2e-3, 5e-3);
+            expect(ty == k::kNVFP4 ? "wide NVFP4 grouped down" : "wide Q8_0 grouped down", actual_y, std::vector<double>(ref_y.begin(), ref_y.end()), 2e-3, 5e-3);
+        }
+        cudaFree(refs); cudaFree(rt);
+    }
+    cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
+    cudaFree(pool); cudaFree(tab); cudaFree(scale); cudaFree(w); cudaFree(top); cudaFree(blobs); cudaFree(n);
+    cudaFree(tok); cudaFree(row); cudaFree(sg); cudaFree(su); cudaFree(wt); cudaFree(inv); cudaFree(x); cudaFree(x16);
+    cudaFree(h); cudaFree(y); cudaFree(href); cudaFree(yref);
+}
+
 // A forced peak of six fixes each vector's UE4M3 scale. Off-grid inputs
 // distinguish native quantization from the FP16 fallback.
 void test_blackwell_group(int members, int K, int N, bool gate) {
@@ -3841,6 +3949,11 @@ int main(int argc, char** argv) {
     std::printf("ik2_kernels_test on %s (sm_%d%d)\n", p.name, p.major, p.minor);
 #endif
 #ifndef STRATA_USE_HIP
+    if (argc == 2 && !std::strcmp(argv[1], "--batch-mma")) {
+        setenv("IK2_GROUP_MMA", "3", 1);
+        for (int T : {16, 32}) test_batch_groups(T, k::kNVFP4);
+        return g_fail ? 1 : 0;
+    }
     if (argc == 2 && !std::strcmp(argv[1], "--blackwell")) {
         if (p.major != 12 || p.minor > 1) return 77;
         setenv("IK2_BLACKWELL_NVFP4", "1", 1);
@@ -3906,6 +4019,10 @@ int main(int argc, char** argv) {
 #endif
     test_sequence_kernels();
     test_sparse_decode();
+#ifndef STRATA_USE_HIP
+    for (int T : {16, 32})
+        for (int ty : {k::kIQ4_NL, k::kQ8_0, k::kNVFP4}) test_batch_groups(T, ty);
+#endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

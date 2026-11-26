@@ -45,6 +45,10 @@ void serve_sequences(Model& M, int width, int ctx, int chunk, int image_token, s
     buf.emb_h = W.emb_h; buf.pos_h = W.pos_h; buf.lp_msg = W.lp_msg_all;
     buf.blob = W.blob; buf.tok = W.tok; buf.inv = W.inv;
     buf.sg = W.sg; buf.su = W.su; buf.wt = W.wt;
+#ifndef STRATA_USE_HIP
+    buf.row = W.batch_group_row;
+    if (buf.row) buf.n = W.gidx;
+#endif
     CU(cudaHostAlloc(&buf.logits_h, (size_t)width * c.n_vocab * sizeof(float), cudaHostAllocPortable));
     const size_t candidate_ints = (size_t)width * (2 + 2 * kCandCap);
     buf.cand_d = dalloc<int>(candidate_ints);

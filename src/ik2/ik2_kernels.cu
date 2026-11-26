@@ -3260,6 +3260,27 @@ __device__ void row_dot_multi(int type, const uint8_t* w, const X* const* xs, in
     float acc[N_CAP];
 #pragma unroll
     for (int t = 0; t < N_CAP; ++t) acc[t] = 0.0f;
+#ifndef STRATA_USE_HIP
+    // Match iq4nl_rows' lane assignment, block scaling and reduction order.
+    if (type == kIQ4_NL) {
+        const int word = lane & 3;
+        for (int block = lane >> 2; block < K / 32; block += 8) {
+            const uint8_t* b = w + (size_t)block * 18;
+            uint32_t packed;
+            memcpy(&packed, b + 2 + 4 * word, sizeof(packed));
+            const uint32_t lo = iq4nl_lut4(packed, false), hi = iq4nl_lut4(packed, true);
+            const float scale = h2f(*(const uint16_t*)b);
+#pragma unroll
+            for (int t = 0; t < N_CAP; ++t) {
+                if (t >= n) break;
+                const X* x = xs[t] + block * 32 + 4 * word;
+                const float4 xl = make_float4(xval(x, 0), xval(x, 1), xval(x, 2), xval(x, 3));
+                const float4 xh = make_float4(xval(x, 16), xval(x, 17), xval(x, 18), xval(x, 19));
+                acc[t] += scale * (dot_u32_f4(lo, xl) + dot_u32_f4(hi, xh));
+            }
+        }
+    } else
+#endif
     if (type == kNVFP4) {
         const int nsub = K / 16;
         for (int sb = lane; sb < nsub; sb += 32) {
@@ -5287,16 +5308,13 @@ __global__ void f16_limbs_rows_kernel(const float* __restrict__ x, int T, int C,
     out[(size_t) t * 2 * C + c] = hi, out[(size_t) t * 2 * C + C + c] = f2h(x[i] - h2f(hi));
 }
 
-// a window's picks grouped by expert on the device (one block of S = T K <= 64 threads): top / w [S] (route()'s)
-// -> for each expert picked, group g (in the order of its first pick): blob[g] = tab[e], n[g] its tokens (<= T),
-// tok / row [g][kGroupMax] (the token, and the slot t K + k: the row of h16 / y32); for each slot sg, su, wt (w with
-// down's scale) and inv (the slot itself) - the arrays experts_*_g, experts_block_* and moe_combine_f32 take.
-// Groups past the last have n = 0.
+// The first pick reserves consecutive chunks for its expert. Slot order within each chunk
+// and the original router order used by moe_combine_f32 are both preserved.
 __global__ void group_route_kernel(const int* __restrict__ top, const float* __restrict__ w, int S, int K,
                                    const uint8_t* const* __restrict__ tab, const float* sg_t, const float* su_t,
                                    const float* sd_t, const uint8_t** blob, int* n, int* tok, int* row, float* sg,
                                    float* su, float* wt, int* inv) {
-    __shared__ int ex[64], lead[64], gid[64];
+    __shared__ int ex[kGroupRouteSlots], chunks[kGroupRouteSlots], gid[kGroupRouteSlots];
     const int i = threadIdx.x;
     const int e = i < S ? top[i] : -1;
     ex[i] = e;
@@ -5311,18 +5329,19 @@ __global__ void group_route_kernel(const int* __restrict__ top, const float* __r
                 ++cnt;
             }
     }
-    lead[i] = i < S && first == i;
+    chunks[i] = first == i ? (cnt + kGroupMax - 1) / kGroupMax : 0;
     __syncthreads();
-    if (lead[i]) {
+    if (chunks[i]) {
         int gx = 0;
-        for (int j = 0; j < i; ++j) gx += lead[j];
+        for (int j = 0; j < i; ++j) gx += chunks[j];
         gid[i] = gx;
     }
     __syncthreads();
     if (i >= S) return;
-    const int g = gid[first];
-    tok[g * kGroupMax + m] = i / K, row[g * kGroupMax + m] = i;
-    if (first == i) blob[g] = tab[e], n[g] = cnt;
+    const int g = gid[first] + m / kGroupMax;
+    const int member = m % kGroupMax;
+    tok[g * kGroupMax + member] = i / K, row[g * kGroupMax + member] = i;
+    if (!member) blob[g] = tab[e], n[g] = min(cnt - m, kGroupMax);
     sg[i] = sg_t ? sg_t[e] : 1.0f, su[i] = su_t ? su_t[e] : 1.0f;
     wt[i] = w[i] * (sd_t ? sd_t[e] : 1.0f);
     inv[i] = i;
@@ -7161,11 +7180,11 @@ void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s)
 void group_route(const int* top, const float* w, int S, int K, const uint8_t* const* tab, const float* sg_t,
                  const float* su_t, const float* sd_t, const uint8_t** blob, int* n, int* tok, int* row, float* sg,
                  float* su, float* wt, int* inv, cudaStream_t s) {
-    if (S <= 0 || S > 64) {
-        std::fprintf(stderr, "ik2::k::group_route: %d slots (1 .. 64)\n", S);
+    if (S <= 0 || S > kGroupRouteSlots) {
+        std::fprintf(stderr, "ik2::k::group_route: %d slots (1 .. %d)\n", S, kGroupRouteSlots);
         std::abort();
     }
-    group_route_kernel<<<1, 64, 0, s>>>(top, w, S, K, tab, sg_t, su_t, sd_t, blob, n, tok, row, sg, su, wt, inv);
+    group_route_kernel<<<1, ((S + 31) / 32) * 32, 0, s>>>(top, w, S, K, tab, sg_t, su_t, sd_t, blob, n, tok, row, sg, su, wt, inv);
     check("group_route");
 }
 void experts_block_gu(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
