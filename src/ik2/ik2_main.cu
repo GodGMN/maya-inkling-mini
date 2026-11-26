@@ -5768,31 +5768,75 @@ int main(int argc, char** argv) {
             const double tw = now();
             const uint64_t m0 = EC.misses, b0 = EC.bytes_up;
             int n = 0;
-            int max_bulk_pitch = 0;
 #ifndef STRATA_USE_HIP
-            int integrated = 0;
-            CU(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, d));
+            bool use_fast_load = false;
+            constexpr size_t kStageBytes = 64ULL << 20;
+            uint8_t* stage[2] = {};
+            cudaEvent_t stage_done[2] = {};
+            bool stage_used[2] = {false, false};
+            int stage_idx = 0;
+            const int pack_threads = std::max(1, std::min(threads > 0 ? threads : 8, 12));
             const char* fast_load = getenv("IK2_FAST_LOAD");
-            if (host_mmap && EC.tp < 0 && (fast_load ? atoi(fast_load) != 0 : integrated != 0))
-                CU(cudaDeviceGetAttribute(&max_bulk_pitch, cudaDevAttrMaxPitch, d));
-#endif
+            if (host_mmap && EC.tp < 0 && (!fast_load || atoi(fast_load) != 0)) {
+                if (cudaHostAlloc(&stage[0], kStageBytes, cudaHostAllocDefault) == cudaSuccess &&
+                    cudaHostAlloc(&stage[1], kStageBytes, cudaHostAllocDefault) == cudaSuccess) {
+                    CU(cudaEventCreateWithFlags(&stage_done[0], cudaEventDisableTiming));
+                    CU(cudaEventCreateWithFlags(&stage_done[1], cudaEventDisableTiming));
+                    use_fast_load = true;
+                } else {
+                    cudaGetLastError();
+                    if (stage[0]) cudaFreeHost(stage[0]);
+                    stage[0] = stage[1] = nullptr;
+                }
+            }
             for (int l = 0; l < c.n_layer; ++l) {
                 const Layer& ly = M.L[l];
                 const size_t pitch = EC.pools[EC.layer_pool[l]].slot_bytes;
-                const bool bulk = std::max({pitch, ly.stride[0], ly.stride[1], ly.stride[2]}) <= (size_t)max_bulk_pitch;
+                const bool bulk = use_fast_load && pitch <= kStageBytes;
                 // Warm profiles can leave holes. Only combine consecutive missing
                 // experts that the allocator placed in consecutive physical slots.
                 uint8_t* first = nullptr;
                 int start = 0, count = 0;
                 auto flush = [&] {
                     if (!count) return;
-                    size_t offset = 0;
-                    for (int r = 0; r < 3; ++r) {
-                        CU(cudaMemcpy2DAsync(first + offset, pitch, ly.host[r] + (size_t)start * ly.stride[r],
-                                             ly.stride[r], ly.eb[r], count, cudaMemcpyHostToDevice, g_cs));
-                        offset += ly.eb[r];
+                    const size_t active_bytes = ly.eb[0] + ly.eb[1] + ly.eb[2];
+                    const int chunk_e = std::max(1, (int)(kStageBytes / pitch));
+                    for (int off_e = 0; off_e < count; off_e += chunk_e) {
+                        const int cnt = std::min(chunk_e, count - off_e);
+                        const int b = stage_idx++ & 1;
+                        if (stage_used[b]) CU(cudaEventSynchronize(stage_done[b]));
+                        uint8_t* sbuf = stage[b];
+                        const int nt = std::min(pack_threads, cnt);
+                        auto pack_range = [&](int lo, int hi) {
+                            for (int k = lo; k < hi; ++k) {
+                                uint8_t* dst_e = sbuf + (size_t)k * pitch;
+                                size_t off = 0;
+                                for (int r = 0; r < 3; ++r) {
+                                    std::memcpy(dst_e + off,
+                                                ly.host[r] + (size_t)(start + off_e + k) * ly.stride[r],
+                                                ly.eb[r]);
+                                    off += ly.eb[r];
+                                }
+                            }
+                        };
+                        if (nt <= 1) {
+                            pack_range(0, cnt);
+                        } else {
+                            std::vector<std::thread> workers;
+                            workers.reserve(nt - 1);
+                            for (int t = 0; t < nt; ++t) {
+                                const int lo = cnt * t / nt, hi = cnt * (t + 1) / nt;
+                                if (t + 1 < nt) workers.emplace_back(pack_range, lo, hi);
+                                else pack_range(lo, hi);
+                            }
+                            for (auto& w : workers) w.join();
+                        }
+                        CU(cudaMemcpyAsync(first + (size_t)off_e * pitch, sbuf, (size_t)cnt * pitch,
+                                           cudaMemcpyHostToDevice, g_cs));
+                        CU(cudaEventRecord(stage_done[b], g_cs));
+                        stage_used[b] = true;
+                        EC.bytes_up += (size_t)cnt * active_bytes;
                     }
-                    EC.bytes_up += count * offset;
                     count = 0;
                 };
                 for (int e = 0; e < c.E; ++e) {
@@ -5807,6 +5851,18 @@ int main(int argc, char** argv) {
                 flush();
             }
             CU(cudaStreamSynchronize(g_cs));
+            if (use_fast_load) {
+                CU(cudaEventDestroy(stage_done[0]));
+                CU(cudaEventDestroy(stage_done[1]));
+                CU(cudaFreeHost(stage[0]));
+                CU(cudaFreeHost(stage[1]));
+            }
+#else
+            for (int l = 0; l < c.n_layer; ++l)
+                for (int e = 0; e < c.E; ++e)
+                    if (!EC.has(l, e)) EC.get(M.L[l], l, e, EC.tick, g_cs, nullptr, true, true), ++n;
+            CU(cudaStreamSynchronize(g_cs));
+#endif
             ++EC.tick;
             for (int l = 0; l < c.n_layer; ++l) {
                 Layer& Ly = M.L[l];

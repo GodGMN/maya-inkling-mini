@@ -437,7 +437,17 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
         const uint16_t* w = sink_w + (size_t) h * sink_k;
         const float* sx = sink_x + (size_t) t * sink_k;
         float a = 0.0f;
-        for (int j = lane; j < sink_k; j += 32) a += h2f(w[j]) * sx[j];
+#ifndef STRATA_USE_HIP
+        if ((sink_k & 127) == 0 && ((uintptr_t)w & 7) == 0 && ((uintptr_t)sx & 15) == 0) {
+            for (int j = lane * 4; j < sink_k; j += 128) {
+                const uint2 wh = *(const uint2*)(w + j);
+                const float2 w01 = u32_to_f2(wh.x), w23 = u32_to_f2(wh.y);
+                const float4 xv = *(const float4*)(sx + j);
+                a = fmaf(w01.x, xv.x, fmaf(w01.y, xv.y, fmaf(w23.x, xv.z, fmaf(w23.y, xv.w, a))));
+            }
+        } else
+#endif
+            for (int j = lane; j < sink_k; j += 32) a += h2f(w[j]) * sx[j];
         a = wsum(a);
         if (lane == 0) sink_y[(size_t) t * H + h] = a;
         return;
@@ -6696,6 +6706,12 @@ void mv_f16(const uint16_t* W, int N, int K, const float* x, float* y, cudaStrea
         check("rdna3_mv_f16_row");
         return;
     }
+#else
+    if ((K & 127) == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)x & 15) == 0) {
+        mv_f16_rows_vec_kernel<1><<<(unsigned)((N + 3) / 4), 128, 0, s>>>(W, N, K, x, K, y, N);
+        check("mv_f16_vec");
+        return;
+    }
 #endif
     mv_f16_kernel<4><<<(unsigned) ((N + 3) / 4), 128, 0, s>>>(W, N, K, x, y);
     check("mv_f16");
@@ -7114,17 +7130,22 @@ void rollback_block(const ConvRec* recs, int n_recs, int n, cudaStream_t s) {
 void mv_f16_rows(const uint16_t* W, int N, int K, const float* x, int x_ld, int T, float* y, int y_ld,
                  cudaStream_t s) {
     if (N <= 0 || T <= 0) return;
-    if (T >= 1 && T <= 8 && (K & 127) == 0 && (x_ld & 3) == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)x & 15) == 0) {
+    if ((K & 127) == 0 && (x_ld & 3) == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)x & 15) == 0) {
         const unsigned blocks = (unsigned) ((N + 3) / 4);
-        switch (T) {
-            case 1: mv_f16_rows_vec_kernel<1><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 2: mv_f16_rows_vec_kernel<2><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 3: mv_f16_rows_vec_kernel<3><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 4: mv_f16_rows_vec_kernel<4><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 5: mv_f16_rows_vec_kernel<5><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 6: mv_f16_rows_vec_kernel<6><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 7: mv_f16_rows_vec_kernel<7><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
-            case 8: mv_f16_rows_vec_kernel<8><<<blocks, 128, 0, s>>>(W, N, K, x, x_ld, y, y_ld); break;
+        for (int off = 0; off < T; off += 8) {
+            const int chunk = std::min(8, T - off);
+            const float* xp = x + (size_t) off * x_ld;
+            float* yp = y + (size_t) off * y_ld;
+            switch (chunk) {
+                case 1: mv_f16_rows_vec_kernel<1><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 2: mv_f16_rows_vec_kernel<2><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 3: mv_f16_rows_vec_kernel<3><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 4: mv_f16_rows_vec_kernel<4><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 5: mv_f16_rows_vec_kernel<5><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 6: mv_f16_rows_vec_kernel<6><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 7: mv_f16_rows_vec_kernel<7><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+                case 8: mv_f16_rows_vec_kernel<8><<<blocks, 128, 0, s>>>(W, N, K, xp, x_ld, yp, y_ld); break;
+            }
         }
         check("mv_f16_rows_vec");
         return;
