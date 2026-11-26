@@ -2899,11 +2899,18 @@ __device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) {
     return f;
 }
 
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
+#define IK2_HAS_NATIVE_NVFP4
+#include "ik2_blackwell.cuh"
+#endif
+#endif
+
 template <bool Gate, int Splits, bool Q8 = false>
 __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, size_t offset, int C, int F,
                                    const uint16_t* h, uint16_t* hidden, float* out, const float* sg, const float* su,
                                    float gcap, float ucap, const int* counts, const int* rows_out,
-                                   const uint16_t* input16 = nullptr) {
+                                   const uint16_t* input16 = nullptr, bool native_fp4 = false) {
     static constexpr int rows = Gate ? 8 : 16;
     const int lane = threadIdx.x & 31, split = threadIdx.x / 32, grp = lane / 4, sub = lane % 4;
     const int s = blockIdx.y, r = blockIdx.x * rows + grp, K = Gate ? C : F;
@@ -2945,6 +2952,14 @@ __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, 
         for (int k = split; k < K / 64; k += Splits) {
             const uint8_t* ap = a + k * 36;
             const uint8_t* bp = b + k * 36;
+#ifdef IK2_HAS_NATIVE_NVFP4
+            // 0xff is outside the serialized UE4M3 range, but the reference
+            // decoder accepts it. Preserve its legacy value on that block.
+            if (native_fp4 && __all_sync(0xffffffff, ap[sub] != 255 && bp[sub] != 255)) {
+                bw_nvfp4_dot(v, ap, bp, (Gate ? input16 : h) + (size_t)input_row * K + k * 64);
+                continue;
+            }
+#endif
             uint32_t sa = f2h(ue4m3(ap[sub])), sb = f2h(ue4m3(bp[sub]));
             sa |= sa << 16;
             sb |= sb << 16;
@@ -6332,6 +6347,17 @@ void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok,
 }
 // The serving engine can retain the original short-prompt arithmetic and enable
 // the grouped tensor-core path only in a window whose tokens are being verified.
+#ifndef STRATA_USE_HIP
+static bool use_blackwell_nvfp4() {
+    static const bool enabled = getenv("IK2_BLACKWELL_NVFP4") && atoi(getenv("IK2_BLACKWELL_NVFP4"));
+    if (!enabled) return false;
+    int dev, major, minor;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) return false;
+    return major == 12 && minor <= 1;
+}
+#endif
 thread_local bool grouped_tensor_products = true;
 void enable_grouped_tensor_products(bool enabled) { grouped_tensor_products = enabled; }
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
@@ -6339,9 +6365,10 @@ void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, in
     if (G <= 0) return;
 #ifndef STRATA_USE_HIP
     static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 2);
-    if (grouped_tensor_products && use_group_mma && ty_down == kNVFP4 && C % 16 == 0 && F % 64 == 0) {
+    const bool native_fp4 = use_blackwell_nvfp4();
+    if (grouped_tensor_products && (use_group_mma || native_fp4) && ty_down == kNVFP4 && C % 16 == 0 && F % 64 == 0) {
         grouped_expert_mma<false, 4><<<dim3(C / 16, G), 128, 0, s>>>(blob, nullptr, off_down, C, F, h, nullptr, y,
-                                                                     nullptr, nullptr, 0, 0, n, row);
+                                                                     nullptr, nullptr, 0, 0, n, row, nullptr, native_fp4);
         check("grouped_expert_mma (grouped)");
         return;
     }
@@ -6404,9 +6431,10 @@ void experts_gate_up_swiglu_g(const uint8_t* const* blob, const int* n, const in
     if (G <= 0) return;
 #ifndef STRATA_USE_HIP
     static const bool use_group_mma = getenv("IK2_GROUP_MMA") && (atoi(getenv("IK2_GROUP_MMA")) & 1);
-    if (grouped_tensor_products && use_group_mma && input16 && ty_gate == kNVFP4 && ty_up == kNVFP4 && F % 8 == 0 && C % 64 == 0) {
+    const bool native_fp4 = use_blackwell_nvfp4();
+    if (grouped_tensor_products && (use_group_mma || native_fp4) && input16 && ty_gate == kNVFP4 && ty_up == kNVFP4 && F % 8 == 0 && C % 64 == 0) {
         grouped_expert_mma<true, 4><<<dim3(F / 8, G), 128, 0, s>>>(blob, tok, eb0, C, F, nullptr, h, nullptr, sg, su,
-                                                                   gcap, ucap, n, row, input16);
+                                                                   gcap, ucap, n, row, input16, native_fp4);
         check("grouped_expert_mma (grouped)");
         return;
     }
