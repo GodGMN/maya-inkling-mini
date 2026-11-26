@@ -75,6 +75,7 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
     const size_t query_row = (size_t)query_l * H + head_l;
     const int kd = Hkv * 128;
     __shared__ AttnHalf16 query[Waves == 1 ? 16 : 1][8];
+    alignas(16) __shared__ float rel_q[Prefill ? 1 : 16][32];
     __shared__ _Float16 values[StageKV ? 1 : 16][136];
     __shared__ AttnHalf16 keys[StageKV ? 16 : 1][8];
     __shared__ AttnHalf16 columns[StageKV ? 128 : 1];
@@ -86,6 +87,12 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
             __builtin_memcpy(&fragment, q + (size_t)query_l * q_ld + head_l * 128 + d * 16, sizeof(fragment));
         if constexpr (Waves == 1) query[l][d] = fragment;
         else query_reg[d] = fragment;
+    }
+    if constexpr (!Prefill) {
+        if (r && dr > 0 && dr <= 32) {
+            for (int j = hi; j < dr; j += 2)
+                rel_q[l][j] = (l < queries) ? r[(size_t)query_l * r_ld + head_l * dr + j] : 0.0f;
+        }
     }
     if constexpr (Waves == 1) __syncthreads();
     auto fragment = [](const KV* cache, size_t offset) {
@@ -180,7 +187,14 @@ __global__ void rdna3_attn_part(const uint16_t* q, const float* r, const KV* kc,
                     v = dot[i] * qscale;
                     if (distance < extent) {
                         if constexpr (Prefill) v += bias[query_row * extent + distance];
-                        else for (int j = 0; j < dr; ++j) v += r[(size_t)query_l * r_ld + head_l * dr + j] * proj[distance * dr + j];
+                        else if (r && dr > 0 && dr <= 32 && (dr & 3) == 0 && (((uintptr_t)proj & 15) == 0)) {
+                            const float4* rp = (const float4*)rel_q[l];
+                            const float4* pp = (const float4*)(proj + distance * dr);
+                            for (int j = 0; j < dr / 4; ++j) {
+                                const float4 rv = rp[j], pv = pp[j];
+                                v = fmaf(rv.x, pv.x, fmaf(rv.y, pv.y, fmaf(rv.z, pv.z, fmaf(rv.w, pv.w, v))));
+                            }
+                        } else for (int j = 0; j < dr; ++j) v += r[(size_t)query_l * r_ld + head_l * dr + j] * proj[distance * dr + j];
                     }
                 }
                 dot[i] = v;

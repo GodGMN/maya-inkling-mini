@@ -3538,6 +3538,174 @@ void test_q8_verify_tile() {
     cudaFree(ds);
 }
 
+void test_draft_attn_online() {
+    constexpr int H = 4, Hkv = 2, D = 128, nq = 8, cap = 64, P = 90, window = 50;
+    const int k_lo = std::max(0, P - window), nc = P - k_lo, nk = nc + nq;
+    const float scale = 1.0f / std::sqrt((float) D);
+    auto q = fvec((size_t) nq * H * D, 1.5f);
+    auto kc = fvec((size_t) cap * Hkv * D, 1.0f), vc = fvec((size_t) cap * Hkv * D, 1.0f);
+    auto kb = fvec((size_t) nq * Hkv * D, 1.0f), vb = fvec((size_t) nq * Hkv * D, 1.0f);
+    float *dq = dev(q), *dkc = dev(kc), *dvc = dev(vc), *dkb = dev(kb), *dvb = dev(vb);
+    int* dP = dev(std::vector<int>{P});
+    float *scratch = dev_n<float>((size_t) 64 * H * 8 * 130), *out = dev_n<float>((size_t) nq * H * D);
+    std::vector<double> want((size_t) nq * H * D, 0.0);
+    for (int h = 0; h < H; ++h) {
+        const int g = h / (H / Hkv);
+        for (int qi = 0; qi < nq; ++qi) {
+            std::vector<double> sc(nk);
+            double mx = -INFINITY;
+            for (int j = 0; j < nk; ++j) {
+                const float* kr = j < nc ? kc.data() + ((size_t) ((k_lo + j) % cap) * Hkv + g) * D
+                                         : kb.data() + ((size_t) (j - nc) * Hkv + g) * D;
+                double dot = 0.0;
+                for (int d = 0; d < D; ++d) dot += (double) q[((size_t) qi * H + h) * D + d] * kr[d];
+                sc[j] = dot * scale;
+                mx = std::max(mx, sc[j]);
+            }
+            double den = 0.0;
+            for (double& s : sc) { s = std::exp(s - mx); den += s; }
+            for (int d = 0; d < D; ++d) {
+                double acc = 0.0;
+                for (int j = 0; j < nk; ++j) {
+                    const float* vr = j < nc ? vc.data() + ((size_t) ((k_lo + j) % cap) * Hkv + g) * D
+                                             : vb.data() + ((size_t) (j - nc) * Hkv + g) * D;
+                    acc += sc[j] * vr[d];
+                }
+                want[((size_t) qi * H + h) * D + d] = acc / den;
+            }
+        }
+    }
+    k::draft_attn(dq, dkc, dvc, k_lo, P, dkb, dvb, nq, H, Hkv, scale, scratch, out, 0, cap);
+    expect("draft_attn online (ring wrap)", host(out, want.size()), want, 1e-4, 2e-5);
+    k::draft_attn_graph(dq, dkc, dvc, dP, window, dkb, dvb, nq, H, Hkv, scale, 4, scratch, out, 0, cap);
+    expect("draft_attn_graph online (d_P, S=4)", host(out, want.size()), want, 1e-4, 2e-5);
+    // Also verify vectorized multi-token mv_f16_rows (T=5, K=256)
+    constexpr int N = 35, K = 256, T = 5;
+    std::vector<uint16_t> W(N * K);
+    for (auto& v : W) v = f2h_host(frand(0.5f));
+    auto x = fvec(T * K, 1.5f);
+    uint16_t* dW = dev(W);
+    float *dx = dev(x), *dy = dev_n<float>(T * N);
+    k::mv_f16_rows(dW, N, K, dx, K, T, dy, N, 0);
+    std::vector<double> wy(T * N, 0.0);
+    for (int t = 0; t < T; ++t)
+        for (int r = 0; r < N; ++r)
+            for (int i = 0; i < K; ++i) wy[t * N + r] += (double) h2f_host(W[r * K + i]) * x[t * K + i];
+    expect("mv_f16_rows vectorized (T=5)", host(dy, wy.size()), wy, 1e-4, 1e-4);
+    for (void* p : {(void*) dq, (void*) dkc, (void*) dvc, (void*) dkb, (void*) dvb, (void*) dP, (void*) scratch,
+                    (void*) out, (void*) dW, (void*) dx, (void*) dy})
+        cudaFree(p);
+}
+
+#ifdef STRATA_USE_HIP
+void test_rdna3_speculative_kernels() {
+    // 1. Grouped block-verify experts across NVFP4, Q8_0, and IQ4_NL at T=5 (group sizes 1, 2, 3, 5)
+    constexpr int C = 256, F = 128, E = 4, T = 5, K = 4, S = T * K;
+    const int types[3] = {k::kNVFP4, k::kQ8_0, k::kIQ4_NL};
+    const char* tnames[3] = {"NVFP4", "Q8_0", "IQ4_NL"};
+    for (int ti = 0; ti < 3; ++ti) {
+        const int ty = types[ti];
+        auto g = rand_blocks(ty, (size_t) E * F * C), u = rand_blocks(ty, (size_t) E * F * C),
+             d = rand_blocks(ty, (size_t) E * C * F);
+        const size_t eb0 = g.size() / E, eb1 = u.size() / E, eb2 = d.size() / E, slot = (eb0 + eb1 + eb2 + 255) / 256 * 256;
+        std::vector<uint8_t> pool(slot * E);
+        for (int e = 0; e < E; ++e) {
+            std::memcpy(pool.data() + e * slot, g.data() + e * eb0, eb0);
+            std::memcpy(pool.data() + e * slot + eb0, u.data() + e * eb1, eb1);
+            std::memcpy(pool.data() + e * slot + eb0 + eb1, d.data() + e * eb2, eb2);
+        }
+        uint8_t* dpool = dev(pool);
+        const int want_ng[E] = {1, 2, 3, 5};
+        std::vector<const uint8_t*> gb(E);
+        std::vector<int> gn(E, 0), gtok(E * k::kGroupMax, 0), grow(E * k::kGroupMax, 0);
+        std::vector<const uint8_t*> sblob;
+        std::vector<int> stok;
+        for (int e = 0; e < E; ++e) {
+            gb[e] = dpool + e * slot;
+            for (int t = 0; t < want_ng[e]; ++t) {
+                const int r = (int) sblob.size();
+                sblob.push_back(dpool + e * slot);
+                stok.push_back(t);
+                gtok[e * k::kGroupMax + gn[e]] = t;
+                grow[e * k::kGroupMax + gn[e]] = r;
+                ++gn[e];
+            }
+        }
+        const int n = (int) sblob.size();
+        const uint8_t **dblob = dev(sblob), **dgb = dev(gb);
+        int *dtok = dev(stok), *dgn = dev(gn), *dgt = dev(gtok), *dgr = dev(grow);
+        auto x = fvec((size_t) T * C, 1.5f);
+        std::vector<uint16_t> x16(x.size());
+        for (size_t i = 0; i < x.size(); ++i) x16[i] = f2h_host(x[i]), x[i] = h2f_host(x16[i]);
+        auto sgv = fvec(n), suv = fvec(n);
+        float *dx = dev(x), *dsg = dev(sgv), *dsu = dev(suv);
+        uint16_t *dx16 = dev(x16), *h_ref = dev_n<uint16_t>((size_t) n * F), *h_got = dev_n<uint16_t>((size_t) n * F);
+        float *y_ref = dev_n<float>((size_t) n * C), *y_got = dev_n<float>((size_t) n * C);
+        k::experts_gate_up_swiglu(dblob, dtok, n, ty, ty, eb0, dx, C, F, dsg, dsu, 12.f, 19.f, h_ref, 0);
+        k::rdna3_experts_block_gu(ty, dgb, dgn, dgt, dgr, E, T, eb0, C, F, dx16, dsg, dsu, 12.f, 19.f, h_got, 0);
+        const auto hr = host(h_ref, (size_t) n * F), hg = host(h_got, (size_t) n * F);
+        std::vector<double> wh(hr.size());
+        std::vector<float> gh(hg.size());
+        for (size_t i = 0; i < hr.size(); ++i) wh[i] = h2f_host(hr[i]), gh[i] = h2f_host(hg[i]);
+        char name[80];
+        std::snprintf(name, sizeof name, "rdna3_experts_block_gu %s (T=5)", tnames[ti]);
+        expect(name, gh, wh, 5e-3, 5e-3);
+        k::experts_down(dblob, n, ty, eb0 + eb1, h_ref, C, F, y_ref, 0);
+        k::rdna3_experts_block_down(ty, dgb, dgn, dgr, E, T, eb0 + eb1, C, F, h_ref, y_got, 0);
+        const auto yr = host(y_ref, (size_t) n * C);
+        std::snprintf(name, sizeof name, "rdna3_experts_block_down %s (T=5)", tnames[ti]);
+        expect(name, host(y_got, yr.size()), std::vector<double>(yr.begin(), yr.end()), 5e-3, 5e-2);
+        for (void* p : {(void*) dpool, (void*) dblob, (void*) dgb, (void*) dtok, (void*) dgn, (void*) dgt, (void*) dgr,
+                        (void*) dx, (void*) dsg, (void*) dsu, (void*) dx16, (void*) h_ref, (void*) h_got,
+                        (void*) y_ref, (void*) y_got})
+            cudaFree(p);
+    }
+    // 2. Small-T BF16 GEMM (T=5)
+    {
+        constexpr int N = 35, K = 256, T = 5, ld = 40;
+        std::vector<uint16_t> W(N * K), X(T * K);
+        auto to_bf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return (uint16_t) (u >> 16); };
+        auto from_bf = [](uint16_t b) { uint32_t u = (uint32_t) b << 16; float f; std::memcpy(&f, &u, 4); return f; };
+        for (auto& v : W) v = to_bf(frand(0.5f));
+        for (auto& v : X) v = to_bf(frand(1.0f));
+        uint16_t *dW = dev(W), *dX = dev(X);
+        float* dY = dev_n<float>(T * ld);
+        k::rdna3_bf16_gemm(dW, N, K, dX, T, dY, ld, 0);
+        std::vector<double> want(T * ld, 0.0);
+        for (int t = 0; t < T; ++t)
+            for (int r = 0; r < N; ++r)
+                for (int i = 0; i < K; ++i) want[t * ld + r] += (double) from_bf(W[r * K + i]) * from_bf(X[t * K + i]);
+        expect("rdna3_bf16_gemm (T=5)", host(dY, want.size()), want, 1e-4, 1e-4);
+        cudaFree(dW); cudaFree(dX); cudaFree(dY);
+    }
+    // 3. Fused separate-input sliding QKV/R/G planar Q8 (T=5)
+    {
+        constexpr int HD = 32, KD = 16, N = HD + 2 * KD + 20, K = 256, T = 5;
+        std::vector<int8_t> q(N * K);
+        for (auto& v : q) v = (int8_t) (rng() & 255);
+        std::vector<uint16_t> d(N * (K / 32)), xq(T * K), xk(T * K), xv(T * K);
+        for (auto& v : d) v = f2h_host(0.015625f * std::fabs(frand()));
+        for (auto& v : xq) v = f2h_host(frand());
+        for (auto& v : xk) v = f2h_host(frand());
+        for (auto& v : xv) v = f2h_host(frand());
+        int8_t* dq = dev(q);
+        uint16_t *dd = dev(d), *dxq = dev(xq), *dxk = dev(xk), *dxv = dev(xv);
+        float* dy = dev_n<float>(T * N);
+        k::rdna3_q8_tile_qkv_sep(dq, dd, N, K, HD, KD, dxq, dxk, dxv, T, dy, N, 0);
+        std::vector<double> want(T * N, 0.0);
+        for (int t = 0; t < T; ++t)
+            for (int r = 0; r < N; ++r) {
+                const auto& xin = (r < HD || r >= HD + 2 * KD) ? xq : (r < HD + KD ? xk : xv);
+                for (int i = 0; i < K; ++i)
+                    want[t * N + r] += (double) ((float) q[r * K + i] * h2f_host(d[(r * K + i) / 32])) * h2f_host(xin[t * K + i]);
+            }
+        expect("rdna3_q8_tile_qkv_sep (T=5)", host(dy, want.size()), want, 2e-4, 2e-4);
+        cudaFree(dq); cudaFree(dd); cudaFree(dxq); cudaFree(dxk); cudaFree(dxv); cudaFree(dy);
+    }
+    (void) S;
+}
+#endif
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -3595,8 +3763,10 @@ int main() {
     test_expert_limbs();
     test_experts_mma(256, 128, 5);
     test_q8_verify_tile();
+    test_draft_attn_online();
 #ifdef STRATA_USE_HIP
     test_experts_mma(2304, 1152, 1);
+    test_rdna3_speculative_kernels();
     test_rdna3_deep_attention();
     test_rdna3_sparse_decode();
 #endif
