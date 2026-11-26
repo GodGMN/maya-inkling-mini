@@ -165,7 +165,6 @@ struct Drafter {
     __half* x16;
     int *pos, *ctx_pos, *toks;
     int* h_out = nullptr;   // pinned host [kBlock - 1]
-#ifdef STRATA_USE_HIP
     int* h_meta = nullptr;  // pinned host [2]: {P, anchor}
     int* d_meta = nullptr;  // device [2]: {P, anchor}
     struct PropGraph {
@@ -175,7 +174,6 @@ struct Drafter {
         int n_rows = 0, n_vocab = 0;
     };
     PropGraph pgraph[kBlock][4];
-#endif
 };
 
 namespace {
@@ -199,7 +197,6 @@ __global__ void init_block_kernel(const float* anchor_h, const float* mask, floa
     if (c < C) res[(size_t) t * C + c] = (t == 0 ? anchor_h : mask)[c];
 }
 
-#ifdef STRATA_USE_HIP
 __global__ void init_block_kernel_d(const float* anchor_h, const float* mask, float* res, int* pos, int* toks, int T,
                                     int C, const int* meta) {
     const int t = blockIdx.y;
@@ -210,7 +207,6 @@ __global__ void init_block_kernel_d(const float* anchor_h, const float* mask, fl
     }
     if (c < C) res[(size_t) t * C + c] = (t == 0 ? anchor_h : mask)[c];
 }
-#endif
 
 __global__ void f16_to_f32_kernel(const uint16_t* src, size_t n, float* dst) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -306,7 +302,6 @@ void layer_attn(Drafter* d, DLayer& l, int P, float* out, int graph_splits = 0) 
     k::rope_neox(d->kk, T, d->KV, d->pos, d->theta, d->s);
     // Local layers (0, 1, 3, 4) match SGLang inkling2_mtp.py's window_anchor_at_start=True with window=1024:
     // every query in the block [P .. P+7] sees context [max(0, P - 1023) .. P-1] plus all 8 block tokens.
-#ifdef STRATA_USE_HIP
     if (graph_splits > 0) {
         const int window = l.local ? 1023 : l.cap;
         const int S = l.local ? 4 : graph_splits;
@@ -316,11 +311,7 @@ void layer_attn(Drafter* d, DLayer& l, int P, float* out, int graph_splits = 0) 
         else
             k::draft_attn_graph(d->q, l.kc, l.vc, d->d_meta, window, d->kk, d->vv, T, d->H, d->KV,
                                 1.0f / std::sqrt(128.0f), S, d->scratch, d->o, d->s, l.cap);
-    } else
-#else
-    (void) graph_splits;
-#endif
-    {
+    } else {
         const int k_lo = l.local ? std::max(0, P - 1023) : std::max(0, P - l.cap);
         if (l.kc16)
             k::draft_attn_f16(d->q, l.kc16, l.vc16, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f),
@@ -448,10 +439,18 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     d->x16 = dalloc<__half>((kBlock - 1) * (size_t) C);
     d->pos = dalloc<int>(T), d->ctx_pos = dalloc<int>(kMixRows), d->toks = dalloc<int>(kBlock);
     cu(cudaHostAlloc(&d->h_out, (kBlock - 1) * sizeof(int), cudaHostAllocDefault), "h_out");
-#ifdef STRATA_USE_HIP
+#ifndef STRATA_USE_HIP
+    // Captured cuBLAS GEMMs share one workspace across all widths and depth buckets on d->s.
+    if (!getenv("IK2_DRAFT_GRAPH") || atoi(getenv("IK2_DRAFT_GRAPH"))) {
+        constexpr size_t workspace_bytes = 4 * 1024 * 1024;
+        cb(cublasCreate(&d->blas), "proposal handle");
+        cb(cublasSetStream(d->blas, d->s), "proposal stream");
+        cb(cublasSetWorkspace(d->blas, dalloc<uint8_t>(workspace_bytes), workspace_bytes), "proposal workspace");
+        d->vram += workspace_bytes;
+    }
+#endif
     d->d_meta = dalloc<int>(2);
     cu(cudaHostAlloc(&d->h_meta, 2 * sizeof(int), cudaHostAllocDefault), "h_meta");
-#endif
     return d;
 }
 
@@ -535,11 +534,14 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     const int C = d->C, T = kBlock;
     const size_t TC = (size_t) T * C;
     const int shortlist_n = (n_vocab + 31) / 32;
-#ifdef STRATA_USE_HIP
     static const bool use_graph = !getenv("IK2_DRAFT_GRAPH") || atoi(getenv("IK2_DRAFT_GRAPH"));
+    bool graph_ok = use_graph && d->head_q8 && proposals >= 1 && proposals < kBlock;
+#ifdef STRATA_USE_HIP
     static const bool bf16_mv = !getenv("IK2_DRAFT_BF16_MV") || atoi(getenv("IK2_DRAFT_BF16_MV"));
-    const bool graph_ok = use_graph && bf16_mv && d->head_q8 && proposals >= 1 && proposals < kBlock &&
-                          C % 128 == 0 && d->F % 128 == 0 && (2 * d->R + 2 * C) % 128 == 0;
+    graph_ok = graph_ok && bf16_mv && C % 128 == 0 && d->F % 128 == 0 && (2 * d->R + 2 * C) % 128 == 0;
+#endif
+    Drafter::PropGraph* capture = nullptr;
+    int splits = 0;
     if (graph_ok) {
         const int bkt = P < 256 ? 0 : (P < 1024 ? 1 : (P < 4096 ? 2 : 3));
         static constexpr int kSplits[4] = {2, 8, 16, 64};
@@ -551,66 +553,33 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
             cu(cudaGraphDestroy(G.graph), "pgraph destroy");
             G = {};
         }
-        if (!G.exec) {
-            G.anchor_h = anchor_h;
-            G.n_rows = n_rows;
-            G.n_vocab = n_vocab;
-            cu(cudaStreamBeginCapture(d->s, cudaStreamCaptureModeGlobal), "pgraph begin");
-            cu(cudaMemcpyAsync(d->d_meta, d->h_meta, 2 * sizeof(int), cudaMemcpyHostToDevice, d->s), "meta h2d");
-            init_block_kernel_d<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
-                anchor_h, d->mask, d->res, d->pos, d->toks, T, C, d->d_meta);
-            for (size_t i = 0; i < d->L.size(); ++i) {
-                DLayer& l = d->L[i];
-                if (i > 0) k::add(d->x, d->res, TC, d->res, d->s);
-                k::rms(d->res, l.in_norm, T, C, d->eps, d->h, d->s);
-                layer_attn(d, l, P, d->x, kSplits[bkt]);
-                k::add(d->x, d->res, TC, d->res, d->s);
-                k::rms(d->res, l.post_norm, T, C, d->eps, d->h, d->s);
-                layer_mlp(d, l, d->x);
-            }
-            k::add(d->x, d->res, TC, d->res, d->s);
-            k::rms(d->res, d->norm, T, C, d->eps, d->h, d->s);
-            k::to_f16(d->h + C, (size_t) proposals * C, (uint16_t*) d->x16, d->s);
-            k::q8_tile(d->head_q8, d->head_q8d, n_rows, C, (const uint16_t*) d->x16, proposals, d->base, n_rows, d->s);
-            if (d->shortlist)
-                draft_shortlist<<<dim3((n_vocab + 127) / 128, proposals), 128, 0, d->s>>>(
-                    d->base, n_rows, n_vocab, shortlist_n, d->shortlist);
-            cu(cudaMemsetAsync(d->state, 0, d->R * 4, d->s), "state");
-            for (int t = 0; t < proposals; ++t) {
-                k::rnn_inputs(d->state, d->w1, d->toks + t, d->h + (size_t) (t + 1) * C, d->f_rnn, d->R, C, d->rnn_in, d->s);
-                gemm_bf(d, d->rnn_w, 3 * d->R, 2 * d->R + 2 * C, d->rnn_in, 1, d->proj, 3 * d->R);
-                k::rnn_gates(d->proj, d->rnn_b, d->R, d->state, d->latent, d->s);
-                if (d->shortlist) {
-                    const int* ids = d->shortlist + t * shortlist_n;
-                    shortlist_gemv<<<(shortlist_n + 3) / 4, 128, 0, d->s>>>(ids, shortlist_n, d->fold_w, d->latent,
-                        d->base + (size_t)t * n_rows, d->fold_b, d->R, d->shortlist_scores);
-                    k::argmax_sum(d->shortlist_scores, nullptr, nullptr, shortlist_n, d->toks + t + 1, d->s);
-                    shortlist_pick<<<1, 1, 0, d->s>>>(d->toks + t + 1, ids);
-                } else {
-                    k::argmax_gemv_f16(d->fold_w, n_rows, d->latent, d->base + (size_t) t * n_rows, d->fold_b, d->R, n_vocab,
-                                   d->toks + t + 1, d->s);
-                }
-            }
-            cu(cudaMemcpyAsync(d->h_out, d->toks + 1, proposals * 4, cudaMemcpyDeviceToHost, d->s), "tokens");
-            cu(cudaStreamEndCapture(d->s, &G.graph), "pgraph end");
-            cu(cudaGraphInstantiate(&G.exec, G.graph, 0), "pgraph instantiate");
+        if (G.exec) {
+            cu(cudaGraphLaunch(G.exec, d->s), "pgraph launch");
+            cu(cudaStreamSynchronize(d->s), "propose");
+            std::memcpy(out, d->h_out, proposals * sizeof(int));
+            return;
         }
-        cu(cudaGraphLaunch(G.exec, d->s), "pgraph launch");
-        cu(cudaStreamSynchronize(d->s), "propose");
-        std::memcpy(out, d->h_out, proposals * sizeof(int));
-        return;
+        capture = &G;
+        splits = kSplits[bkt];
+        G.anchor_h = anchor_h;
+        G.n_rows = n_rows;
+        G.n_vocab = n_vocab;
+        cu(cudaStreamBeginCapture(d->s, cudaStreamCaptureModeGlobal), "pgraph begin");
+        cu(cudaMemcpyAsync(d->d_meta, d->h_meta, 2 * sizeof(int), cudaMemcpyHostToDevice, d->s), "meta h2d");
+        init_block_kernel_d<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
+            anchor_h, d->mask, d->res, d->pos, d->toks, T, C, d->d_meta);
+    } else {
+        // Initialize the residual stream [anchor_h; mask x 7], block positions, and anchor token in one kernel.
+        // Layer 0 reads d->res and overwrites d->x, so d->x does not need pre-filling.
+        init_block_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
+            anchor_h, d->mask, d->res, d->pos, d->toks, T, C, P, anchor);
     }
-#endif
-    // Initialize the residual stream [anchor_h; mask x 7], block positions, and anchor token in one kernel.
-    // Layer 0 reads d->res and overwrites d->x, so d->x does not need pre-filling.
-    init_block_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
-        anchor_h, d->mask, d->res, d->pos, d->toks, T, C, P, anchor);
     // pre-norm layers, the residual carried apart (res = x + res before each norm)
     for (size_t i = 0; i < d->L.size(); ++i) {
         DLayer& l = d->L[i];
         if (i > 0) k::add(d->x, d->res, TC, d->res, d->s);
         k::rms(d->res, l.in_norm, T, C, d->eps, d->h, d->s);
-        layer_attn(d, l, P, d->x);
+        layer_attn(d, l, P, d->x, splits);
         k::add(d->x, d->res, TC, d->res, d->s);
         k::rms(d->res, l.post_norm, T, C, d->eps, d->h, d->s);
         layer_mlp(d, l, d->x);
@@ -645,6 +614,11 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
         }
     }
     cu(cudaMemcpyAsync(d->h_out, d->toks + 1, proposals * 4, cudaMemcpyDeviceToHost, d->s), "tokens");
+    if (capture) {
+        cu(cudaStreamEndCapture(d->s, &capture->graph), "pgraph end");
+        cu(cudaGraphInstantiate(&capture->exec, capture->graph, 0), "pgraph instantiate");
+        cu(cudaGraphLaunch(capture->exec, d->s), "pgraph launch");
+    }
     cu(cudaStreamSynchronize(d->s), "propose");
     std::memcpy(out, d->h_out, proposals * sizeof(int));
 }

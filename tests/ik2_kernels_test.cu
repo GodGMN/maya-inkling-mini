@@ -3602,12 +3602,66 @@ void test_q8_verify_tile() {
     cudaFree(ds);
 }
 
+#ifndef STRATA_USE_HIP
+void test_linear_block_verify(int type, int T) {
+    constexpr int C = 96, F = 64;
+    auto raw = rand_blocks(type, 3 * C * F);
+    const size_t matrix = raw.size() / 3;
+    std::vector<float> weights(3 * C * F);
+    k::decode_host(type, raw.data(), weights.size(), weights.data());
+    auto x = fvec(T * C, 0.1f);
+    std::vector<int> tokens(2 * k::kGroupMax), rows(tokens.size());
+    std::vector<double> hidden(T * F), down(T * C);
+    for (int t = 0; t < T; ++t) {
+        tokens[t] = T - 1 - t;
+        rows[t] = (t + 1) % T;
+        for (int f = 0; f < F; ++f) {
+            double g = 0, u = 0;
+            for (int c = 0; c < C; ++c) {
+                const double v = x[tokens[t] * C + c];
+                g += v * weights[f * C + c];
+                u += v * weights[(F + f) * C + c];
+            }
+            hidden[rows[t] * F + f] = 4 * std::tanh(g / 4) / (1 + std::exp(-g)) * 25 * std::tanh(u / 25);
+        }
+    }
+    auto* w = dev(raw);
+    auto** blobs = dev(std::vector<const uint8_t*>{w, nullptr});
+    auto* counts = dev(std::vector<int>{T, 0});
+    auto* dt = dev(tokens);
+    auto* dr = dev(rows);
+    auto* dx = dev(x);
+    auto* limbs = dev_n<uint16_t>(T * 2 * C);
+    auto* dh = dev_n<uint16_t>(T * F);
+    auto* dy = dev_n<float>(T * C);
+    k::f16_limbs_rows(dx, T, C, limbs, 0);
+    k::experts_block_gu_linear(type, blobs, counts, dt, dr, 2, T, matrix, C, F, limbs, nullptr, nullptr, 4, 25, dh, 0);
+    auto h = host(dh, T * F);
+    std::vector<float> actual(h.size());
+    std::transform(h.begin(), h.end(), actual.begin(), h2f_host);
+    expect("block verify gate/up vs FP64", actual, hidden, 1e-3, 2e-3);
+    for (int t = 0; t < T; ++t)
+        for (int c = 0; c < C; ++c)
+            for (int f = 0; f < F; ++f)
+                down[t * C + c] += double(actual[t * F + f]) * weights[2 * C * F + c * F + f];
+    k::experts_block_down_linear(type, blobs, counts, dr, 2, 2 * matrix, C, F, dh, dy, 0);
+    expect("block verify down vs FP64", host(dy, down.size()), down, 1e-4, 0.01);
+    cudaFree(w); cudaFree(blobs); cudaFree(counts); cudaFree(dt); cudaFree(dr);
+    cudaFree(dx); cudaFree(limbs); cudaFree(dh); cudaFree(dy);
+}
+#endif
+
 void test_draft_attn_online() {
     constexpr int H = 4, Hkv = 2, D = 128, nq = 8, cap = 64, P = 90, window = 50;
     const int k_lo = std::max(0, P - window), nc = P - k_lo, nk = nc + nq;
     const float scale = 1.0f / std::sqrt((float) D);
     auto q = fvec((size_t) nq * H * D, 1.5f);
     auto kc = fvec((size_t) cap * Hkv * D, 1.0f), vc = fvec((size_t) cap * Hkv * D, 1.0f);
+    std::vector<uint16_t> kc16(kc.size()), vc16(vc.size());
+    for (size_t i = 0; i < kc.size(); ++i) {
+        kc[i] = h2f_host(kc16[i] = f2h_host(kc[i]));
+        vc[i] = h2f_host(vc16[i] = f2h_host(vc[i]));
+    }
     auto kb = fvec((size_t) nq * Hkv * D, 1.0f), vb = fvec((size_t) nq * Hkv * D, 1.0f);
     float *dq = dev(q), *dkc = dev(kc), *dvc = dev(vc), *dkb = dev(kb), *dvb = dev(vb);
     int* dP = dev(std::vector<int>{P});
@@ -3643,6 +3697,32 @@ void test_draft_attn_online() {
     expect("draft_attn online (ring wrap)", host(out, want.size()), want, 1e-4, 2e-5);
     k::draft_attn_graph(dq, dkc, dvc, dP, window, dkb, dvb, nq, H, Hkv, scale, 4, scratch, out, 0, cap);
     expect("draft_attn_graph online (d_P, S=4)", host(out, want.size()), want, 1e-4, 2e-5);
+    auto* dk16 = dev(kc16);
+    auto* dv16 = dev(vc16);
+    cudaStream_t stream;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    CU(cudaStreamCreate(&stream));
+    CU(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    k::draft_attn_f16_graph(dq, dk16, dv16, dP, window, dkb, dvb, nq, H, Hkv, scale, 4, scratch, out, stream, cap);
+    CU(cudaStreamEndCapture(stream, &graph));
+    CU(cudaGraphInstantiate(&exec, graph, 0));
+    for (int pos : {0, P}) {
+        CU(cudaMemcpy(dP, &pos, sizeof(pos), cudaMemcpyHostToDevice));
+        CU(cudaGraphLaunch(exec, stream));
+        CU(cudaStreamSynchronize(stream));
+        const auto result = host(out, want.size());
+        if (pos == P) expect("FP16 draft graph replay after ring wrap vs FP64", result, want, 1e-4, 2e-5);
+        else {
+            k::draft_attn(dq, dkc, dvc, 0, 0, dkb, dvb, nq, H, Hkv, scale, scratch, out, 0, cap);
+            const auto eager = host(out, want.size());
+            expect("FP16 draft graph at empty context", result, std::vector<double>(eager.begin(), eager.end()), 1e-4, 2e-5);
+        }
+    }
+    CU(cudaGraphExecDestroy(exec));
+    CU(cudaGraphDestroy(graph));
+    CU(cudaStreamDestroy(stream));
+    cudaFree(dk16); cudaFree(dv16);
     // Also verify vectorized multi-token mv_f16_rows (T=5, K=256)
     constexpr int N = 35, K = 256, T = 5;
     std::vector<uint16_t> W(N * K);
@@ -3899,6 +3979,10 @@ int main(int argc, char** argv) {
     test_experts_mma(256, 128, 5);
     test_q8_verify_tile();
     test_draft_attn_online();
+#ifndef STRATA_USE_HIP
+    for (int t = 2; t <= 8; ++t)
+        for (int type : {k::kIQ4_NL, k::kQ8_0}) test_linear_block_verify(type, t);
+#endif
 #ifdef STRATA_USE_HIP
     test_experts_mma(2304, 1152, 1);
     test_rdna3_speculative_kernels();
