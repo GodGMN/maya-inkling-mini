@@ -39,12 +39,16 @@ float bf(uint16_t b) {
 
 }  // namespace
 
+// BF16 or packed integers with one scale per output channel.
+struct Backbone { uint16_t* data; float* scales; };
+
 struct DLayer {
     struct Conv { uint16_t *projection, *base; };
     Conv attention_conv{}, mlp_conv{};
     bool local = false;
     float *in_norm, *post_norm, *dflare, *q_norm, *k_norm, *k_norm_ctx;
-    uint16_t *wq, *wk, *wv, *wo, *wkc, *wvc, *wgu, *wd;   // BF16 [out][in]
+    Backbone wq, wk, wv, wo, wgu, wd;
+    uint16_t *wkc, *wvc;   // DSpark context projections, BF16 [out][in]
     float *kc = nullptr, *vc = nullptr;                    // the context caches, F32 [cap][KV * 128] (a window's
     uint16_t *kc16 = nullptr, *vc16 = nullptr;             //  layer) or FP16 (the layer that sees the whole context)
     int cap = 0;                                           // their rows: a ring of the last cap positions
@@ -54,10 +58,14 @@ struct Drafter {
     struct DFlash2 {
         uint16_t *fc, *selector, *pred, *succ, *packed;
         float *hidden_norm, *dynamic;
+        Draws *draws, *host_draws;
+        DraftMass *mass, *host_mass;
+        bool sample;
         int *parts, *ids;
         const uint16_t* head = nullptr;
     };
     DFlash2* flash = nullptr;
+    int bits = 16;
     int taps = 8, C = 4608, H = 48, KV = 8, F = 18432, R = 256, V = 0, ctx = 0;
     int cap = 0;   // the rows of the layer without a window's context cache (IK2_DRAFT_CTX, default the context)
     float* ctx_tmp = nullptr;   // write_context's K and V rows before an FP16 cache, [2][kMixRows][KV * 128]
@@ -89,9 +97,9 @@ struct Drafter {
         const float* anchor_h = nullptr;
         int n_rows = 0, n_vocab = 0;
     };
-    struct SlotGraphs { PropGraph width[kBlock][4]; };
+    struct SlotGraphs { PropGraph width[kBlock][5]; };
     std::vector<SlotGraphs> graphs;
-    PropGraph batch_graph[kBlock + 1][kBlock + 1];  // [active][verify width]
+    PropGraph batch_graph[kBlock + 1][kBlock + 1][2];  // [active][verify width]
     int slot = 0;
 };
 
@@ -199,6 +207,22 @@ uint16_t* projection(Drafter* d, const std::vector<uint16_t>& values, int k) {
 #endif
     return weights;
 }
+Backbone backbone(Drafter* d, const std::vector<uint16_t>& values, int k) {
+    if (d->bits == 16) return {projection(d, values, k), nullptr};
+    const int n = values.size() / k;
+    auto* input = up16(d, values);
+    auto* packed = dalloc<uint16_t>(values.size() * d->bits / 16);
+    auto* scales = dalloc<float>(n);
+    if (d->bits == 8)
+        df2::quantize_rows<8><<<n, 256, 0, d->s>>>(input, k, reinterpret_cast<uint8_t*>(packed), scales);
+    else
+        df2::quantize_rows<4><<<n, 256, 0, d->s>>>(input, k, reinterpret_cast<uint8_t*>(packed), scales);
+    cu(cudaFree(input), "quantize draft projection");
+    d->vram -= values.size()*2;
+    d->vram += values.size()*d->bits/8 + n*sizeof(float);
+    return {packed, scales};
+}
+
 float* up32(Drafter* d, const std::vector<uint16_t>& v) {
     std::vector<float> f(v.size());
     for (size_t i = 0; i < v.size(); ++i) f[i] = bf(v[i]);
@@ -215,8 +239,10 @@ void gemm_bf(Drafter* d, const uint16_t* W, int N, int K, const uint16_t* X, int
 #endif
 #ifdef STRATA_USE_HIP
     static const bool bf16_mv = !getenv("IK2_DRAFT_BF16_MV") || atoi(getenv("IK2_DRAFT_BF16_MV"));
-    if (bf16_mv && T >= 1 && T <= 8 && K % 128 == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)X & 7) == 0) {
-        k::rdna3_bf16_gemm(W, N, K, X, T, Y, ldy, d->s);
+    const int mv_rows = d->flash ? kBlock * kBlock : kBlock;
+    if (bf16_mv && T >= 1 && T <= mv_rows && K % 128 == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)X & 7) == 0) {
+        for (int t = 0; t < T; t += kBlock)
+            k::rdna3_bf16_gemm(W, N, K, X + t*K, std::min(kBlock, T-t), Y + t*ldy, ldy, d->s);
         return;
     }
 #endif
@@ -225,6 +251,24 @@ void gemm_bf(Drafter* d, const uint16_t* W, int N, int K, const uint16_t* X, int
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "gemm_bf");
 }
+void project_backbone(Drafter* d, Backbone w, int n, int kdim, const uint16_t* x, int rows, float* y, int ld) {
+    if (d->bits == 16) return gemm_bf(d, w.data, n, kdim, x, rows, y, ld);
+#ifndef STRATA_USE_HIP
+    if (d->bits == 8) df2::project_rows<false, 8>(w.data, x, n, kdim, rows, y, ld, d->s, w.scales);
+    else df2::project_rows<false, 4>(w.data, x, n, kdim, rows, y, ld, d->s, w.scales);
+#else
+    dim3 grid((n+63)/64, (rows+15)/16);
+    auto* weights = reinterpret_cast<const uint8_t*>(w.data);
+    if (d->bits == 8) df2::project_quant<8><<<grid, 128, 0, d->s>>>(weights, w.scales, x, n, kdim, rows, y, ld);
+    else df2::project_quant<4><<<grid, 128, 0, d->s>>>(weights, w.scales, x, n, kdim, rows, y, ld);
+#endif
+}
+
+void backbone_input(Drafter* d, const float* x, int count, uint16_t* out) {
+    if (d->bits == 16) k::to_bf16(x, count, out, d->s);
+    else k::to_f16(x, count, out, d->s);
+}
+
 void gemm_h(Drafter* d, const uint16_t* W, int N, int K, const void* X, int T, float* Y, int ldy) {
 #ifndef STRATA_USE_HIP
     if (d->flash) return df2::project_rows<true>(W, static_cast<const uint16_t*>(X), N, K, T, Y, ldy, d->s);
@@ -238,9 +282,9 @@ void gemm_h(Drafter* d, const uint16_t* W, int N, int K, const void* X, int T, f
 void layer_attn(Drafter* d, DLayer& l, int P, float* out, int graph_splits = 0) {
     const int T = kBlock, HD = d->H * 128, KD = d->KV * 128;
     k::to_bf16(d->h, (size_t) T * d->C, d->hb, d->s);
-    gemm_bf(d, l.wq, HD, d->C, d->hb, T, d->q, HD);
-    gemm_bf(d, l.wk, KD, d->C, d->hb, T, d->kk, KD);
-    gemm_bf(d, l.wv, KD, d->C, d->hb, T, d->vv, KD);
+    project_backbone(d, l.wq, HD, d->C, d->hb, T, d->q, HD);
+    project_backbone(d, l.wk, KD, d->C, d->hb, T, d->kk, KD);
+    project_backbone(d, l.wv, KD, d->C, d->hb, T, d->vv, KD);
     k::rms(d->q, l.q_norm, T * d->H, 128, d->eps, d->q, d->s);
     k::rms(d->kk, l.k_norm, T * d->KV, 128, d->eps, d->kk, d->s);
     k::rope_neox(d->q, T, d->H, d->pos, d->theta, d->s);
@@ -266,15 +310,15 @@ void layer_attn(Drafter* d, DLayer& l, int P, float* out, int graph_splits = 0) 
                           d->o, d->s, l.cap);
     }
     k::to_bf16(d->o, (size_t) T * HD, d->hb, d->s);
-    gemm_bf(d, l.wo, d->C, HD, d->hb, T, out, d->C);
+    project_backbone(d, l.wo, d->C, HD, d->hb, T, out, d->C);
 }
 
 void layer_mlp(Drafter* d, DLayer& l, float* out) {
     const int T = kBlock;
     k::to_bf16(d->h, (size_t) T * d->C, d->hb, d->s);
-    gemm_bf(d, l.wgu, 2 * d->F, d->C, d->hb, T, d->gu, 2 * d->F);
+    project_backbone(d, l.wgu, 2 * d->F, d->C, d->hb, T, d->gu, 2 * d->F);
     k::silu_mul_bf16(d->gu, T, d->F, d->hb2, d->s);
-    gemm_bf(d, l.wd, d->C, d->F, d->hb2, T, out, d->C);
+    project_backbone(d, l.wd, d->C, d->F, d->hb2, T, out, d->C);
 }
 
 }  // namespace
@@ -305,6 +349,15 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     if (f.t.count("candidate_selector.hidden_projection.weight")) {
         if (!mini) throw std::runtime_error("DFlash2 requires Inkling-2-Mini");
         d->flash = new Drafter::DFlash2;
+        const char* quant = std::getenv("IK2_DFLASH2_QUANT");
+        if (!quant || !std::strcmp(quant, "q8")) d->bits = 8;
+        else if (!std::strcmp(quant, "bf16")) d->bits = 16;
+        else if (!std::strcmp(quant, "q4")) d->bits = 4;
+        else throw std::runtime_error("IK2_DFLASH2_QUANT expects bf16, q8 or q4");
+        const char* sample = std::getenv("IK2_DFLASH2_SAMPLE");
+        d->flash->sample = !sample || !std::strcmp(sample, "prob");
+        if (!d->flash->sample && std::strcmp(sample, "greedy"))
+            throw std::runtime_error("IK2_DFLASH2_SAMPLE expects prob or greedy");
         d->H = 32;
         d->F = 6912;
         d->theta = 10000.f;
@@ -339,10 +392,10 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
         l.q_norm = up32(d, st_bf16(f, b + "self_attn.q_norm.weight", {128}));
         l.k_norm = up32(d, st_bf16(f, b + "self_attn.k_norm.weight", {128}));
         if (!d->flash) l.k_norm_ctx = up32(d, st_bf16(f, b + "self_attn.k_norm_ctx.weight", {128}));
-        l.wq = projection(d, st_bf16(f, b + "self_attn.q_proj.weight", {H * 128, C}), C);
-        l.wk = projection(d, st_bf16(f, b + "self_attn.k_proj.weight", {KV * 128, C}), C);
-        l.wv = projection(d, st_bf16(f, b + "self_attn.v_proj.weight", {KV * 128, C}), C);
-        l.wo = projection(d, st_bf16(f, b + "self_attn.o_proj.weight", {C, H * 128}), H * 128);
+        l.wq = backbone(d, st_bf16(f, b + "self_attn.q_proj.weight", {H * 128, C}), C);
+        l.wk = backbone(d, st_bf16(f, b + "self_attn.k_proj.weight", {KV * 128, C}), C);
+        l.wv = backbone(d, st_bf16(f, b + "self_attn.v_proj.weight", {KV * 128, C}), C);
+        l.wo = backbone(d, st_bf16(f, b + "self_attn.o_proj.weight", {C, H * 128}), H * 128);
         if (d->flash) {
             auto load_conv = [&](const std::string& name) {
                 return DLayer::Conv{
@@ -359,9 +412,9 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
             auto g = st_bf16(f, b + "mlp.gate_proj.weight", {F, C});
             const auto u = st_bf16(f, b + "mlp.up_proj.weight", {F, C});
             g.insert(g.end(), u.begin(), u.end());   // gate's rows, then up's
-            l.wgu = projection(d, g, C);
+            l.wgu = backbone(d, g, C);
         }
-        l.wd = projection(d, st_bf16(f, b + "mlp.down_proj.weight", {C, F}), F);
+        l.wd = backbone(d, st_bf16(f, b + "mlp.down_proj.weight", {C, F}), F);
         if (l.local) {   // (a window of 1024: a ring of 2048 rows, F32)
             l.cap = std::min(ctx, 2048);
             l.kc = dalloc<float>((size_t) slots * l.cap * KV * 128);
@@ -377,6 +430,10 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     d->norm = up32(d, st_bf16(f, "norm.weight", {C}));
     if (d->flash) {
         auto& flash = *d->flash;
+        flash.draws = dalloc<Draws>(slots);
+        flash.mass = dalloc<DraftMass>(slots * (kBlock - 1));
+        cu(cudaHostAlloc(&flash.host_draws, slots*sizeof(Draws), cudaHostAllocDefault), "draft draws");
+        cu(cudaHostAlloc(&flash.host_mass, slots*(kBlock-1)*sizeof(DraftMass), cudaHostAllocDefault), "draft probabilities");
         flash.fc = projection(d, st_bf16(f, "fc.weight", {C, 4 * C}), 4 * C);
         flash.hidden_norm = up32(d, st_bf16(f, "hidden_norm.weight", {C}));
         flash.selector = projection(d, st_bf16(f, "candidate_selector.hidden_projection.weight", {R, C}), C);
@@ -449,6 +506,8 @@ void select_slot(Drafter* d, int slot) {
     if (!d->flash) d->f_rnn += delta * d->C;
     d->slot = slot;
 }
+
+bool probabilistic(const Drafter* d) { return d && d->flash && d->flash->sample; }
 
 float* dflash2_mask(Drafter* d) { return d->flash ? d->mask : nullptr; }
 
@@ -529,6 +588,12 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
     }
 }
 
+void prefill_context(Drafter* d, const float* taps, int ld, int n, int pos, int end) {
+    // Preserve the GEMM shape of every retained chunk, including the boundary chunk.
+    if (d->flash && pos + n <= end - df2::window) return;
+    write_context(d, taps, ld, 0, n, pos);
+}
+
 void commit_windows(Drafter* d, const float* taps, int ld, const std::vector<ContextWindow>& windows) {
     if (windows.empty()) return;
     if (windows.size() == 1 || !d->flash) {
@@ -554,11 +619,11 @@ void commit_windows(Drafter* d, const float* taps, int ld, const std::vector<Con
     df2::gather_context<<<dim3(d->C / 256, n, 4), 256, 0, d->s>>>(taps, ld, rows, f.packed, d->ctx_pos);
     gemm_bf(d, f.fc, d->C, 4 * d->C, f.packed, n, d->mix, d->C);
     df2::norm<<<n, 256, 0, d->s>>>(d->mix, nullptr, f.hidden_norm, d->C, d->mix);
-    k::to_bf16(d->mix, n * d->C, d->hb, d->s);
+    backbone_input(d, d->mix, n * d->C, d->hb);
     const int kd = d->KV * df2::head_dim;
     for (auto& l : d->L) {
-        gemm_bf(d, l.wk, kd, d->C, d->hb, n, d->kk, kd);
-        gemm_bf(d, l.wv, kd, d->C, d->hb, n, d->vv, kd);
+        project_backbone(d, l.wk, kd, d->C, d->hb, n, d->kk, kd);
+        project_backbone(d, l.wv, kd, d->C, d->hb, n, d->vv, kd);
         df2::prepare_keys(d, d->kk, l.k_norm, n, d->KV, d->ctx_pos);
         df2::scatter_context<<<dim3(kd / 256, n), 256, 0, d->s>>>(d->kk, d->vv, rows, l.cap, kd, l.kc, l.vc);
     }
@@ -616,7 +681,8 @@ static void dspark_block(Drafter* d, int proposals, int P, const uint16_t* lm_f1
 }
 
 void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
-             int* out, int proposals) {
+             int* out, int proposals, const Draws* draws, DraftMass* mass) {
+    if (draws) *d->flash->host_draws = *draws;
     const int C = d->C, T = kBlock;
     if (d->flash && (n_vocab != df2::vocab || n_rows < n_vocab || anchor < 0 || anchor >= n_vocab))
         throw std::runtime_error("DFlash2 requires the Inkling-2-Mini vocabulary");
@@ -633,7 +699,7 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
         static constexpr int kSplits[4] = {2, 8, 16, 64};
         d->h_meta[0] = P;
         d->h_meta[1] = anchor;
-        auto& G = d->graphs[d->slot].width[proposals][bkt];
+        auto& G = d->graphs[d->slot].width[proposals][draws ? 4 : bkt];
         if (G.exec && (G.anchor_h != anchor_h || G.n_rows != n_rows || G.n_vocab != n_vocab)) {
             cu(cudaGraphExecDestroy(G.exec), "pgraph destroy exec");
             cu(cudaGraphDestroy(G.graph), "pgraph destroy");
@@ -642,6 +708,7 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
         if (G.exec) {
             cu(cudaGraphLaunch(G.exec, d->s), "pgraph launch");
             cu(cudaStreamSynchronize(d->s), "propose");
+            if (mass) std::copy_n(d->flash->host_mass, proposals, mass);
             std::memcpy(out, d->h_out, proposals * sizeof(int));
             return;
         }
@@ -660,7 +727,12 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
         init_block_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
             anchor_h, d->mask, d->res, d->pos, d->toks, T, C, P, anchor);
     }
-    if (d->flash) df2::block(d, proposals);
+    if (draws) {
+        auto& f = *d->flash;
+        cu(cudaMemcpyAsync(f.draws, f.host_draws, sizeof(Draws), cudaMemcpyHostToDevice, d->s), "draws");
+        df2::block(d, proposals, 1, nullptr, true);
+        cu(cudaMemcpyAsync(f.host_mass, f.mass, proposals*sizeof(DraftMass), cudaMemcpyDeviceToHost, d->s), "mass");
+    } else if (d->flash) df2::block(d, proposals);
     else dspark_block(d, proposals, P, lm_f16, n_rows, n_vocab, splits);
     cu(cudaMemcpyAsync(d->h_out, d->toks + 1, proposals * 4, cudaMemcpyDeviceToHost, d->s), "tokens");
     if (capture) {
@@ -669,16 +741,19 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
         cu(cudaGraphLaunch(capture->exec, d->s), "pgraph launch");
     }
     cu(cudaStreamSynchronize(d->s), "propose");
+    if (mass) std::copy_n(d->flash->host_mass, proposals, mass);
     std::memcpy(out, d->h_out, proposals * sizeof(int));
 }
 
 void propose_batch(Drafter* d, int active, const int* slots, const int* positions, const float* embeddings,
-                   const uint16_t* lm_f16, int n_rows, int n_vocab, int window, int* tokens) {
+                   const uint16_t* lm_f16, int n_rows, int n_vocab, int window, int* tokens,
+                   const Draws* draws, DraftMass* mass) {
     if (!d->flash || active == 1) {
         for (int i = 0; i < active; ++i) {
             select_slot(d, slots[i]);
             int* block = tokens + i * window;
-            propose(d, block[0], embeddings + i * d->C, positions[i], lm_f16, n_rows, n_vocab, block + 1, window - 1);
+            propose(d, block[0], embeddings + i * d->C, positions[i], lm_f16, n_rows, n_vocab, block + 1, window - 1,
+                    draws ? draws+i : nullptr, mass ? mass+i*(window-1) : nullptr);
         }
         return;
     }
@@ -689,16 +764,20 @@ void propose_batch(Drafter* d, int active, const int* slots, const int* position
         d->h_meta[2*active+i] = slots[i];
     }
     const size_t bytes = active * window * sizeof(int);
+    if (draws) std::copy_n(draws, active, d->flash->host_draws);
     auto launch = [&] {
+        if (draws) cu(cudaMemcpyAsync(d->flash->draws, d->flash->host_draws, active*sizeof(Draws), cudaMemcpyHostToDevice, d->s), "batch draws");
         cu(cudaMemcpyAsync(d->d_meta, d->h_meta, 3 * active * sizeof(int), cudaMemcpyHostToDevice, d->s), "batch metadata");
         init_block_kernel_d<<<dim3((d->C + 255) / 256, kBlock, active), 256, 0, d->s>>>(
             embeddings, d->mask, d->res, d->pos, d->toks, kBlock, d->C, d->d_meta, window);
-        df2::block(d, window - 1, active, d->d_meta + 2*active);
+        df2::block(d, window - 1, active, d->d_meta + 2*active, draws != nullptr);
+        if (draws) cu(cudaMemcpyAsync(d->flash->host_mass, d->flash->mass, active*(window-1)*sizeof(DraftMass),
+                                     cudaMemcpyDeviceToHost, d->s), "batch probabilities");
         cu(cudaMemcpyAsync(d->h_out, d->toks, bytes, cudaMemcpyDeviceToHost, d->s), "batch tokens");
     };
     static const bool use_graph = !getenv("IK2_DRAFT_GRAPH") || atoi(getenv("IK2_DRAFT_GRAPH"));
     if (use_graph) {
-        auto& g = d->batch_graph[active][window];
+        auto& g = d->batch_graph[active][window][draws != nullptr];
         if (g.exec && g.anchor_h != embeddings) {
             cu(cudaGraphExecDestroy(g.exec), "batch graph destroy exec");
             cu(cudaGraphDestroy(g.graph), "batch graph destroy");
@@ -714,6 +793,7 @@ void propose_batch(Drafter* d, int active, const int* slots, const int* position
         cu(cudaGraphLaunch(g.exec, d->s), "batch graph launch");
     } else launch();
     cu(cudaStreamSynchronize(d->s), "propose_batch");
+    if (mass) std::copy_n(d->flash->host_mass, active*(window-1), mass);
     std::memcpy(tokens, d->h_out, bytes);
 }
 

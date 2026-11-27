@@ -1,4 +1,4 @@
-#include "ik2_draft.hpp"
+#include "ik2_draft_sampling.hpp"
 #include <random>
 #include "ik2_dflash2_kernels.cuh"
 #include "ik2_draft_weights.hpp"
@@ -83,6 +83,32 @@ static void conv_test() {
     gpu(cudaFree(dx)); gpu(cudaFree(dy)); gpu(cudaFree(dd)); gpu(cudaFree(db));
 }
 
+static void rejection_test() {
+    using namespace ik2::draft;
+    // Token 0 has excess draft mass. Token 1 is absent from the draft,
+    // token 2 is absent from the target, and token 3 has equal mass.
+    DraftMass q{};
+    for (int i = 0; i < kCandidates; ++i) q.ids[i] = i;
+    q.probabilities[0] = .5;
+    q.probabilities[2] = q.probabilities[3] = .25;
+    const std::vector<std::pair<int, double>> target{{0,.25}, {1,.5}, {3,.25}};
+    std::mt19937_64 rng(1024);
+    int counts[4]{}, accepted = 0;
+    constexpr int draws = 100000;
+    for (int i = 0; i < draws; ++i) {
+        double u = std::uniform_real_distribution<double>(0,1)(rng);
+        int candidate = u < .5 ? 0 : (u < .75 ? 2 : 3);
+        auto p = target;
+        int result = verify_draft(p, candidate, q, rng);
+        check(result != 2, "emitted a token outside target support");
+        ++counts[result];
+        accepted += result == candidate;
+    }
+    for (auto [id, prob] : target)
+        check(std::abs(double(counts[id])/draws-prob) < .008, "incorrect rejection-sampled distribution");
+    check(std::abs(double(accepted)/draws-.5) < .008, "incorrect draft acceptance probability");
+}
+
 static void selector_test() {
     const int stride = df::codebook_rows, rows = 2;
     std::vector<float> base(rows * stride, 10000);
@@ -114,6 +140,28 @@ static void selector_test() {
     auto tokens = upload(std::vector<int>(3));
     df::walk<<<1, 512>>>(logits, stride, ids, dh, dp, ds, rows, tokens);
     check(read(tokens, 3) == std::vector<int>({0,11,12}), "selector walk differs");
+    using ik2::draft::Draws;
+    using ik2::draft::DraftMass;
+    Draws draws{1.0, {0.999, 0.0}};
+    auto* dd = upload(std::vector<Draws>{draws});
+    auto* dm = upload(std::vector<DraftMass>(rows));
+    df::walk<true><<<1, 512>>>(logits, stride, ids, dh, dp, ds, rows, tokens, dd, dm);
+    const auto path = read(tokens, 3);
+    const auto mass = read(dm, rows);
+    check(path == std::vector<int>({0,12,11}), "sampled selector ignored its draw or predecessor");
+    for (int r = 0; r < rows; ++r) {
+        double weights[df::top], total = 0;
+        for (int i = 0; i < df::top; ++i) {
+            const int id = selected[r*df::top+i];
+            check(mass[r].ids[i] == id, "sampled support differs");
+            double corrected = base[r*stride+id] + (r == 0 && id == 11 ? -40 : 0);
+            weights[i] = std::exp(30*std::tanh(corrected/30));
+            total += weights[i];
+        }
+        for (int i = 0; i < df::top; ++i)
+            check(std::abs(mass[r].probabilities[i]-weights[i]/total) < 1e-6, "incorrect conditional draft mass");
+    }
+    gpu(cudaFree(dd)); gpu(cudaFree(dm));
     cudaStream_t stream;
     cudaGraph_t graph;
     cudaGraphExec_t exec;
@@ -136,6 +184,45 @@ static void selector_test() {
     gpu(cudaStreamDestroy(stream));
     gpu(cudaFree(logits)); gpu(cudaFree(parts)); gpu(cudaFree(ids));
     gpu(cudaFree(dp)); gpu(cudaFree(ds)); gpu(cudaFree(dh)); gpu(cudaFree(tokens));
+}
+
+template<int Bits>
+static void quantized_projection_test() {
+    constexpr int n = 80, k = 256, rows = 129, ld = n+3, limit = (1 << (Bits-1))-1;
+    std::mt19937 rng(405);
+    std::vector<float> weights(n*k);
+    std::vector<uint16_t> bf16(n*k), inputs(rows*k);
+    for (int c = 0; c < n; ++c) {
+        const float scale = c%5 ? std::ldexp(1.f, c%5-4) : 0.f;
+        for (int j = 0; j < k; ++j) {
+            int q = j ? int(rng()%(2*limit+1))-limit : limit;
+            float value = weights[c*k+j] = scale*q;
+            uint32_t bits;
+            std::memcpy(&bits, &value, sizeof(bits));
+            bf16[c*k+j] = bits >> 16;
+        }
+    }
+    for (auto& x : inputs) x = rng()%2 ? 0x3c00 : 0xbc00;
+    auto* w = upload(bf16);
+    auto* x = upload(inputs);
+    auto* packed = upload(std::vector<uint8_t>(n*k*Bits/8));
+    auto* scales = upload(std::vector<float>(n));
+    auto* output = upload(std::vector<float>(ld*rows));
+    df::quantize_rows<Bits><<<n, 256>>>(w, k, packed, scales);
+    for (int t : {1, 8, 15, 27, 64, rows}) {
+#ifdef STRATA_USE_HIP
+        df::project_quant<Bits><<<dim3((n+63)/64,(t+15)/16),128>>>(packed, scales, x, n, k, t, output, ld);
+#else
+        df::project_rows<false,Bits>(reinterpret_cast<uint16_t*>(packed), x, n, k, t, output, ld, nullptr, scales);
+#endif
+        const auto actual = read(output, t*ld);
+        for (int r = 0; r < t; ++r) for (int c = 0; c < n; ++c) {
+            float expected = 0;
+            for (int j = 0; j < k; ++j) expected += inputs[r*k+j] == 0x3c00 ? weights[c*k+j] : -weights[c*k+j];
+            check(actual[r*ld+c] == expected, "quantized projection differs from reference dot product");
+        }
+    }
+    gpu(cudaFree(w)); gpu(cudaFree(x)); gpu(cudaFree(packed)); gpu(cudaFree(scales)); gpu(cudaFree(output));
 }
 
 #ifndef STRATA_USE_HIP
@@ -162,6 +249,8 @@ static void projection_test() {
     }
     gpu(cudaFree(dw)); gpu(cudaFree(dx)); gpu(cudaFree(packed)); gpu(cudaFree(dy));
 }
+
+#endif
 
 static void proposals_test(const char* checkpoint) {
     using namespace ik2::draft;
@@ -244,21 +333,50 @@ static void proposals_test(const char* checkpoint) {
             check(false, "batched draft IDs differ from independent proposals");
         }
     }
+    auto* long_ctx = load(checkpoint, C, 4096, blas, stream);
+    gpu(cudaMemcpy(dflash2_mask(long_ctx), data.data(), C*sizeof(float), cudaMemcpyHostToDevice));
+    set_head_q8(long_ctx, head, scales);
+    const auto spans = cache_spans(long_ctx);
+    std::vector<std::vector<float>> expected;
+    std::vector<int> full(kBlock-1), skipped(kBlock-1);
+    for (int pass = 0; pass < 2; ++pass) {
+        for (auto span : spans) gpu(cudaMemsetAsync(span.ptr, 0, span.rows*span.row_bytes, stream));
+        for (int pos = 0; pos < 4096;) {
+            // The window boundary splits a chunk, and the final chunk wraps around the ring.
+            int n = std::min(61, 4096-pos);
+            const float* chunk = taps + (pos % 4)*C;
+            if (pass == 0) write_context(long_ctx, chunk, ld, 0, n, pos);
+            else prefill_context(long_ctx, chunk, ld, n, pos, 4096);
+            pos += n;
+        }
+        propose(long_ctx, 17, taps, 4096, nullptr, df::vocab, df::vocab,
+                pass ? skipped.data() : full.data());
+        for (size_t i = 0; i < spans.size(); ++i) {
+            auto span = spans[i];
+            auto kv = read(static_cast<float*>(span.ptr), span.rows*span.row_bytes/sizeof(float));
+            if (!pass) expected.push_back(std::move(kv));
+            else check(!std::memcmp(expected[i].data(), kv.data(), kv.size()*sizeof(float)), "4096-token KV differs");
+        }
+    }
+    check(full == skipped, "4096-token proposals differ");
+    std::puts("4096-token prefill matched full K/V and proposal IDs bit for bit");
     std::puts("Batched proposals matched independent slots across ring wrap and reuse");
 }
-#endif
 
 int main(int argc, char** argv) {
     try {
         weights_test();
+        rejection_test();
         if (argc == 2 && std::strcmp(argv[1], "--weights-only") == 0) return 0;
 #ifndef STRATA_USE_HIP
         projection_test();
+#endif
         if (argc == 3 && std::strcmp(argv[1], "--checkpoint") == 0) {
             proposals_test(argv[2]);
             return 0;
         }
-#endif
+        quantized_projection_test<8>();
+        quantized_projection_test<4>();
         conv_test();
         selector_test();
         std::puts("DFlash2 weights, convolution, top-16 and selector passed");

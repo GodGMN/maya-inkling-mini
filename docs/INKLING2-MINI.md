@@ -88,7 +88,11 @@ The `env` block in the configs:
 
 For DFlash2, pass `--draft path/to/Inkling-2-Mini-DFlash2` or its `model.safetensors` file. The engine identifies the drafter from its tensor names. All five DFlash2 layers use a 2,048-position window. `IK2_DRAFT_GRAPH=0` runs proposals without graph capture.
 
-With two to eight active CUDA requests, DFlash2 projects all proposals together and verifies a window of seven tokens per request by default. DSpark proposes separately for each slot. Set `IK2_BATCH` to the slot count and `IK2_DRAFT_WIDTH` to change the window.
+DFlash2 quantizes its attention and MLP weights to eight bits per weight at load. Set `IK2_DFLASH2_QUANT=q4` for four bits or `bf16` to keep the original weights. The tap projection stays BF16, and the selector shares the target output head. During prefill, only chunks overlapping the final 2,048 prompt positions need draft K/V writes.
+
+At positive temperature, DFlash2 samples each successor conditional on the preceding candidate. The verifier accepts with probability `min(1, p/q)` and draws a replacement from the positive part of `p-q` on rejection. In the multi-slot server, requests with an explicit seed share a uniform draw between draft and target and keep the matching prefix. This preserves their target-only token stream. Set `IK2_DFLASH2_SAMPLE=greedy` to use deterministic proposals at any temperature.
+
+With two to eight active requests, DFlash2 projects all proposals together and verifies a window of seven tokens per request by default. DSpark proposes separately for each slot. Set `IK2_BATCH` to the slot count and `IK2_DRAFT_WIDTH` to change the window.
 
 On CUDA, each output row of a DFlash2 projection uses the same four partitions of the input channels, MMA instructions and reduction order at every batch size. Batching adds independent rows. The convolution resets at each eight-row draft block, attention reads only that slot's accepted context, and the selector breaks ties in token order within each request. Starting from the same taps and anchor, each layer therefore produces the same row values and draft IDs as a single-slot proposal. The checkpoint differential test repeats this comparison after unequal commits, ring wrap and slot reuse.
 

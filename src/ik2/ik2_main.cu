@@ -23,7 +23,7 @@
 // seams.  Settings (IK2_*): docs/SETTINGS.md.
 #include "ik2_cpu.hpp"
 #include "ik2_cpu_deep.hpp"
-#include "ik2_draft.hpp"
+#include "ik2_draft_sampling.hpp"
 #include "ik2_kernels.cuh"
 #include "ik2_lora.hpp"
 
@@ -3413,20 +3413,13 @@ std::vector<std::pair<int, double>> sample_dist(std::vector<std::pair<float, int
     for (int j = 0; j < keep; ++j) out[j] = {cd[j].second, pr[j] / zk};
     return out;
 }
-int sample_from(const std::vector<std::pair<int, double>>& d, std::mt19937_64& rng, int skip = -1) {
-    double z = 0;
-    for (const auto& e : d)
-        if (e.first != skip) z += e.second;
-    if (z <= 0) return d[0].first;
-    double u = std::uniform_real_distribution<double>(0, z)(rng);
-    for (const auto& e : d) {
-        if (e.first == skip) continue;
-        u -= e.second;
-        if (u <= 0) return e.first;
-    }
-    for (auto it = d.rbegin(); it != d.rend(); ++it)
-        if (it->first != skip) return it->first;
-    return d[0].first;
+using ik2::draft::sample_from;
+
+ik2::draft::Draws draft_draws(double temperature, int count, std::mt19937_64& rng) {
+    ik2::draft::Draws draws{};
+    draws.temperature = temperature;
+    for (int i = 0; i < count; ++i) draws.uniform[i] = std::uniform_real_distribution<double>(0, 1)(rng);
+    return draws;
 }
 
 // When to draft and how wide (IK2_DRAFT_WIDTH the widest; IK2_DRAFT_ADAPT=0: always that wide): a step's expected
@@ -3498,7 +3491,12 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     if (!raw) raw = dalloc<float>(c.C), anchor_h = dalloc<float>(c.C);
     embed_row(M, anchor, raw, anchor_h);
     int dr[kBlockMax];
-    ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1);
+    const bool sample = sc.temp > 0 && ik2::draft::probabilistic(drafter);
+    ik2::draft::Draws draws;
+    ik2::draft::DraftMass mass[kBlockMax-1];
+    if (sample) draws = draft_draws(sc.temp, B-1, *sc.rng);
+    ik2::draft::propose(drafter, anchor, anchor_h, P, nullptr, c.n_rows, c.n_vocab, dr, B - 1,
+                        sample ? &draws : nullptr, sample ? mass : nullptr);
     int tk[kBlockMax];
     tk[0] = anchor;
     for (int j = 1; j < B; ++j) tk[j] = dr[j - 1];
@@ -3512,8 +3510,6 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
         for (int j = 0; j < n; ++j) next.push_back(dr[j]);
         next.push_back(g[n]);
     } else {
-        // the drafts are the drafter's argmax (a point mass): accept draft d with the target's probability of it,
-        // else sample the target's distribution without d - the target's distribution exactly
         fast_block(M, tk, B, P, OutMode::kCand, lo, nullptr);
         for (int j = 0; j < B; ++j) {
             std::vector<std::pair<float, int>> cd;
@@ -3524,10 +3520,15 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
                 cd.resize(c.n_vocab);
                 for (int v = 0; v < c.n_vocab; ++v) cd[v] = {row[v], v};
             }
-            const auto dist = sample_dist(cd, sc);
+            auto dist = sample_dist(cd, sc);
             if (j == B - 1) {
                 next.push_back(sample_from(dist, *sc.rng));
                 break;
+            }
+            if (sample) {
+                next.push_back(verify_draft(dist, dr[j], mass[j], *sc.rng));
+                if (next.back() != dr[j]) break;
+                continue;
             }
             double pd = 0;
             for (const auto& e : dist)
@@ -4847,9 +4848,6 @@ int main(int argc, char** argv) {
     if (batch_width < 1 || batch_width > 32) die("IK2_BATCH must be between 1 and 32");
     const bool batch_draft = batch_width > 1 && !draft_path.empty();
     if (batch_draft && batch_width > 8) die("batched --draft supports up to eight slots");
-#ifdef STRATA_USE_HIP
-    if (batch_draft) die("batched --draft requires CUDA");
-#endif
     const int batch_rows = batch_width * (batch_draft ? kBlockMax : 1);
     if (batch_width > 1) {
         if (!serve || !serve_maya || (cache_slots != 1 && cache_slots != batch_width))
@@ -5624,6 +5622,9 @@ int main(int argc, char** argv) {
         try {
             drafter = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s, batch_width);
             draft_mask = ik2::draft::dflash2_mask(drafter);
+#ifdef STRATA_USE_HIP
+            if (batch_draft && !draft_mask) die("batched HIP drafting requires DFlash2");
+#endif
             if (draft_mask && (g_final_tap != 3 || c.n_vocab != 200058))
                 die("DFlash2 requires the Inkling-2-Mini target");
             if (!draft_head && M.out_w.q8 && !draft_mask) {
@@ -5636,10 +5637,10 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             die(e.what());
         }
-        if (M.out_w.q8 && !M.out_w.f16) {   // (the FP16 copy was the fold's: the base logits from the blocks)
+        if (M.out_w.q8 && (draft_mask || !M.out_w.f16)) {
             ik2::draft::set_head_q8(drafter, M.out_w.q8, M.out_w.q8d);
             CU(cudaStreamSynchronize(g_s));
-            if (draft_head) CU(cudaFree(draft_head));
+            if (draft_head && draft_head != M.out_w.f16) CU(cudaFree(draft_head));
             draft_head = nullptr;
         }
         g_taps_ld = std::max({chunk, ik2::draft::kBlock, batch_rows});
@@ -6484,7 +6485,7 @@ int main(int argc, char** argv) {
                                 std::string(), lo, nullptr, t_exp);
                         if (last_c) last = std::move(lo);
                         if (drafter) {   // (the drafter's context for these positions, from their taps)
-                            ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
+                            ik2::draft::prefill_context(drafter, g_taps, g_taps_ld, n, (int) p0, ids.size());
                             if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
                         }
                         if (serve_maya && ids.size() - L > (size_t)chunk) {
@@ -6754,7 +6755,7 @@ int main(int argc, char** argv) {
             if (all) logits.insert(logits.end(), lo.begin(), lo.end());
             else if (last && !ag.empty()) first_best = ag[0];
             if (drafter) {
-                ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, p0);
+                ik2::draft::prefill_context(drafter, g_taps, g_taps_ld, n, p0, prompt.size());
                 if (last) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
             }
         }

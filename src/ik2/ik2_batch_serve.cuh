@@ -6,7 +6,8 @@ struct BatchRequest {
     SampleCfg sampling;
     std::mt19937_64 rng;
     double start = 0, decode_start = 0;
-    bool ready = false;
+    bool ready = false, seeded = false;
+    int draft_windows = 0, verified_tokens = 0;
 
     int pick(const float* logits, int vocab) {
         if (sampling.temp <= 0) return std::max_element(logits, logits + vocab) - logits;
@@ -112,7 +113,10 @@ void serve_sequences(Model& M, int width, int ctx, int chunk, int image_token, s
         if (getenv("IK2_DRAFT_WIDTH")) ctl.wmax = draft_width;
         ctl.adapt = !getenv("IK2_DRAFT_ADAPT") || atoi(getenv("IK2_DRAFT_ADAPT"));
     }
+    const bool stats = getenv("IK2_STATS") != nullptr;
     auto done = [&](BatchRequest& r, const char* reason) {
+        if (stats && r.draft_windows)
+            std::fprintf(stderr, "draft request %d: %d tokens in %d windows\n", r.rid, r.verified_tokens, r.draft_windows);
         const double t = now(), start = r.ready ? r.decode_start : t;
         std::printf("DONE %d %d %zu %.1f %.1f %s 0 0 0\n", r.rid, r.generated, r.ids.size(),
                     (start - r.start) * 1e3, (t - start) * 1e3, reason);
@@ -156,7 +160,7 @@ void serve_sequences(Model& M, int width, int ctx, int chunk, int image_token, s
             else if (key == "temperature") r.sampling.temp = std::atof(value);
             else if (key == "top_p") r.sampling.top_p = std::atof(value);
             else if (key == "top_k") r.sampling.top_k = std::atoi(value);
-            else if (key == "seed" && std::atoll(value) >= 0) r.rng.seed(std::atoll(value));
+            else if (key == "seed" && std::atoll(value) >= 0) { r.rng.seed(std::atoll(value)); r.seeded = true; }
             else if (key == "stop_token") r.stops.push_back(std::atoi(value));
         }
         bool valid = !ids.empty();
@@ -246,7 +250,7 @@ void serve_sequences(Model& M, int width, int ctx, int chunk, int image_token, s
             g_graph = graphs;
             if (drafter) {
                 ik2::draft::select_slot(drafter, s);
-                ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, r.pos);
+                ik2::draft::prefill_context(drafter, g_taps, g_taps_ld, n, r.pos, r.ids.size());
                 if (last) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
             }
             r.pos += n;
@@ -295,14 +299,28 @@ void serve_sequences(Model& M, int width, int ctx, int chunk, int image_token, s
         M.V = base;
         const int T = rows.slots.size();
         const size_t rb = (size_t)c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
+        ik2::draft::DraftMass mass[kBlockMax * (kBlockMax-1)];
+        const bool sample = B > 1 && mode != OutMode::kArgmax && ik2::draft::probabilistic(drafter);
         if (B > 1) {
             const int count = active.size();
             for (int i = 0; i < count; ++i)
                 k::decode_host(M.embd_type, M.embd + size_t(tokens[i * B]) * rb, c.C, W.emb_h + i * c.C);
             CU(cudaMemcpyAsync(W.tmp, W.emb_h, size_t(count) * c.C * sizeof(float), cudaMemcpyHostToDevice, g_s));
             k::rms(W.tmp, M.embd_norm, count, c.C, c.eps, W.xq, g_s);
+            ik2::draft::Draws draws[kBlockMax];
+            if (sample) for (int i = 0; i < count; ++i) {
+                auto& request = *slots[active[i]];
+                if (request.sampling.temp <= 0) draws[i] = {};
+                else if (request.seeded) {
+                    // Preserve seeded token streams by peeking at the target uniforms.
+                    auto rng = request.rng;
+                    draws[i] = draft_draws(request.sampling.temp, B-1, rng);
+                } else {
+                    draws[i] = draft_draws(request.sampling.temp, B-1, request.rng);
+                }
+            }
             ik2::draft::propose_batch(drafter, count, active.data(), positions.data(), W.xq,
-                                      draft_head, c.n_rows, c.n_vocab, B, tokens.data());
+                                      draft_head, c.n_rows, c.n_vocab, B, tokens.data(), sample ? draws : nullptr, sample ? mass : nullptr);
         }
         for (int t = 0; t < T; ++t)
             k::decode_host(M.embd_type, M.embd + (size_t)tokens[t] * rb, c.C, W.emb_h + (size_t)t * c.C);
@@ -346,26 +364,37 @@ void serve_sequences(Model& M, int width, int ctx, int chunk, int image_token, s
         CU(cudaStreamSynchronize(g_s));
         auto target_token = [&](BatchRequest& r, int t) {
             if (r.sampling.temp <= 0) return W.argmax_h[t];
+            auto pick = [&](std::vector<std::pair<float, int>>& candidates) {
+                auto p = sample_dist(candidates, r.sampling);
+                const int row = t % B;
+                if (sample && !r.seeded && row+1 < B)
+                    return verify_draft(p, tokens[t+1], mass[(t/B)*(B-1)+row], r.rng);
+                return sample_from(p, r.rng);
+            };
+            std::vector<std::pair<float, int>> candidates;
+            const float* logits;
             if (mode == OutMode::kCand) {
-                std::vector<std::pair<float, int>> candidates;
                 if (block_cands(single ? W.cand_h : buf.cand_h, t, candidates))
-                    return sample_from(sample_dist(candidates, r.sampling), r.rng);
+                    return pick(candidates);
                 CU(cudaMemcpy(W.logits_h, W.logits + (size_t)t * c.n_rows, c.n_vocab * sizeof(float),
                               cudaMemcpyDeviceToHost));
-                return r.pick(W.logits_h, c.n_vocab);
-            }
-            return r.pick(single ? W.logits_h : buf.logits_h + (size_t)t * c.n_vocab, c.n_vocab);
+                logits = W.logits_h;
+            } else logits = single ? W.logits_h : buf.logits_h + (size_t)t * c.n_vocab;
+            candidates.resize(c.n_vocab);
+            for (int id = 0; id < c.n_vocab; ++id) candidates[id] = {logits[id], id};
+            return pick(candidates);
         };
         std::vector<ik2::draft::ContextWindow> commits;
         for (int first = 0; first < T; first += B) {
             const int s = rows.slots[first];
             const int start = slots[s]->pos;
             int kept = 0;
+            if (B > 1 && stats) ++slots[s]->draft_windows;
             while (kept < B) {
-                // Sampling the target once per emitted token also preserves the request's RNG sequence.
                 const int token = target_token(*slots[s], first + kept);
                 ++kept;
                 ++slots[s]->pos;
+                if (B > 1 && stats) ++slots[s]->verified_tokens;
                 emit(s, token);
                 if (!slots[s] || kept == B || token != tokens[first + kept]) break;
             }
