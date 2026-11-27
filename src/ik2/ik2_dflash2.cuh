@@ -39,55 +39,63 @@ void context(Drafter* d, const float* taps, int ld, int first, int rows, int pos
     }
 }
 
-void conv_input(Drafter* d, DLayer::Conv weights) {
-    k::to_bf16(d->h, kBlock * width, d->hb, d->s);
-    gemm_bf(d, weights.projection, dyn_width, width, d->hb, kBlock, d->flash->dynamic, dyn_width);
-    conv<<<dim3(width / 256, kBlock), 256, 0, d->s>>>(d->h, d->flash->dynamic, weights.base, 0, d->x);
-    k::to_bf16(d->x, kBlock * width, d->hb, d->s);
+void conv_input(Drafter* d, DLayer::Conv weights, int T) {
+    k::to_bf16(d->h, T * width, d->hb, d->s);
+    gemm_bf(d, weights.projection, dyn_width, width, d->hb, T, d->flash->dynamic, dyn_width);
+    conv<<<dim3(width / 256, T), 256, 0, d->s>>>(d->h, d->flash->dynamic, weights.base, 0, d->x);
+    k::to_bf16(d->x, T * width, d->hb, d->s);
 }
 
-void conv_output(Drafter* d, DLayer::Conv weights) {
-    conv<<<dim3(width / 256, kBlock), 256, 0, d->s>>>(d->h, d->flash->dynamic, weights.base, 1, d->x);
+void conv_output(Drafter* d, DLayer::Conv weights, int T) {
+    conv<<<dim3(width / 256, T), 256, 0, d->s>>>(d->h, d->flash->dynamic, weights.base, 1, d->x);
 }
 
-void block(Drafter* d, int rows) {
+void block(Drafter* d, int proposals, int active = 1, const int* slots = nullptr) {
     auto& f = *d->flash;
+    const int T = active * kBlock;
+    const int rows = active * proposals;
     for (auto& l : d->L) {
         if (&l == &d->L.front())
-            norm<<<kBlock, 256, 0, d->s>>>(d->res, nullptr, l.in_norm, width, d->h);
+            norm<<<T, 256, 0, d->s>>>(d->res, nullptr, l.in_norm, width, d->h);
         else
-            norm<<<kBlock, 256, 0, d->s>>>(d->x, d->res, l.in_norm, width, d->h);
-        conv_input(d, l.attention_conv);
-        gemm_bf(d, l.wq, qdim, width, d->hb, kBlock, d->q, qdim);
-        gemm_bf(d, l.wk, kdim, width, d->hb, kBlock, d->kk, kdim);
-        gemm_bf(d, l.wv, kdim, width, d->hb, kBlock, d->vv, kdim);
-        prepare_keys(d, d->q, l.q_norm, kBlock, heads, d->pos);
-        prepare_keys(d, d->kk, l.k_norm, kBlock, kv_heads, d->pos);
-        round_values(d, d->vv, kBlock * kdim);
+            norm<<<T, 256, 0, d->s>>>(d->x, d->res, l.in_norm, width, d->h);
+        conv_input(d, l.attention_conv, T);
+        gemm_bf(d, l.wq, qdim, width, d->hb, T, d->q, qdim);
+        gemm_bf(d, l.wk, kdim, width, d->hb, T, d->kk, kdim);
+        gemm_bf(d, l.wv, kdim, width, d->hb, T, d->vv, kdim);
+        prepare_keys(d, d->q, l.q_norm, T, heads, d->pos);
+        prepare_keys(d, d->kk, l.k_norm, T, kv_heads, d->pos);
+        round_values(d, d->vv, T * kdim);
         k::dflash2_attn(d->q, l.kc, l.vc, d->pos, window - 1, d->kk, d->vv, kBlock, heads, kv_heads,
-                        1.f / std::sqrt(float(head_dim)), 8, d->scratch, d->o, d->s, l.cap);
-        k::to_bf16(d->o, kBlock * qdim, d->hb, d->s);
-        gemm_bf(d, l.wo, width, qdim, d->hb, kBlock, d->h, width);
-        conv_output(d, l.attention_conv);
-        norm<<<kBlock, 256, 0, d->s>>>(d->x, d->res, l.post_norm, width, d->h);
-        conv_input(d, l.mlp_conv);
-        gemm_bf(d, l.wgu, 2 * ff, width, d->hb, kBlock, d->gu, 2 * ff);
-        round_values(d, d->gu, kBlock * 2 * ff);
-        k::silu_mul_bf16(d->gu, kBlock, ff, d->hb2, d->s);
-        gemm_bf(d, l.wd, width, ff, d->hb2, kBlock, d->h, width);
-        conv_output(d, l.mlp_conv);
+                        1.f / std::sqrt(float(head_dim)), 8, d->scratch, d->o, d->s, l.cap, active, slots);
+        k::to_bf16(d->o, T * qdim, d->hb, d->s);
+        gemm_bf(d, l.wo, width, qdim, d->hb, T, d->h, width);
+        conv_output(d, l.attention_conv, T);
+        norm<<<T, 256, 0, d->s>>>(d->x, d->res, l.post_norm, width, d->h);
+        conv_input(d, l.mlp_conv, T);
+        gemm_bf(d, l.wgu, 2 * ff, width, d->hb, T, d->gu, 2 * ff);
+        round_values(d, d->gu, T * 2 * ff);
+        k::silu_mul_bf16(d->gu, T, ff, d->hb2, d->s);
+        gemm_bf(d, l.wd, width, ff, d->hb2, T, d->h, width);
+        conv_output(d, l.mlp_conv, T);
     }
-    norm<<<kBlock, 256, 0, d->s>>>(d->x, d->res, d->norm, width, d->h);
-    k::to_bf16(d->h + width, rows * width, d->hb, d->s);
+    norm<<<T, 256, 0, d->s>>>(d->x, d->res, d->norm, width, d->h);
+    float* hidden = d->h + width;
+    if (active > 1) {
+        cu(cudaMemcpy2DAsync(d->x, proposals * width * sizeof(float), hidden, kBlock * width * sizeof(float),
+                             proposals * width * sizeof(float), active, cudaMemcpyDeviceToDevice, d->s), "selector rows");
+        hidden = d->x;
+    }
+    k::to_bf16(hidden, rows * width, d->hb, d->s);
     gemm_bf(d, f.selector, rank, width, d->hb, rows, d->proj, rank);
-    k::to_f16(d->h + width, rows * width, (uint16_t*)d->x16, d->s);
+    k::to_f16(hidden, rows * width, (uint16_t*)d->x16, d->s);
     if (d->head_q8)
         k::q8_tile(d->head_q8, d->head_q8d, vocab, width, (const uint16_t*)d->x16, rows, d->base, vocab, d->s);
     else
         gemm_h(d, f.head, vocab, width, d->x16, rows, d->base, vocab);
     radix_parts<<<dim3(parts, rows), 256, 0, d->s>>>(d->base, vocab, f.parts);
     merge_parts<<<rows, 128, 0, d->s>>>(d->base, vocab, f.parts, f.ids);
-    walk<<<1, top * 32, 0, d->s>>>(d->base, vocab, f.ids, d->proj, f.pred, f.succ, rows, d->toks);
+    walk<<<active, top * 32, 0, d->s>>>(d->base, vocab, f.ids, d->proj, f.pred, f.succ, proposals, d->toks);
 }
 } // namespace
 } // namespace df2

@@ -88,7 +88,11 @@ The `env` block in the configs:
 
 For DFlash2, pass `--draft path/to/Inkling-2-Mini-DFlash2` or its `model.safetensors` file. The engine identifies the drafter from its tensor names. All five DFlash2 layers use a 2,048-position window. `IK2_DRAFT_GRAPH=0` runs proposals without graph capture.
 
-With `--draft` the engine decides every step whether to draft. A window of B tokens is worth (1 - a^B) / (1 - a) tokens, where a is how often recent drafts were accepted; it drafts when that, over the window's measured time, beats a plain token's time, and after 8 plain tokens it drafts once to look again. `IK2_DRAFT_WIDTH` (default 5) sets the widest window, `IK2_DRAFT_ADAPT=0` always drafts at that width.
+With two to eight active CUDA requests, DFlash2 projects all proposals together and verifies a window of seven tokens per request by default. DSpark proposes separately for each slot. Set `IK2_BATCH` to the slot count and `IK2_DRAFT_WIDTH` to change the window.
+
+On CUDA, each output row of a DFlash2 projection uses the same four partitions of the input channels, MMA instructions and reduction order at every batch size. Batching adds independent rows. The convolution resets at each eight-row draft block, attention reads only that slot's accepted context, and the selector breaks ties in token order within each request. Starting from the same taps and anchor, each layer therefore produces the same row values and draft IDs as a single-slot proposal. The checkpoint differential test repeats this comparison after unequal commits, ring wrap and slot reuse.
+
+With one active request the engine decides every step whether to draft. A window of B tokens is worth (1 - a^B) / (1 - a) tokens, where a is how often recent drafts were accepted; it drafts when that, over the window's measured time, beats a plain token's time, and after 8 plain tokens it drafts once to look again. `IK2_DRAFT_WIDTH` (default 5) sets the widest window, `IK2_DRAFT_ADAPT=0` always drafts at that width.
 
 The tensor core expert kernels are on by default; `IK2_EXPERT_MMA=0` in `env` switches back to the scalar ones, which give the same logits bit for bit as the older builds. Every setting is listed in [SETTINGS.md](SETTINGS.md).
 

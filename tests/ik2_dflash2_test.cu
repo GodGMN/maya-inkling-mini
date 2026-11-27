@@ -1,3 +1,5 @@
+#include "ik2_draft.hpp"
+#include <random>
 #include "ik2_dflash2_kernels.cuh"
 #include "ik2_draft_weights.hpp"
 
@@ -136,10 +138,127 @@ static void selector_test() {
     gpu(cudaFree(dp)); gpu(cudaFree(ds)); gpu(cudaFree(dh)); gpu(cudaFree(tokens));
 }
 
+#ifndef STRATA_USE_HIP
+static void projection_test() {
+    constexpr int n = 32, k = 256, stride = n + 7;
+    std::mt19937 rng(41);
+    std::vector<uint16_t> w(n*k), x(64*k);
+    auto sign = [&](uint16_t& v) { v = rng() & 1 ? 0x3f80 : 0xbf80; };
+    std::for_each(w.begin(), w.end(), sign);
+    std::for_each(x.begin(), x.end(), sign);
+    auto* dw = upload(w);
+    auto* dx = upload(x);
+    auto* packed = upload(w);
+    auto* dy = upload(std::vector<float>(64 * stride));
+    df::pack_projection<<<dim3(n/16, k/64), 128>>>(dw, k, reinterpret_cast<uint4*>(packed));
+    for (int rows : {1, 7, 13, 26, 49, 64}) {
+        df::project_rows(packed, dx, n, k, rows, dy, stride, nullptr);
+        const auto y = read(dy, rows * stride);
+        for (int t = 0; t < rows; ++t) for (int c = 0; c < n; ++c) {
+            int expected = 0;
+            for (int j = 0; j < k; ++j) expected += w[c*k+j] == x[t*k+j] ? 1 : -1;
+            check(y[t*stride+c] == expected, "packed BF16 projection differs from the dot product");
+        }
+    }
+    gpu(cudaFree(dw)); gpu(cudaFree(dx)); gpu(cudaFree(packed)); gpu(cudaFree(dy));
+}
+
+static void proposals_test(const char* checkpoint) {
+    using namespace ik2::draft;
+    constexpr int slots = 8, C = df::width, ld = slots * kBlock;
+    cudaStream_t stream;
+    cublasHandle_t blas;
+    gpu(cudaStreamCreate(&stream));
+    check(cublasCreate(&blas) == CUBLAS_STATUS_SUCCESS, "create BLAS handle");
+    check(cublasSetStream(blas, stream) == CUBLAS_STATUS_SUCCESS, "set BLAS stream");
+    auto* batch = load(checkpoint, C, 32, blas, stream, slots);
+    auto* reference = load(checkpoint, C, 32, blas, stream);
+    std::mt19937 rng(217);
+    std::vector<int8_t> q(size_t(df::vocab) * C);
+    for (auto& x : q) x = int(rng() % 255) - 127;
+    auto* head = upload(q);
+    auto* scales = upload(std::vector<uint16_t>(q.size() / 32, 0x2000));
+    std::vector<float> data(4 * ld * C);
+    for (auto& x : data) x = (int(rng() % 8192) - 4096) / 1024.f;
+    auto* taps = upload(data);
+    for (auto* d : {batch, reference}) {
+        check(dflash2_mask(d) != nullptr, "expected a DFlash2 checkpoint");
+        gpu(cudaMemcpy(dflash2_mask(d), data.data(), C * sizeof(float), cudaMemcpyHostToDevice));
+        set_head_q8(d, head, scales);
+    }
+    struct Step {
+        int window;
+        std::vector<ContextWindow> writes;
+        std::vector<int> ids, positions, anchors, expected;
+    };
+    std::vector<Step> steps(15);
+    int lengths[slots]{};
+    std::vector<int> order{3, 7, 1, 5, 0, 2, 6, 4};
+    for (int n = 0; n < int(steps.size()); ++n) {
+        auto& step = steps[n];
+        const int active = 2 + n % 7;
+        step.window = 2 + (n * 3) % 7;
+        std::rotate(order.begin(), order.begin() + 1, order.end());
+        step.ids.assign(order.begin(), order.begin() + active);
+        for (int i = 0; i < active; ++i) {
+            const int slot = order[i], count = 1 + (i + n) % kBlock;
+            if (n == 8 && i == 0) lengths[slot] = 0;
+            step.writes.push_back({slot, i * kBlock, count, lengths[slot]});
+            step.positions.push_back(lengths[slot] += count);
+            step.anchors.push_back(rng() % df::vocab);
+        }
+        step.expected.resize(active * step.window);
+    }
+    // Replay an entire request history before reusing the one-slot reference model.
+    for (int slot = 0; slot < slots; ++slot) {
+        for (int n = 0; n < int(steps.size()); ++n) {
+            auto& step = steps[n];
+            for (int i = 0; i < int(step.ids.size()); ++i) {
+                const auto& w = step.writes[i];
+                if (w.slot != slot) continue;
+                write_context(reference, taps, ld, w.first, w.count, w.position);
+                int* out = step.expected.data() + i * step.window;
+                out[0] = step.anchors[i];
+                propose(reference, out[0], taps + (n + i + 1) * C, step.positions[i], nullptr,
+                        df::vocab, df::vocab, out + 1, step.window - 1);
+            }
+        }
+    }
+    // A stable input address exercises graph replay with fresh slot IDs, positions and anchors.
+    auto* embeddings = upload(std::vector<float>(slots * C));
+    for (int n = 0; n < int(steps.size()); ++n) {
+        const auto& step = steps[n];
+        const int active = step.ids.size();
+        std::vector<int> actual(active * step.window, -1);
+        for (int i = 0; i < active; ++i) actual[i * step.window] = step.anchors[i];
+        gpu(cudaMemcpyAsync(embeddings, taps + (n + 1) * C, size_t(active) * C * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream));
+        commit_windows(batch, taps, ld, step.writes);
+        propose_batch(batch, active, step.ids.data(), step.positions.data(), embeddings, nullptr,
+                      df::vocab, df::vocab, step.window, actual.data());
+        for (int j = 0; j < int(actual.size()); ++j) {
+            if (actual[j] == step.expected[j]) continue;
+            const int i = j / step.window;
+            std::fprintf(stderr, "step %d slot %d position %d draft %d: got %d expected %d\n",
+                         n, step.ids[i], step.positions[i], j % step.window, actual[j], step.expected[j]);
+            check(false, "batched draft IDs differ from independent proposals");
+        }
+    }
+    std::puts("Batched proposals matched independent slots across ring wrap and reuse");
+}
+#endif
+
 int main(int argc, char** argv) {
     try {
         weights_test();
         if (argc == 2 && std::strcmp(argv[1], "--weights-only") == 0) return 0;
+#ifndef STRATA_USE_HIP
+        projection_test();
+        if (argc == 3 && std::strcmp(argv[1], "--checkpoint") == 0) {
+            proposals_test(argv[2]);
+            return 0;
+        }
+#endif
         conv_test();
         selector_test();
         std::puts("DFlash2 weights, convolution, top-16 and selector passed");

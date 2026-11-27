@@ -179,11 +179,6 @@ struct Shards {
         return files[it->second.first]->data_start() + it->second.second->offset;
     }
     int file_of(const std::string& n) const { return by_name.at(n).first; }
-    double num(const std::string& key) const {
-        const auto* v = files[0]->get(key);
-        if (!v) die("no key " + key);
-        return v->num();
-    }
     const strata::MetaValue* get(const std::string& key) const { return files[0]->get(key); }
 };
 
@@ -385,11 +380,11 @@ struct Prof {
     double attn = 0, route = 0, upload = 0, experts = 0, rest = 0;
     double t = 0;
     void start() {
-        if (g_prof) cudaStreamSynchronize(g_s), t = now();
+        if (g_prof) { CU(cudaStreamSynchronize(g_s)); t = now(); }
     }
     void lap(double& acc) {
         if (!g_prof) return;
-        cudaStreamSynchronize(g_s);
+        CU(cudaStreamSynchronize(g_s));
         const double n = now();
         acc += n - t;
         t = n;
@@ -586,7 +581,7 @@ Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
         return m;
     }
     if (nb > g_stage_bytes) {
-        if (g_stage) cudaFree(g_stage);
+        if (g_stage) CU(cudaFree(g_stage));
         g_stage = dalloc<uint8_t>(g_stage_bytes = nb);
     }
     CU(cudaMemcpy(g_stage, S.data(n), nb, cudaMemcpyHostToDevice));
@@ -670,7 +665,7 @@ struct MatPart {
 
 void ensure_stage(size_t nb) {
     if (nb > g_stage_bytes) {
-        if (g_stage) cudaFree(g_stage);
+        if (g_stage) CU(cudaFree(g_stage));
         g_stage = dalloc<uint8_t>(g_stage_bytes = nb);
     }
 }
@@ -865,10 +860,10 @@ struct Pinned {
     ~Pinned() {
         for (const auto& b : blocks) {
             if (b.mapped) {
-                if (b.registered) cudaHostUnregister(b.ptr);
+                if (b.registered) CU(cudaHostUnregister(b.ptr));
                 ::munmap(b.ptr, b.bytes);
             } else if (b.ptr) {
-                cudaFreeHost(b.ptr);
+                CU(cudaFreeHost(b.ptr));
             }
         }
     }
@@ -1468,7 +1463,7 @@ Work& dev_work(int d) { return g_dev[d].W; }
 ExpertCache& dev_cache(int d) { return g_dev[d].EC; }
 void use_dev(int d) {
     if (d == g_cur) return;
-    if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;   // (the previous device's)
+    if (g_stage) { CU(cudaFree(g_stage)); g_stage = nullptr; g_stage_bytes = 0; }   // (the previous device's)
     CU(cudaSetDevice(d));
     g_cur = d;
     g_s = g_dev[d].s, g_cs = g_dev[d].cs, g_ev = g_dev[d].ev, g_blas = g_dev[d].blas;
@@ -2860,6 +2855,7 @@ struct BlockBufs {
     float *sg = nullptr, *su = nullptr, *wt = nullptr;
     float* lp_msg = nullptr;     // a pass's messages, [n_core][4][kBlockMax][C]
     k::ConvRec* recs = nullptr;  // every visit's four convs (rollback_block)
+    int* zero_slots = nullptr;
     int n_recs = 0;
     int *cand_d = nullptr, *cand_h = nullptr;   // kCand: each row's k::cand_topk out, [kBlockMax][2 + 2 kCandCap]
 };
@@ -2892,6 +2888,12 @@ void block_init(Model& M) {
     g_blk.n_recs = (int) recs.size();
     g_blk.recs = dalloc<k::ConvRec>(recs.size());
     CU(cudaMemcpy(g_blk.recs, recs.data(), recs.size() * sizeof(k::ConvRec), cudaMemcpyHostToDevice));
+#ifndef STRATA_USE_HIP
+    if (g_taps && getenv("IK2_BLACKWELL_NVFP4") && !atoi(getenv("IK2_BLACKWELL_NVFP4"))) {
+        g_blk.zero_slots = dalloc<int>(kBlockMax);
+        CU(cudaMemset(g_blk.zero_slots, 0, kBlockMax * sizeof(int)));
+    }
+#endif
     g_blk.ready = true;
 }
 
@@ -2904,6 +2906,8 @@ void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y
 struct SequenceRows {
     std::vector<int> slots, buckets;
     int* device_slots = nullptr;
+    bool native_fp4 = false;
+    int window = 0;   // positive for recorded speculative windows, including a one-row tail
 };
 
 Visit sequence_visit(Visit v, const Layer& ly, const Config& c, int slot) {
@@ -2921,11 +2925,24 @@ Visit sequence_visit(Visit v, const Layer& ly, const Config& c, int slot) {
     v.h_v += slot * 3 * kd;
     v.h_attn += slot * 3 * c.C;
     v.h_mlp += slot * 3 * c.C;
+    for (int i = 0; i < 4; ++i) {
+        const size_t offset = slot * (i < 2 ? kd : c.C);
+        if (v.rec_old[i]) v.rec_old[i] += 3 * offset;
+        if (v.rec_x[i]) v.rec_x[i] += kBlockMax * offset;
+    }
     return v;
 }
 
 void sequence_product(const Mat& m, const float* x, int T, float* y, int ld) {
     k::mv_q8p_sequences(m.q8, m.q8d, m.N, m.K, x, T, y, ld, g_s);
+}
+
+void sequence_conv(const SequenceRows& rows, const float* x, int ld, k::MvConv cv, const Visit& visit, int which) {
+    const int count = rows.slots.size();
+    if (rows.window)
+        k::conv_windows(rows.device_slots, count, rows.window, kBlockMax, x, ld, cv, visit.rec_old[which], visit.rec_x[which], g_s);
+    else
+        k::conv_sequences(rows.device_slots, count, x, ld, cv, g_s);
 }
 
 void sequence_attention(Model& M, Work& W, int vis, bool sep, const SequenceRows& rows) {
@@ -2934,12 +2951,16 @@ void sequence_attention(Model& M, Work& W, int vis, bool sep, const SequenceRows
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, T = (int)rows.slots.size();
     const Mat& m = ly.sliding ? ly.wqkvrg : ly.wqrg;
     const int N = m.N;
+    auto product = [&](const Mat& weight, const float* x, const uint16_t* half, float* out, int ld) {
+        if (rows.native_fp4) tile_rows(weight, 0, weight.N, half, T, out, ld);
+        else sequence_product(weight, x, T, out, ld);
+    };
     if (ly.sliding && sep) {
-        sequence_product(mat_rows(m, 0, HD), W.xq, T, W.qkv, N);
-        sequence_product(mat_rows(m, HD, KD), W.xk, T, W.qkv + HD, N);
-        sequence_product(mat_rows(m, HD + KD, KD), W.xv, T, W.qkv + HD + KD, N);
-        sequence_product(mat_rows(m, HD + 2 * KD, N - HD - 2 * KD), W.xq, T, W.qkv + HD + 2 * KD, N);
-    } else sequence_product(m, W.xq, T, W.qkv, N);
+        product(mat_rows(m, 0, HD), W.xq, W.x16, W.qkv, N);
+        product(mat_rows(m, HD, KD), W.xk, W.xk16, W.qkv + HD, N);
+        product(mat_rows(m, HD + KD, KD), W.xv, W.xv16, W.qkv + HD + KD, N);
+        product(mat_rows(m, HD + 2 * KD, N - HD - 2 * KD), W.xq, W.x16, W.qkv + HD + 2 * KD, N);
+    } else product(m, W.xq, W.x16, W.qkv, N);
     float* kd = nullptr;
     float* vd = nullptr;
     const float* keys = W.qkv + HD;
@@ -2951,38 +2972,44 @@ void sequence_attention(Model& M, Work& W, int vis, bool sep, const SequenceRows
         vd = kd + T * D;
         k::mv_f16_rows(ly.sc_k_dyn16, D, C, W.xk, C, T, kd, D, g_s);
         k::mv_f16_rows(ly.sc_v_dyn16, D, C, W.xv, C, T, vd, D, g_s);
-        sequence_product(ly.wk, W.xk, T, W.kk, KD);
-        sequence_product(ly.wv, W.xv, T, W.vv, KD);
+        product(ly.wk, W.xk, W.xk16, W.kk, KD);
+        product(ly.wv, W.xv, W.xv16, W.vv, KD);
         keys = W.kk;
         values = W.vv;
         ld = KD;
     }
-    k::conv_sequences(rows.device_slots, T, keys, ld, {0, KD, ly.h_k, ly.sc_k, kd, c.KV, nullptr, W.kconv}, g_s);
-    k::conv_sequences(rows.device_slots, T, values, ld, {0, KD, ly.h_v, ly.sc_v, vd, c.KV, nullptr, W.vconv}, g_s);
+    sequence_conv(rows, keys, ld, {0, KD, ly.h_k, ly.sc_k, kd, c.KV, nullptr, W.kconv}, M.V[vis], 0);
+    sequence_conv(rows, values, ld, {0, KD, ly.h_v, ly.sc_v, vd, c.KV, nullptr, W.vconv}, M.V[vis], 1);
     k::mv_f16_rows(ly.sink16, c.H, C, W.xq, C, T, W.sink, c.H, g_s);
+
 #ifdef STRATA_USE_HIP
-    // The Radeon preset splits short attention across keys. A batch with different split
-    // counts (e.g. requests on both sides of 1024 tokens) keeps each row's scalar dispatch.
+    // Different depth buckets can require different split counts.
     const int bucket = rows.buckets.front();
     const bool same_split = ly.sliding || std::all_of(rows.buckets.begin(), rows.buckets.end(),
                                                       [bucket](int b) { return b == bucket; });
     const bool scalar = g_attn_mma != 1 && (ly.sliding || (g_attn_mma != 2 && bucket < 3));
     static const bool grouped = getenv("IK2_DECODE_SUBWAVE") && atoi(getenv("IK2_DECODE_SUBWAVE"));
-    if (grouped && ly.kc8 && c.D == 128 && same_split && scalar) {
-        const int splits = ly.sliding ? std::min(128, (c.window + 63) / 64) : bucket == 1 ? 16 : bucket == 2 ? 32 : 128;
+    const bool use_batch = grouped && same_split && scalar;
+    const int splits = ly.sliding ? std::min(128, (c.window + 63) / 64) : bucket == 1 ? 16 : bucket == 2 ? 32 : 128;
+    uint16_t* q16 = nullptr;
+    const size_t scratch = (size_t)T * c.H * splits * 130;
+#else
+    const bool use_batch = rows.window && g_attn_mma == 1;
+    const int splits = ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
+    uint16_t* q16 = W.x16;
+    const size_t scratch = (size_t)T * k::attn_decode_mma_scratch(c.H, splits);
+#endif
+    if (use_batch && ly.kc8 && c.D == 128 && scratch <= W.lg_cap) {
         const size_t cap = ly.paged_kv ? ((size_t)ly.kv_cap + 15) / 16 * 16 : ly.kv_cap;
         float* r = W.qkv + HD + (ly.sliding ? 2 * KD : 0);
-        if ((size_t)T * c.H * splits * 130 <= W.lg_cap) {
-            k::sequence_attention_quantized(W.qkv, r, r + c.H * c.d_rel, N, ly.q_clip, ly.r_clip, W.kconv, W.vconv,
+        k::sequence_attention_quantized(W.qkv, r, r + c.H * c.d_rel, N, ly.q_clip, ly.r_clip, W.kconv, W.vconv,
                                       ly.kc8, ly.vc8, ly.fp8_layout(), cap * kv_row_bytes(KD, ly.sliding),
                                       rows.device_slots, W.pos, T, c.H, c.KV, c.d_rel, c.qk_clip, c.rel_clip,
                                       c.eps, c.alpha, c.n_floor, c.qk_clip <= 28.f ? 16.f : 1.f, 32.f, ly.rel_proj,
                                       ly.sliding ? c.extent_swa : c.extent, ly.sliding ? c.window : 1 << 30,
-                                      splits, W.sink, W.lg, W.o, g_s);
-            return;
-        }
+                                      splits, W.sink, W.lg, W.o, g_s, q16);
+        return;
     }
-#endif
     for (int t = 0; t < T; ++t) {
         const Visit v = sequence_visit(M.V[vis], ly, c, rows.slots[t]);
         ly.kc = v.kc; ly.vc = v.vc; ly.kc8 = v.kc8; ly.vc8 = v.vc8;
@@ -3140,11 +3167,14 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
         // the output projection and its short conv (the stream added, but where a block starts)
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, TCb, cudaMemcpyDeviceToDevice, g_s));
-        if (rows) sequence_product(Ly.wo, W.o, T, W.tmp, C);
+        if (rows && rows->native_fp4) {
+            k::to_f16(W.o, (size_t)T * HD, W.x16, g_s);
+            tile_rows(Ly.wo, 0, C, W.x16, T, W.tmp, C);
+        } else if (rows) sequence_product(Ly.wo, W.o, T, W.tmp, C);
         else tile_rows(Ly.wo, 0, C, W.x16, T, W.tmp, C);
         if (Ly.attn_lora.rank) add_attention_lora(Ly, W.o, T, W.attn_lora_tmp, W.tmp);
-        if (rows) k::conv_sequences(rows->device_slots, T, W.tmp, C,
-                                    {0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : W.h, W.r}, g_s);
+        if (rows) sequence_conv(*rows, W.tmp, C,
+                                    {0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : W.h, W.r}, M.V[vis], 2);
         else k::conv_block(W.tmp, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, 0, T, C, first ? nullptr : W.h, C, W.r, C,
                       Ly.rec_old[2], Ly.rec_x[2], g_s);
         abl(W.r, T, C, 1);
@@ -3193,13 +3223,28 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
                 k::experts_down_g(buf.blob, buf.n, buf.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                                   g_s);
 #else
-        if (!rows || (buf.row && S <= k::kGroupRouteSlots)) {
+        if (rows && rows->native_fp4 && blackwell_verify_enabled() &&
+            k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
+            auto batch = k::blackwell_prefill_groups(rtop, rw, S, c.K, c.E, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
+                                                     Ly.tab_sc[2], W.w16, buf.sg, buf.su, buf.wt, buf.inv, g_s);
+            auto* x = reinterpret_cast<k::BlackwellActivation*>(W.ex16);
+            auto* h = reinterpret_cast<k::BlackwellActivation*>(W.gu32);
+            k::blackwell_pack_rows(W.x16, T, C, x, g_s);
+            k::blackwell_expert_product(true, batch, Ly.eb[0], C, c.F, W.x16, x, buf.sg, buf.su,
+                                        c.gate_cap, c.up_cap, W.h16, nullptr, g_s, h);
+            k::blackwell_expert_product(false, batch, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, h,
+                                        nullptr, nullptr, 0, 0, nullptr, W.y32, g_s);
+        } else if (!rows || (buf.row && S <= k::kGroupRouteSlots)) {
             k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], buf.blob, buf.n,
                            buf.tok, buf.row, buf.sg, buf.su, buf.wt, buf.inv, g_s);
             // Each distinct expert needs one pick, and each additional chunk needs eight.
             const int distinct = std::min(c.E, S);
             const int groups = rows ? distinct + (S - distinct) / k::kGroupMax : S;
-            if ((!rows || W.batch_group_mma) && (Ly.ty[0] == k::kQ8_0 || Ly.ty[0] == k::kIQ4_NL) &&
+            if (rows && rows->window && Ly.ty[0] == k::kQ8_0 && Ly.ty[1] == k::kQ8_0 &&
+                Ly.ty[2] == k::kQ8_0 && !rows->native_fp4) {
+                k::experts_q8_verify(buf.blob, buf.n, buf.tok, buf.row, groups, T, Ly.eb[0], Ly.eb[0] + Ly.eb[1],
+                                     W.xq, C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, W.y32, g_s);
+            } else if ((!rows || W.batch_group_mma || rows->native_fp4) && (Ly.ty[0] == k::kQ8_0 || Ly.ty[0] == k::kIQ4_NL) &&
                 Ly.ty[1] == Ly.ty[0] && Ly.ty[2] == Ly.ty[0] && C % 32 == 0 && c.F % 32 == 0) {
                 uint16_t* limbs = (uint16_t*) W.gu32;
                 k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
@@ -3217,21 +3262,21 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
                 k::blackwell_pack_rows(W.h16, S, c.F, packed, g_s);
                 k::blackwell_expert_product(false, batch, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, packed,
                                             nullptr, nullptr, 0, 0, nullptr, W.y32, g_s);
-            } else if (!rows && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
-                const int mask = k::block_nvfp4_mma_mask();
+            } else if ((!rows || (rows->window && !rows->native_fp4)) && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
+                const int mask = rows ? 0 : k::block_nvfp4_mma_mask();
                 if (mask & 1) {
-                    k::experts_gate_up_swiglu_g(buf.blob, buf.n, buf.tok, buf.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0],
+                    k::experts_gate_up_swiglu_g(buf.blob, buf.n, buf.tok, buf.row, groups, Ly.ty[0], Ly.ty[1], Ly.eb[0],
                                                 W.xq, C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s, W.x16);
                 } else {
                     uint16_t* limbs = (uint16_t*) W.gu32;
                     k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
-                    k::experts_block_gu(buf.blob, buf.n, buf.tok, buf.row, S, T, Ly.eb[0], C, c.F, limbs, buf.sg,
+                    k::experts_block_gu(buf.blob, buf.n, buf.tok, buf.row, groups, T, Ly.eb[0], C, c.F, limbs, buf.sg,
                                         buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
                 }
                 if (mask & 2)
-                    k::experts_down_g(buf.blob, buf.n, buf.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+                    k::experts_down_g(buf.blob, buf.n, buf.row, groups, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
                 else
-                    k::experts_block_down(buf.blob, buf.n, buf.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
+                    k::experts_block_down(buf.blob, buf.n, buf.row, groups, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
             } else {
                 k::experts_gate_up_swiglu_g(buf.blob, buf.n, buf.tok, buf.row, groups, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
                                             C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s, rows ? W.x16 : nullptr);
@@ -3247,8 +3292,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
             k::experts_down(buf.blob, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
         }
         k::moe_combine_f32(W.y32, buf.inv, buf.wt, T, c.K, C, W.tmp, false, g_s);
-        if (rows) k::conv_sequences(rows->device_slots, T, W.tmp, C,
-                                    {0, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, W.r, W.h}, g_s);
+        if (rows) sequence_conv(*rows, W.tmp, C,
+                                    {0, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, W.r, W.h}, M.V[vis], 3);
         else k::conv_block(W.tmp, C, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, 0, T, C, W.r, C, W.h, C, Ly.rec_old[3], Ly.rec_x[3],
                       g_s);
         abl(W.h, T, C, 2);
@@ -3263,7 +3308,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
         k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
         if (g_taps)
             CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, TCb, cudaMemcpyDeviceToDevice, g_s));
-        if (rows) sequence_product(M.out_w, W.xq, T, W.logits, c.n_rows);
+        if (rows && !rows->native_fp4) sequence_product(M.out_w, W.xq, T, W.logits, c.n_rows);
         else tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
         if (out_mode == OutMode::kArgmax || rows) {
             // A mixed batch still takes greedy rows' argmax before the sampler's softcap.
@@ -3301,13 +3346,20 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
         g_blk.pos_h[t] = pos0 + t;
     }
     const int attn_bkt = (pos0 + T) < 256 ? 0 : ((pos0 + T) < 1024 ? 1 : 2);
-    if (!g_graph) {
-        fast_block_launches(M, W, T, out_mode, g_blk, nullptr, attn_bkt);
+    SequenceRows rows;
+    if (g_blk.zero_slots) {
+        rows.window = T;
+        rows.slots.assign(T, 0);
+        rows.device_slots = g_blk.zero_slots;
+        for (int t = 0; t < T; ++t) rows.buckets.push_back(decode_bucket(pos0 + t));
+    }
+    if (!g_graph || (g_blk.zero_slots && g_attn_mma == 3)) {
+        fast_block_launches(M, W, T, out_mode, g_blk, g_blk.zero_slots ? &rows : nullptr, attn_bkt);
     } else {
         FastGraph& G = g_bgraph[T][(int) out_mode][attn_bkt];
         if (!G.exec) {
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
-            fast_block_launches(M, W, T, out_mode, g_blk, nullptr, attn_bkt);
+            fast_block_launches(M, W, T, out_mode, g_blk, g_blk.zero_slots ? &rows : nullptr, attn_bkt);
             CU(cudaStreamEndCapture(g_s, &G.graph));
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
         }
@@ -4803,9 +4855,15 @@ int main(int argc, char** argv) {
             die("IK2_SPARSE_DECODE requires single-stream decode without speculation");
     }
     if (batch_width < 1 || batch_width > 32) die("IK2_BATCH must be between 1 and 32");
+    const bool batch_draft = batch_width > 1 && !draft_path.empty();
+    if (batch_draft && batch_width > 8) die("batched --draft supports up to eight slots");
+#ifdef STRATA_USE_HIP
+    if (batch_draft) die("batched --draft requires CUDA");
+#endif
+    const int batch_rows = batch_width * (batch_draft ? kBlockMax : 1);
     if (batch_width > 1) {
-        if (!serve || !serve_maya || !draft_path.empty() || (cache_slots != 1 && cache_slots != batch_width))
-            die("IK2_BATCH requires --serve without a drafter or a separate cache-slot count");
+        if (!serve || !serve_maya || (cache_slots != 1 && cache_slots != batch_width))
+            die("IK2_BATCH requires --serve without a separate cache-slot count");
         cache_slots = batch_width;
     }
     if (chunk < 1 || ctx < 1) die("--chunk and --ctx must be positive");
@@ -5364,7 +5422,7 @@ int main(int argc, char** argv) {
     M.embd = S.data("token_embd.weight");
     M.embd_type = (int) S.info("token_embd.weight")->type;
     if (!k::block_values(M.embd_type)) die("token_embd's type");
-    if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;
+    if (g_stage) { CU(cudaFree(g_stage)); g_stage = nullptr; g_stage_bytes = 0; }
     {
         size_t kv_bytes = 0;
         for (const auto& Vi : M.V) kv_bytes += (size_t) Vi.kv_cap * kv_row_bytes(KD, M.L[Vi.l].sliding) * 2;
@@ -5419,7 +5477,7 @@ int main(int argc, char** argv) {
             } else {
                 *((volatile uint8_t*) mp) = 0;
                 if (cudaHostRegister(mp, probe_bytes, cudaHostRegisterPortable) != cudaSuccess) {
-                    cudaGetLastError();
+                    (void)cudaGetLastError();
                     use_mmap_reg = false;
                 } else {
                     CU(cudaHostUnregister(mp));
@@ -5507,7 +5565,7 @@ int main(int argc, char** argv) {
                     if (cudaHostRegister(pin.blocks[l].ptr, pin.blocks[l].bytes, cudaHostRegisterPortable) == cudaSuccess)
                         pin.blocks[l].registered = true;
                     else
-                        cudaGetLastError(), ++reg_fail;
+                        (void)cudaGetLastError(), ++reg_fail;
                 }
             });
         auto layer_read = [&](int l) {
@@ -5572,7 +5630,7 @@ int main(int argc, char** argv) {
         g_final_tap = c.n_pass == 1 ? 7 : 3;
         const double t0 = now();
         try {
-            drafter = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s);
+            drafter = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s, batch_width);
             draft_mask = ik2::draft::dflash2_mask(drafter);
             if (draft_mask && (g_final_tap != 3 || c.n_vocab != 200058))
                 die("DFlash2 requires the Inkling-2-Mini target");
@@ -5592,9 +5650,9 @@ int main(int argc, char** argv) {
             if (draft_head) CU(cudaFree(draft_head));
             draft_head = nullptr;
         }
-        g_taps_ld = std::max(chunk, ik2::draft::kBlock);
+        g_taps_ld = std::max({chunk, ik2::draft::kBlock, batch_rows});
         g_taps = dalloc<float>((size_t) (g_final_tap + 1) * g_taps_ld * c.C);
-        for (auto& Vi : M.V) {
+        if (batch_width == 1) for (auto& Vi : M.V) {
             const size_t cc[4] = {KD, KD, C, C};
             for (int i = 0; i < 4; ++i) {
                 Vi.rec_old[i] = dalloc<float>(3 * cc[i]);
@@ -5644,7 +5702,7 @@ int main(int argc, char** argv) {
     use_dev(d);
     CU(cudaMemGetInfo(&fr, &tot));
     Work& W = g_dev[d].W;
-    W.Tm = std::max(batch_width, drafter ? std::max(chunk, kBlockMax) : chunk);
+    W.Tm = std::max(batch_rows, drafter ? std::max(chunk, kBlockMax) : chunk);
     W.ctx = ctx;
     W.nk_max = std::min(ctx, ctx);
     // Tokens a layer-major prefill pass (every expert not in VRAM streams in once a pass): 16384 when there is room
@@ -5699,7 +5757,7 @@ int main(int argc, char** argv) {
     W.rlog = work_alloc<float>(T_buf * c.E), W.route_d = work_alloc<int>(S_buf * 2);
     W.ex16 = work_alloc<uint16_t>(T_buf * C),
     W.w16 = work_alloc<uint16_t>((size_t)2 * c.F * C); // (one expert's tokens)
-    W.h16 = work_alloc<uint16_t>(std::max({size_t(64), T_buf, size_t(batch_width * c.K)}) * c.F);
+    W.h16 = work_alloc<uint16_t>(std::max({size_t(64), T_buf, size_t(batch_rows * c.K)}) * c.F);
     W.gu32_bytes = 4 * std::max({Tm * C, // two FP16 limbs per input element
                   S8 * 2 * (size_t) c.F,
                   Tm * std::max<size_t>(2 * HD + 2 * KD + (size_t) c.H * c.d_rel + c.H,
@@ -5708,7 +5766,7 @@ int main(int argc, char** argv) {
     W.gu32 = work_alloc<float>(W.gu32_bytes / 4);
     W.qkv = W.gu32;
     W.lg16 = (uint16_t*) W.gu32;
-    W.y32 = work_alloc<float>(std::max({size_t(64), T_buf, size_t(batch_width * c.K)}) * C);
+    W.y32 = work_alloc<float>(std::max({size_t(64), T_buf, size_t(batch_rows * c.K)}) * C);
     if (g_tp)
         W.tp_h = work_alloc<uint16_t>(std::max<size_t>(64, S_buf) *
                                       c.F); // (one expert's tokens; the token path's <= 64 rows)
@@ -5718,9 +5776,9 @@ int main(int argc, char** argv) {
     size_t token_entries = S8;
 #ifndef STRATA_USE_HIP
     const char* group_moe = getenv("IK2_BATCH_GROUP_MOE");
-    if (batch_width > 1 && group_moe && std::atoi(group_moe)) {
-        W.batch_group_mma = std::atoi(group_moe) == 2;
-        const size_t entries = size_t(std::min(batch_width * c.K, k::kGroupRouteSlots)) * k::kGroupMax;
+    if (batch_draft || (batch_width > 1 && group_moe && std::atoi(group_moe))) {
+        W.batch_group_mma = group_moe && std::atoi(group_moe) == 2;
+        const size_t entries = size_t(std::min(batch_rows * c.K, k::kGroupRouteSlots)) * k::kGroupMax;
         token_entries = std::max(token_entries, entries);
         W.batch_group_row = work_alloc<int>(entries);
     }
@@ -5785,14 +5843,14 @@ int main(int argc, char** argv) {
 #ifdef STRATA_USE_HIP
     if (suffix_window >= 32) W.head_rows = std::min(64, suffix_window / 16 * 16);
 #endif
-    W.head_rows = std::max(W.head_rows, batch_width);
+    W.head_rows = std::max(W.head_rows, batch_rows);
     W.logits = dalloc<float>((size_t) W.head_rows * c.n_rows);
     if (c.n_pass > 1) {
         W.lp_pre = work_alloc<float>(Tm * C);
         W.lp_bank = work_alloc<float>((size_t)(n_core / c.block) * Tm *
                                       C); // (the pass's blocks after its first, its final stream)
         W.lp_msg = work_alloc<float>(4 * Tm * C);
-        W.lp_msg_all = dalloc<float>((size_t) n_core * 4 * C * batch_width);
+        W.lp_msg_all = dalloc<float>((size_t) n_core * 4 * C * batch_rows);
         W.lp_in = work_alloc<float>(3 * Tm * C);
         W.lp_g = work_alloc<float>(3 * Tm * (2 * (size_t)c.rank + 2));
         W.lp_a = work_alloc<float>(3 * Tm * (size_t)c.rank);
@@ -5899,7 +5957,7 @@ int main(int argc, char** argv) {
                     CU(cudaEventCreateWithFlags(&stage_done[1], cudaEventDisableTiming));
                     use_fast_load = true;
                 } else {
-                    cudaGetLastError();
+                    (void)cudaGetLastError();
                     if (stage[0]) cudaFreeHost(stage[0]);
                     stage[0] = stage[1] = nullptr;
                 }
@@ -6076,7 +6134,7 @@ int main(int argc, char** argv) {
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
         if (batch_width > 1) {
-            serve_sequences(M, batch_width, ctx, chunk, image_token, eos_ids);
+            serve_sequences(M, batch_width, ctx, chunk, image_token, eos_ids, drafter, draft_head);
             return 0;
         }
         // --serve: requests on stdin, a line each - "GEN max_new temperature top_p seed stop,stop ids,ids,..." - and

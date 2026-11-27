@@ -80,16 +80,19 @@ struct Drafter {
     uint16_t *hb, *hb2, *rnn_in;
     __half* x16;
     int *pos, *ctx_pos, *toks;
-    int* h_out = nullptr;   // pinned host [kBlock - 1]
-    int* h_meta = nullptr;  // pinned host [2]: {P, anchor}
-    int* d_meta = nullptr;  // device [2]: {P, anchor}
+    int* h_out = nullptr;   // pinned proposal tokens, including anchors in batched mode
+    int* h_meta = nullptr;  // {P, anchor} per active slot, followed by slot IDs
+    int* d_meta = nullptr;  // device copy of h_meta
     struct PropGraph {
         cudaGraph_t graph = nullptr;
         cudaGraphExec_t exec = nullptr;
         const float* anchor_h = nullptr;
         int n_rows = 0, n_vocab = 0;
     };
-    PropGraph pgraph[kBlock][4];
+    struct SlotGraphs { PropGraph width[kBlock][4]; };
+    std::vector<SlotGraphs> graphs;
+    PropGraph batch_graph[kBlock + 1][kBlock + 1];  // [active][verify width]
+    int slot = 0;
 };
 
 namespace {
@@ -114,7 +117,13 @@ __global__ void init_block_kernel(const float* anchor_h, const float* mask, floa
 }
 
 __global__ void init_block_kernel_d(const float* anchor_h, const float* mask, float* res, int* pos, int* toks, int T,
-                                    int C, const int* meta) {
+                                    int C, const int* meta, int window = kBlock) {
+    const int batch = blockIdx.z;
+    anchor_h += batch * C;
+    res += batch * T * C;
+    pos += batch * T;
+    toks += batch * window;
+    meta += 2 * batch;
     const int t = blockIdx.y;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (t == 0 && blockIdx.x == 0) {
@@ -176,6 +185,20 @@ uint16_t* up16(Drafter* d, const std::vector<uint16_t>& v) {
     d->vram += v.size() * 2;
     return p;
 }
+uint16_t* projection(Drafter* d, const std::vector<uint16_t>& values, int k) {
+    auto* weights = up16(d, values);
+#ifndef STRATA_USE_HIP
+    if (d->flash) {
+        auto* packed = dalloc<uint16_t>(values.size());
+        const int n = values.size() / k;
+        df2::pack_projection<<<dim3(n / 16, (k + 63) / 64), 128, 0, d->s>>>(
+            weights, k, reinterpret_cast<uint4*>(packed));
+        cu(cudaFree(weights), "pack draft projection");
+        return packed;
+    }
+#endif
+    return weights;
+}
 float* up32(Drafter* d, const std::vector<uint16_t>& v) {
     std::vector<float> f(v.size());
     for (size_t i = 0; i < v.size(); ++i) f[i] = bf(v[i]);
@@ -187,6 +210,9 @@ float* up32(Drafter* d, const std::vector<uint16_t>& v) {
 
 // Y [T][N] (ldy) = X [T][K] BF16 . W [N][K]^T BF16, F32 sums
 void gemm_bf(Drafter* d, const uint16_t* W, int N, int K, const uint16_t* X, int T, float* Y, int ldy) {
+#ifndef STRATA_USE_HIP
+    if (d->flash) return df2::project_rows(W, X, N, K, T, Y, ldy, d->s);
+#endif
 #ifdef STRATA_USE_HIP
     static const bool bf16_mv = !getenv("IK2_DRAFT_BF16_MV") || atoi(getenv("IK2_DRAFT_BF16_MV"));
     if (bf16_mv && T >= 1 && T <= 8 && K % 128 == 0 && ((uintptr_t)W & 7) == 0 && ((uintptr_t)X & 7) == 0) {
@@ -200,6 +226,9 @@ void gemm_bf(Drafter* d, const uint16_t* W, int N, int K, const uint16_t* X, int
        "gemm_bf");
 }
 void gemm_h(Drafter* d, const uint16_t* W, int N, int K, const void* X, int T, float* Y, int ldy) {
+#ifndef STRATA_USE_HIP
+    if (d->flash) return df2::project_rows<true>(W, static_cast<const uint16_t*>(X), N, K, T, Y, ldy, d->s);
+#endif
     const float one = 1.0f, zero = 0.0f;
     cb(cublasGemmEx(d->blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, K, &one, W, CUDA_R_16F, K, X, CUDA_R_16F, K, &zero, Y,
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
@@ -255,9 +284,10 @@ const std::vector<int>& tap_layers() {
     return v;
 }
 
-Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s) {
+Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s, int slots) {
     const StFile f = st_open(path);
     auto* d = new Drafter;
+    d->graphs.resize(slots);
     d->C = C, d->ctx = ctx, d->blas = blas, d->s = s;
     {
         // (IK2_DRAFT_CTX: the positions the layer without a window sees, the last ones; default the whole context)
@@ -309,14 +339,14 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
         l.q_norm = up32(d, st_bf16(f, b + "self_attn.q_norm.weight", {128}));
         l.k_norm = up32(d, st_bf16(f, b + "self_attn.k_norm.weight", {128}));
         if (!d->flash) l.k_norm_ctx = up32(d, st_bf16(f, b + "self_attn.k_norm_ctx.weight", {128}));
-        l.wq = up16(d, st_bf16(f, b + "self_attn.q_proj.weight", {H * 128, C}));
-        l.wk = up16(d, st_bf16(f, b + "self_attn.k_proj.weight", {KV * 128, C}));
-        l.wv = up16(d, st_bf16(f, b + "self_attn.v_proj.weight", {KV * 128, C}));
-        l.wo = up16(d, st_bf16(f, b + "self_attn.o_proj.weight", {C, H * 128}));
+        l.wq = projection(d, st_bf16(f, b + "self_attn.q_proj.weight", {H * 128, C}), C);
+        l.wk = projection(d, st_bf16(f, b + "self_attn.k_proj.weight", {KV * 128, C}), C);
+        l.wv = projection(d, st_bf16(f, b + "self_attn.v_proj.weight", {KV * 128, C}), C);
+        l.wo = projection(d, st_bf16(f, b + "self_attn.o_proj.weight", {C, H * 128}), H * 128);
         if (d->flash) {
             auto load_conv = [&](const std::string& name) {
                 return DLayer::Conv{
-                    up16(d, st_bf16(f, b + name + ".kernel_projection.weight", {df2::dyn_width, C})),
+                    projection(d, st_bf16(f, b + name + ".kernel_projection.weight", {df2::dyn_width, C}), C),
                     up16(d, st_bf16(f, b + name + ".base_kernel", {2, 2, C}))};
             };
             l.attention_conv = load_conv("attention_conv");
@@ -329,36 +359,36 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
             auto g = st_bf16(f, b + "mlp.gate_proj.weight", {F, C});
             const auto u = st_bf16(f, b + "mlp.up_proj.weight", {F, C});
             g.insert(g.end(), u.begin(), u.end());   // gate's rows, then up's
-            l.wgu = up16(d, g);
+            l.wgu = projection(d, g, C);
         }
-        l.wd = up16(d, st_bf16(f, b + "mlp.down_proj.weight", {C, F}));
+        l.wd = projection(d, st_bf16(f, b + "mlp.down_proj.weight", {C, F}), F);
         if (l.local) {   // (a window of 1024: a ring of 2048 rows, F32)
             l.cap = std::min(ctx, 2048);
-            l.kc = dalloc<float>((size_t) l.cap * KV * 128);
-            l.vc = dalloc<float>((size_t) l.cap * KV * 128);
-            d->vram += (size_t) l.cap * KV * 128 * 8;
+            l.kc = dalloc<float>((size_t) slots * l.cap * KV * 128);
+            l.vc = dalloc<float>((size_t) slots * l.cap * KV * 128);
+            d->vram += (size_t) slots * l.cap * KV * 128 * 8;
         } else {         // (the whole context, or IK2_DRAFT_CTX's last positions: FP16)
             l.cap = d->cap;
-            l.kc16 = dalloc<uint16_t>((size_t) l.cap * KV * 128);
-            l.vc16 = dalloc<uint16_t>((size_t) l.cap * KV * 128);
-            d->vram += (size_t) l.cap * KV * 128 * 4;
+            l.kc16 = dalloc<uint16_t>((size_t) slots * l.cap * KV * 128);
+            l.vc16 = dalloc<uint16_t>((size_t) slots * l.cap * KV * 128);
+            d->vram += (size_t) slots * l.cap * KV * 128 * 4;
         }
     }
     d->norm = up32(d, st_bf16(f, "norm.weight", {C}));
     if (d->flash) {
         auto& flash = *d->flash;
-        flash.fc = up16(d, st_bf16(f, "fc.weight", {C, 4 * C}));
+        flash.fc = projection(d, st_bf16(f, "fc.weight", {C, 4 * C}), 4 * C);
         flash.hidden_norm = up32(d, st_bf16(f, "hidden_norm.weight", {C}));
-        flash.selector = up16(d, st_bf16(f, "candidate_selector.hidden_projection.weight", {R, C}));
+        flash.selector = projection(d, st_bf16(f, "candidate_selector.hidden_projection.weight", {R, C}), C);
         flash.pred = up16(d, st_bf16(f, "candidate_selector.predecessor_codebook", {df2::codebook_rows, R}));
         flash.succ = up16(d, st_bf16(f, "candidate_selector.successor_codebook", {df2::codebook_rows, R}));
         flash.packed = dalloc<uint16_t>(kMixRows * 4 * C);
-        flash.dynamic = dalloc<float>(kBlock * df2::dyn_width);
-        flash.parts = dalloc<int>((kBlock - 1) * df2::parts * df2::top);
-        flash.ids = dalloc<int>((kBlock - 1) * df2::top);
+        flash.dynamic = dalloc<float>(slots * kBlock * df2::dyn_width);
+        flash.parts = dalloc<int>(slots * (kBlock - 1) * df2::parts * df2::top);
+        flash.ids = dalloc<int>(slots * (kBlock - 1) * df2::top);
         d->mask = dalloc<float>(C);
-        d->proj = dalloc<float>((kBlock - 1) * R);
-        d->base = dalloc<float>((kBlock - 1) * df2::vocab);
+        d->proj = dalloc<float>(slots * (kBlock - 1) * R);
+        d->base = dalloc<float>(slots * (kBlock - 1) * df2::vocab);
     } else {
         d->mask = up32(d, st_bf16(f, "mask_embed", {C}));
         d->mk_dflare = up32(d, st_bf16(f, "markov_head.dflare_norm.weight", {C}));
@@ -369,7 +399,7 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
         d->hout_b = st_bf16(f, "markov_head.hidden_out.bias", {C});
     }
     // work buffers
-    const size_t T = kBlock;
+    const size_t T = kBlock * (d->flash ? slots : 1);
     d->x = dalloc<float>(T * C), d->res = dalloc<float>(T * C), d->h = dalloc<float>(T * C);
     d->q = dalloc<float>(T * H * 128), d->o = dalloc<float>(T * H * 128);
     d->kk = dalloc<float>((d->flash ? T : kMixRows) * KV * 128), d->vv = dalloc<float>(T * KV * 128);
@@ -378,16 +408,16 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     d->hb2 = dalloc<uint16_t>(T * F);
     // (online-softmax draft_attn's: only the chunks' outputs [64][H][8][128] and (max, sum))
     if (!d->flash) d->ctx_tmp = dalloc<float>((size_t) 2 * kMixRows * KV * 128);
-    d->scratch = dalloc<float>((size_t) (d->flash ? 8 : 64) * H * 8 * 130);
+    d->scratch = dalloc<float>((size_t) (d->flash ? slots * 8 : 64) * H * 8 * 130);
     d->mix = dalloc<float>((size_t) kMixRows * C);
     if (!d->flash) {
-        d->f_rnn = dalloc<float>(C);
+        d->f_rnn = dalloc<float>((size_t)slots * C);
         d->state = dalloc<float>(R), d->latent = dalloc<float>(R), d->proj = dalloc<float>(3 * R);
         d->rnn_in = dalloc<uint16_t>(2 * R + 2 * C);
     }
-    d->x16 = dalloc<__half>((kBlock - 1) * (size_t) C);
-    d->pos = dalloc<int>(T), d->ctx_pos = dalloc<int>(kMixRows), d->toks = dalloc<int>(kBlock);
-    cu(cudaHostAlloc(&d->h_out, (kBlock - 1) * sizeof(int), cudaHostAllocDefault), "h_out");
+    d->x16 = dalloc<__half>(T * C);
+    d->pos = dalloc<int>(T), d->ctx_pos = dalloc<int>(kMixRows), d->toks = dalloc<int>(T);
+    cu(cudaHostAlloc(&d->h_out, T * sizeof(int), cudaHostAllocDefault), "h_out");
 #ifndef STRATA_USE_HIP
     // Captured cuBLAS GEMMs share one workspace across all widths and depth buckets on d->s.
     if (!getenv("IK2_DRAFT_GRAPH") || atoi(getenv("IK2_DRAFT_GRAPH"))) {
@@ -398,9 +428,26 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
         d->vram += workspace_bytes;
     }
 #endif
-    d->d_meta = dalloc<int>(2);
-    cu(cudaHostAlloc(&d->h_meta, 2 * sizeof(int), cudaHostAllocDefault), "h_meta");
+    d->d_meta = dalloc<int>(3 * slots);
+    cu(cudaHostAlloc(&d->h_meta, 3 * slots * sizeof(int), cudaHostAllocDefault), "h_meta");
     return d;
+}
+
+void select_slot(Drafter* d, int slot) {
+    const ptrdiff_t delta = slot - d->slot;
+    if (!delta) return;
+    for (auto& l : d->L) {
+        const ptrdiff_t offset = delta * l.cap * d->KV * 128;
+        if (l.kc16) {
+            l.kc16 += offset;
+            l.vc16 += offset;
+        } else {
+            l.kc += offset;
+            l.vc += offset;
+        }
+    }
+    if (!d->flash) d->f_rnn += delta * d->C;
+    d->slot = slot;
 }
 
 float* dflash2_mask(Drafter* d) { return d->flash ? d->mask : nullptr; }
@@ -449,7 +496,7 @@ void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) {
         k::to_f16(dfb, (size_t) m, d->fold_b + r0, d->s);
     }
     cu(cudaStreamSynchronize(d->s), "fold");
-    cudaFree(dht), cudaFree(dhb), cudaFree(dlm), cudaFree(dfw), cudaFree(dfb);
+    for (auto* p : {dht, dhb, dlm, dfw, dfb}) cu(cudaFree(p), "fold cleanup");
     d->vram += ((size_t) R + 1) * n_rows * 2 + (size_t) (kBlock - 1) * n_rows * 4;
 }
 
@@ -479,6 +526,41 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
             }
             a += n;
         }
+    }
+}
+
+void commit_windows(Drafter* d, const float* taps, int ld, const std::vector<ContextWindow>& windows) {
+    if (windows.empty()) return;
+    if (windows.size() == 1 || !d->flash) {
+        for (const auto& w : windows) {
+            select_slot(d, w.slot);
+            write_context(d, taps, ld, w.first, w.count, w.position);
+            set_f_rnn(d, taps, ld, w.first + w.count - 1);
+        }
+        return;
+    }
+
+    select_slot(d, 0);
+    df2::ContextRows rows{};
+    int n = 0;
+    for (const auto& w : windows) {
+        for (int j = 0; j < w.count; ++j, ++n) {
+            rows.tap[n] = w.first + j;
+            rows.position[n] = w.position + j;
+            rows.slot[n] = w.slot;
+        }
+    }
+    auto& f = *d->flash;
+    df2::gather_context<<<dim3(d->C / 256, n, 4), 256, 0, d->s>>>(taps, ld, rows, f.packed, d->ctx_pos);
+    gemm_bf(d, f.fc, d->C, 4 * d->C, f.packed, n, d->mix, d->C);
+    df2::norm<<<n, 256, 0, d->s>>>(d->mix, nullptr, f.hidden_norm, d->C, d->mix);
+    k::to_bf16(d->mix, n * d->C, d->hb, d->s);
+    const int kd = d->KV * df2::head_dim;
+    for (auto& l : d->L) {
+        gemm_bf(d, l.wk, kd, d->C, d->hb, n, d->kk, kd);
+        gemm_bf(d, l.wv, kd, d->C, d->hb, n, d->vv, kd);
+        df2::prepare_keys(d, d->kk, l.k_norm, n, d->KV, d->ctx_pos);
+        df2::scatter_context<<<dim3(kd / 256, n), 256, 0, d->s>>>(d->kk, d->vv, rows, l.cap, kd, l.kc, l.vc);
     }
 }
 
@@ -551,7 +633,7 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
         static constexpr int kSplits[4] = {2, 8, 16, 64};
         d->h_meta[0] = P;
         d->h_meta[1] = anchor;
-        auto& G = d->pgraph[proposals][bkt];
+        auto& G = d->graphs[d->slot].width[proposals][bkt];
         if (G.exec && (G.anchor_h != anchor_h || G.n_rows != n_rows || G.n_vocab != n_vocab)) {
             cu(cudaGraphExecDestroy(G.exec), "pgraph destroy exec");
             cu(cudaGraphDestroy(G.graph), "pgraph destroy");
@@ -588,6 +670,51 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     }
     cu(cudaStreamSynchronize(d->s), "propose");
     std::memcpy(out, d->h_out, proposals * sizeof(int));
+}
+
+void propose_batch(Drafter* d, int active, const int* slots, const int* positions, const float* embeddings,
+                   const uint16_t* lm_f16, int n_rows, int n_vocab, int window, int* tokens) {
+    if (!d->flash || active == 1) {
+        for (int i = 0; i < active; ++i) {
+            select_slot(d, slots[i]);
+            int* block = tokens + i * window;
+            propose(d, block[0], embeddings + i * d->C, positions[i], lm_f16, n_rows, n_vocab, block + 1, window - 1);
+        }
+        return;
+    }
+    select_slot(d, 0);
+    for (int i = 0; i < active; ++i) {
+        d->h_meta[2*i] = positions[i];
+        d->h_meta[2*i+1] = tokens[i * window];
+        d->h_meta[2*active+i] = slots[i];
+    }
+    const size_t bytes = active * window * sizeof(int);
+    auto launch = [&] {
+        cu(cudaMemcpyAsync(d->d_meta, d->h_meta, 3 * active * sizeof(int), cudaMemcpyHostToDevice, d->s), "batch metadata");
+        init_block_kernel_d<<<dim3((d->C + 255) / 256, kBlock, active), 256, 0, d->s>>>(
+            embeddings, d->mask, d->res, d->pos, d->toks, kBlock, d->C, d->d_meta, window);
+        df2::block(d, window - 1, active, d->d_meta + 2*active);
+        cu(cudaMemcpyAsync(d->h_out, d->toks, bytes, cudaMemcpyDeviceToHost, d->s), "batch tokens");
+    };
+    static const bool use_graph = !getenv("IK2_DRAFT_GRAPH") || atoi(getenv("IK2_DRAFT_GRAPH"));
+    if (use_graph) {
+        auto& g = d->batch_graph[active][window];
+        if (g.exec && g.anchor_h != embeddings) {
+            cu(cudaGraphExecDestroy(g.exec), "batch graph destroy exec");
+            cu(cudaGraphDestroy(g.graph), "batch graph destroy");
+            g = {};
+        }
+        if (!g.exec) {
+            cu(cudaStreamBeginCapture(d->s, cudaStreamCaptureModeGlobal), "batch graph begin");
+            launch();
+            cu(cudaStreamEndCapture(d->s, &g.graph), "batch graph end");
+            cu(cudaGraphInstantiate(&g.exec, g.graph, 0), "batch graph instantiate");
+            g.anchor_h = embeddings;
+        }
+        cu(cudaGraphLaunch(g.exec, d->s), "batch graph launch");
+    } else launch();
+    cu(cudaStreamSynchronize(d->s), "propose_batch");
+    std::memcpy(tokens, d->h_out, bytes);
 }
 
 std::vector<CacheSpan> cache_spans(const Drafter* d) {
