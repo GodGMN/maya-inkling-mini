@@ -139,7 +139,7 @@ Streaming reserves another 2 GiB. On one GPU, `--vram-gb N` simulates a device b
 limited by both actual free memory and the simulated budget after device allocations. Pinned host experts
 are outside the simulated budget.
 
-In cache mode, the engine saves a binary profile for each canonical model path under
+The engine saves a binary profile for each canonical model path under
 `$XDG_CACHE_HOME/tintero` (default `~/.cache/tintero` on Unix, `%LOCALAPPDATA%/tintero` on Windows).
 On the next launch, each pool loads its most frequently selected experts with an initial eviction frequency
 of at most two. Counts accumulate across launches and halve together when a counter would overflow.
@@ -153,7 +153,7 @@ Engine flags: `--max-context N` (262144), `--cache-gb N` (optional expert-cache 
 | `IK2_FUSED_ROUTER` | `0` | HIP only. Fuse FP16 router projection, biased sigmoid top-8 selection and weight normalization for 128 experts and 16–64 batched rows. Single-token decode keeps the wider `mv_f16` + `route_token` path. |
 | `IK2_KV` | `f16` | `fp8`: the KV cache in FP8 E4M3, half the bytes (the full layers' 32 KB a token -> 16 KB); against the reference it changed 5 of 48 top-1 tokens where FP16 changed none (docs/INKLING2.md 6.1). On CUDA (SM 80 and newer) and HIP (RDNA 3/3.5, including gfx1100 and gfx1151), `fp4-global` stores global keys and values in E2M1 blocks and keeps sliding layers in E4M3. Each 128-channel global head uses 72 bytes for K and 72 for V, including scales. On HIP, `fp4` also packs the sliding-window ring in E2M1. Both modes require 128-wide heads and dense attention. HIP accepts `IK2_PAGED_KV=1` for 16-token global pages. |
 | `IK2_WARM` | model profile | Read expert counts from this file at startup. An empty value starts cold. |
-| `IK2_POP_OUT` | model profile in cache mode | Save the updated counts here on clean shutdown. An empty value disables saving. Setting a path explicitly also collects counts when the model fits in VRAM. |
+| `IK2_POP_OUT` | model profile | Save the updated counts here on clean shutdown. An empty value disables saving. The resident decoder normally counts on the GPU. An explicit output path selects the existing host profiling path. |
 | `IK2_EP` | off | `1` with `--gpus 2`: expert parallel - each layer's experts dealt to both GPUs by how often they are picked, each GPU its own cache and link; attention and the KV cache on GPU 0. Decode 22 -> 42 tok/s on two RTX PRO 6000s. Off, `--gpus 2` splits the layers |
 | `IK2_EP_SPLIT` | `0.55` | GPU 1's share of the picks under `IK2_EP` (GPU 0 also holds the dense weights and the cache of the KV) |
 | `IK2_TP` | off | `1` with `--gpus 2`: the experts tensor parallel instead (each GPU half of every expert): decode 42.8 vs EP's 41.3 tok/s, prompts slower |

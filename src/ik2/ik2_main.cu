@@ -319,16 +319,31 @@ bool g_mv = true;   // IK2_MV=0: a few tokens' experts through the FP16 GEMMs to
 std::vector<uint64_t> g_pop;
 int g_pop_E = 0;
 std::filesystem::path g_profile_out;
+// Resident graphs accumulate session deltas without a host read at each visit.
+unsigned long long* g_pop_device = nullptr;
+unsigned long long* device_counts(int layer) {
+    return g_pop_device ? g_pop_device + size_t(layer) * g_pop_E : nullptr;
+}
+bool host_profile() { return !g_pop.empty() && !g_pop_device; }
+void add_picks(size_t index, uint64_t picks) {
+    auto& count = g_pop[index];
+    while (picks > UINT64_MAX - count) {
+        picks -= UINT64_MAX - count;
+        count = UINT64_MAX;
+        for (auto& value : g_pop) value >>= 1;
+    }
+    count += picks;
+}
 void pop_count(int l, const int* top, int S) {
     if (g_pop.empty()) return;
-    for (int i = 0; i < S; ++i) {
-        auto& count = g_pop[(size_t) l * g_pop_E + top[i]];
-        if (count == UINT64_MAX)
-            for (auto& value : g_pop) value >>= 1;
-        ++count;
-    }
+    for (int i = 0; i < S; ++i) add_picks(size_t(l) * g_pop_E + top[i], 1);
 }
 void pop_dump() {
+    if (g_pop_device) {
+        std::vector<unsigned long long> delta(g_pop.size());
+        CU(cudaMemcpy(delta.data(), g_pop_device, delta.size() * sizeof(delta[0]), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < delta.size(); ++i) add_picks(i, delta[i]);
+    }
     ik2::usage::write(g_profile_out, g_pop_E, g_pop);
 }
 int g_pop_E_ep = 0;
@@ -2711,7 +2726,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
         k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
         k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
-                       fast_gate ? W.gu32 : nullptr, q8_gate || iq4_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr);
+                       fast_gate ? W.gu32 : nullptr, q8_gate || iq4_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr, device_counts(l));
 
 #ifdef IK2_HOST_AVX2
         if ((tier_active || host_plan.forced) && !host_plan.active.empty() && host_plan.active[l]) {
@@ -3214,6 +3229,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
             k::mv_f16_rows(Ly.router16, c.E, C, W.xq, C, T, W.rlog, c.E, g_s);
             k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
         }
+        if (g_pop_device) k::count_routes(rtop, S, device_counts(l), g_s);
 #ifdef STRATA_USE_HIP
         if (!rows && buf.n && buf.row && S <= 64) {
             k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], buf.blob, buf.n,
@@ -3652,7 +3668,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     const int C = c.C;
     // A one-token prompt chunk uses prompt ablation, even just after a masked decode row.
     const bool prompt_ablation = !generation && !g_abl_r.empty() && (!g_abl_decode || g_abl_tokens >= 0);
-    if (g_fast && !prompt_ablation && T == 1 && dump.empty() && !g_prof && !g_rec && !g_trace && g_pop.empty() && g_img.at(pos0) < 0) {
+    if (g_fast && !prompt_ablation && T == 1 && dump.empty() && !g_prof && !g_rec && !g_trace && !host_profile() && g_img.at(pos0) < 0) {
         fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out, generation);
         return;
     }
@@ -3800,7 +3816,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
-        if (dump.empty() && !g_trace && g_pop.empty() && resident_expert_prefill(c, Ly, T, W, t_exp)) {
+        if (dump.empty() && !g_trace && !host_profile() && resident_expert_prefill(c, Ly, T, W, t_exp)) {
+            if (g_pop_device) k::count_routes(rtop, S, device_counts(l), g_s);
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
             abl(W.h, T, C, 2);
@@ -6101,12 +6118,16 @@ int main(int argc, char** argv) {
     }
     std::fflush(stdout);
     }
-    if ((!g_fast || output) && !g_profile_out.empty()) {
+    if (!g_profile_out.empty()) {
         g_pop = std::move(counts);
         if (g_pop.empty()) g_pop.resize(size_t(c.n_layer) * c.E);
+        if (g_fast && !output) {
+            g_pop_device = dalloc<unsigned long long>(g_pop.size());
+            CU(cudaMemset(g_pop_device, 0, g_pop.size() * sizeof(*g_pop_device)));
+        }
     }
     if (g_sparse_decode) {
-        if (!g_fast || g_prof || g_rec || g_trace || !g_pop.empty() || !dump.empty())
+        if (!g_fast || g_prof || g_rec || g_trace || host_profile() || !dump.empty())
             die("IK2_SPARSE_DECODE requires the resident decoder without tracing, profiling or dumps");
         std::fprintf(stderr, "sparse decode enabled: 224 x 64 global keys from position 32768; dense prefill\n");
     }
@@ -6179,6 +6200,7 @@ int main(int argc, char** argv) {
         }
         if (batch_width > 1) {
             serve_sequences(M, batch_width, ctx, chunk, image_token, eos_ids, drafter, draft_head);
+            pop_dump();
             return 0;
         }
         // --serve: requests on stdin, a line each - "GEN max_new temperature top_p seed stop,stop ids,ids,..." - and
