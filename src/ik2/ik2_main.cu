@@ -245,10 +245,11 @@ struct Layer {
     bool paged_kv = false;
     bool fp4_kv = false;
     k::Fp8KvLayout fp8_layout() const {
-        if (fp4_kv) return k::Fp8KvLayout::global_fp4();
 #ifdef STRATA_USE_HIP
-        if (paged_kv) return k::Fp8KvLayout::global_pages();
+        if (paged_kv) return k::Fp8KvLayout::global_pages(fp4_kv);
+        if (fp4_kv && sliding) return k::Fp8KvLayout::fp4_ring(kv_cap);
 #endif
+        if (fp4_kv) return k::Fp8KvLayout::global_fp4();
         return sliding ? kv_cap : 0;
     }
     float *h_k, *h_v, *h_attn, *h_mlp;             // conv histories [3][C']
@@ -459,14 +460,23 @@ bool g_dense_q8 = false;
 // The KV cache in FP16 (IK2_KV=fp8: E4M3, half the bytes).  Against ref/inkling2.py over 48 tokens FP16 kept every
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
-enum class KVPrecision { f16, fp8, fp8_global, fp4_global };
+#ifdef STRATA_USE_HIP
+bool fused_router(int experts, int picks, int rows) {
+    static const bool enabled = getenv("IK2_FUSED_ROUTER") && atoi(getenv("IK2_FUSED_ROUTER"));
+    return enabled && experts == 128 && picks == 8 && rows <= 64;
+}
+#endif
+enum class KVPrecision { f16, fp8, fp8_global, fp4_global, fp4 };
 KVPrecision g_kv_precision = KVPrecision::f16;
+bool packed_cache(bool sliding) {
+    return g_kv_precision == KVPrecision::fp4 || (!sliding && g_kv_precision == KVPrecision::fp4_global);
+}
 bool byte_cache(bool sliding) {
-    return g_kv_precision == KVPrecision::fp8 || g_kv_precision == KVPrecision::fp4_global ||
+    return g_kv_precision == KVPrecision::fp4 || g_kv_precision == KVPrecision::fp4_global || g_kv_precision == KVPrecision::fp8 ||
            (!sliding && g_kv_precision == KVPrecision::fp8_global);
 }
 size_t kv_row_bytes(size_t elements, bool sliding) {
-    if (!sliding && g_kv_precision == KVPrecision::fp4_global)
+    if (packed_cache(sliding))
         return elements / 32 * sizeof(k::Fp4KvBlock);
     return elements * (byte_cache(sliding) ? 1 : sizeof(uint16_t));
 }
@@ -474,6 +484,7 @@ const char* kv_format_name() {
     switch (g_kv_precision) {
         case KVPrecision::f16: return "f16";
         case KVPrecision::fp8: return "fp8";
+        case KVPrecision::fp4: return "fp4";
         case KVPrecision::fp4_global: return "fp4-global";
         case KVPrecision::fp8_global: return "fp8-global";
     }
@@ -2677,7 +2688,6 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
                 k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
             }
         }
-        k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + c.K);
         static const int limb = getenv("IK2_EXPERT_LIMB") ? atoi(getenv("IK2_EXPERT_LIMB")) : 0;
@@ -2693,9 +2703,19 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
         static const bool exp_mma = !getenv("IK2_EXPERT_MMA") || atoi(getenv("IK2_EXPERT_MMA"));
 #endif
         const bool exp_tc = exp_mma && !fast_gate && !fast_down && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
-        k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
-                       Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
-                       fast_gate ? W.gu32 : nullptr, q8_gate || iq4_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr);
+#ifdef STRATA_USE_HIP
+        if (fused_router(c.E, c.K, 1) && !fast_gate && !exp_tc) {
+            k::rdna3_project_route(Ly.router16, W.xq, C, 1, Ly.probs_b, c.route_scale, rtop, rw, g_s);
+            k::route_gather(rtop, rw, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2],
+                            c.K, c.K, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s);
+        } else
+#endif
+        {
+            k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
+            k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
+                           Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
+                           fast_gate ? W.gu32 : nullptr, q8_gate || iq4_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr);
+        }
 
 #ifdef IK2_HOST_AVX2
         if ((tier_active || host_plan.forced) && !host_plan.active.empty() && host_plan.active[l]) {
@@ -3187,10 +3207,17 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
                 k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, T, C, 1e-6f, c.eps, outs, g_s);
             }
         }
-        k::mv_f16_rows(Ly.router16, c.E, C, W.xq, C, T, W.rlog, c.E, g_s);
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
-        k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+#ifdef STRATA_USE_HIP
+        if (fused_router(c.E, c.K, T)) {
+            k::rdna3_project_route(Ly.router16, W.xq, C, T, Ly.probs_b, c.route_scale, rtop, rw, g_s);
+        } else
+#endif
+        {
+            k::mv_f16_rows(Ly.router16, c.E, C, W.xq, C, T, W.rlog, c.E, g_s);
+            k::route_rows(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+        }
 #ifdef STRATA_USE_HIP
         if (!rows && buf.n && buf.row && S <= 64) {
             k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], buf.blob, buf.n,
@@ -3607,14 +3634,13 @@ bool resident_expert_prefill(const Config& c, const Layer& ly, int T, Work& w, d
     const bool fused = fuse_swiglu && tiles.rows == 64;
     // The down projection overwrites the gate/up workspace after SwiGLU has consumed it.
     auto* hidden = reinterpret_cast<uint16_t*>(w.lg);
-    auto* input = fused ? reinterpret_cast<uint16_t*>(w.gu32) : hidden;
     k::rdna3_expert_groups(w.route_d, (const float*)(w.route_d + S), S, c.K, c.E, ly.tab_sc[0], ly.tab_sc[1],
                            ly.tab_sc[2], tiles, w.gidx, w.inv, w.sg, w.su, w.wtr, g_s);
-    gather_f16_16_kernel<<<S, 256, 0, g_s>>>(w.x16, w.gidx, S, C, input);
     if (fused) {
-        k::rdna3_expert_swiglu(ly.ty[0], ly.tab_blob, tiles, input, C, F, w.sg, w.su, c.gate_cap, c.up_cap, hidden, g_s);
+        k::rdna3_expert_swiglu(ly.ty[0], ly.tab_blob, tiles, w.x16, C, F, w.sg, w.su, c.gate_cap, c.up_cap, hidden, w.gidx, g_s);
     } else {
-        k::rdna3_expert_gemm(ly.ty[0], ly.tab_blob, 0, tiles, input, C, 2 * F, w.gu32, g_s);
+        gather_f16_16_kernel<<<S, 256, 0, g_s>>>(w.x16, w.gidx, S, C, hidden);
+        k::rdna3_expert_gemm(ly.ty[0], ly.tab_blob, 0, tiles, hidden, C, 2 * F, w.gu32, g_s);
         k::swiglu_cap_f32(w.gu32, S, F, w.sg, w.su, c.gate_cap, c.up_cap, hidden, g_s);
     }
     k::rdna3_expert_gemm(ly.ty[2], ly.tab_blob, ly.eb[0] + ly.eb[1], tiles, hidden, F, C, w.gu32, g_s);
@@ -4809,9 +4835,11 @@ int main(int argc, char** argv) {
     }
     if (serve && !draft_path.empty() && getenv("IK2_BLOCK") && !atoi(getenv("IK2_BLOCK")))
         die("--serve with --draft requires block verification");
-    if (n_gpu != 1) die("HIP supports one gfx1100 device");
+    if (n_gpu != 1) die("HIP supports one RDNA 3 or 3.5 device");
     g_flash = getenv("IK2_FLASH") && std::atoi(getenv("IK2_FLASH"));
-    std::fprintf(stderr, "ik2 HIP gfx1100: %s prefill attention\n", g_flash ? "RDNA3 WMMA" : "hipBLAS");
+    cudaDeviceProp hip_props{};
+    CU(cudaGetDeviceProperties(&hip_props, 0));
+    std::fprintf(stderr, "ik2 HIP %s: %s prefill attention\n", hip_props.gcnArchName, g_flash ? "RDNA3 WMMA" : "hipBLAS");
 #else
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
 #endif
@@ -4827,8 +4855,15 @@ int main(int argc, char** argv) {
         if (kv == "f16" || kv == "fp16") g_kv_precision = KVPrecision::f16;
         else if (kv == "fp8" || kv == "e4m3") g_kv_precision = KVPrecision::fp8;
         else if (kv == "fp8-global") g_kv_precision = KVPrecision::fp8_global;
+        else if (kv == "fp4") {
+#ifdef STRATA_USE_HIP
+            g_kv_precision = KVPrecision::fp4;
+#else
+            die("IK2_KV=fp4 requires HIP; use fp4-global for CUDA");
+#endif
+        }
         else if (kv == "fp4-global") g_kv_precision = KVPrecision::fp4_global;
-        else die("unknown IK2_KV=" + kv + " (expected f16, fp8, fp8-global or fp4-global)");
+        else die("unknown IK2_KV=" + kv + " (expected f16, fp8, fp8-global, fp4 or fp4-global)");
     }
     if (getenv("IK2_TRACE") && *getenv("IK2_TRACE")) {
         g_trace = std::fopen(getenv("IK2_TRACE"), "wb");
@@ -5363,12 +5398,12 @@ int main(int argc, char** argv) {
     const bool paged_kv = getenv("IK2_PAGED_KV") && atoi(getenv("IK2_PAGED_KV"));
     if (g_sparse_decode && (paged_kv || g_kv_precision != KVPrecision::fp8 || c.D != 128 || g_attn_mma != 3))
         die("IK2_SPARSE_DECODE requires token-major IK2_KV=fp8 and IK2_ATTN_MMA=3 with 128-wide heads");
-    if (g_kv_precision == KVPrecision::fp4_global && (paged_kv || c.D != 128))
-        die("fp4-global requires token-major KV and 128-wide heads");
+    if (packed_cache(false) && c.D != 128)
+        die("FP4 KV requires 128-wide heads");
 #ifdef STRATA_USE_HIP
-    if (paged_kv && (!byte_cache(false) || c.D != 128)) die("IK2_PAGED_KV requires global E4M3 KV with 128-wide heads");
+    if (paged_kv && (!byte_cache(false) || c.D != 128)) die("IK2_PAGED_KV requires quantized global KV with 128-wide heads");
 #else
-    if (paged_kv) die("IK2_PAGED_KV requires the gfx1100 backend");
+    if (paged_kv) die("IK2_PAGED_KV requires the HIP backend");
 #endif
     M.V.resize(c.n_visit);
     for (int v = 0; v < c.n_visit; ++v) {
@@ -5377,7 +5412,7 @@ int main(int argc, char** argv) {
         else if (v < c.core0 + c.n_pass * n_core) Vi.l = c.core0 + (v - c.core0) % n_core, Vi.pass = (v - c.core0) / n_core;
         else Vi.l = v - (c.n_pass - 1) * n_core;
         Layer& Ly = M.L[Vi.l];
-        Ly.fp4_kv = !Ly.sliding && g_kv_precision == KVPrecision::fp4_global;
+        Ly.fp4_kv = packed_cache(Ly.sliding);
         Ly.paged_kv = paged_kv && !Ly.sliding;
         use_dev(Ly.dev);
         Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
@@ -6143,7 +6178,6 @@ int main(int argc, char** argv) {
             std::vector<float*> h;   // [layer * 4 + conv]
             std::vector<std::vector<uint8_t>> kv_k, kv_v;
         };
-        const size_t kv_elem_b = byte_cache(true) ? 1 : 2;
         struct Conversation {
             std::vector<int> hist;
             std::vector<uint64_t> hist_sig;
@@ -6179,7 +6213,7 @@ int main(int argc, char** argv) {
         auto snap_copy = [&](Snap& sn, bool save) {
             const size_t cc[4] = {KD, KD, C, C};
             const cudaMemcpyKind kv_dir = save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
-            const size_t row_b = (size_t) KD * kv_elem_b;
+            const size_t row_b = kv_row_bytes(KD, true);
             for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
                 Layer& Ly = bind_visit(M, (int) l);
                 use_dev(Ly.dev);

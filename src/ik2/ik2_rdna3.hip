@@ -125,12 +125,25 @@ __global__ void nv_token_wmma(const uint8_t* const* experts, size_t offset, cons
     const uint8_t* w = experts[slot] + expert_byte_offset<kNVFP4>((size_t)row * K) + (Gate ? 0 : offset);
     const uint16_t* x = input + (Gate ? (lane & 1) * K : (size_t)slot * K);
     Float8 first = {}, second = {};
+    // Pipeline the next weight fragments as in CIRU hip_moe_decode.hip
+    // (Copyright 2026 Ciru, Apache-2.0). The last iteration has no lookahead load.
+    Half16 gate{}, up{};
+    if (split * 16 < K) {
+        gate = expert_fragment<kNVFP4>(w, split * 16);
+        if constexpr (Gate) up = expert_fragment<kNVFP4>(w + offset, split * 16);
+    }
     for (int k = split * 16; k < K; k += splits * 16) {
+        const Half16 g = gate, u = up;
+        const int next = k + splits * 16;
+        if (next < K) {
+            gate = expert_fragment<kNVFP4>(w, next);
+            if constexpr (Gate) up = expert_fragment<kNVFP4>(w + offset, next);
+        }
         Half16 a;
         __builtin_memcpy(&a, x + k, sizeof(a));
-        first = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, expert_fragment<kNVFP4>(w, k), first);
+        first = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, g, first);
         if constexpr (Gate)
-            second = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, expert_fragment<kNVFP4>(w + offset, k), second);
+            second = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, u, second);
     }
     if constexpr (Gate) {
         const float g = first[0] + __shfl_xor(first[0], 16);
@@ -241,6 +254,7 @@ struct ExpertActivation {
     const float *gate_scale, *up_scale;
     float gate_cap, up_cap;
     uint16_t* hidden;
+    const int* tokens;
 };
 
 template <int Type, int Depth, bool Activate = false>
@@ -261,6 +275,17 @@ __global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts,
     }
     const int col0 = blockIdx.x * (Activate ? 32 : 64);
     const int m0 = (wave / 2) * 32, n0 = (wave % 2) * 32;
+    // CIRU hip_moe_prefill.hip (Copyright 2026 Ciru, Apache-2.0) resolves sorted
+    // token rows before the K loop. Load the gate/up input directly from its source token.
+    constexpr int loads = 64 * vectors / 128;
+    int token_rows[Activate ? loads : 1];
+    if constexpr (Activate) {
+#pragma unroll
+        for (int load = 0; load < loads; ++load) {
+            const int row = row0 + (tid + load * 128) / vectors;
+            token_rows[load] = row < T ? activation.tokens[row] : 0;
+        }
+    }
     Float8 accum[2][2] = {};
     for (int k0 = 0; k0 < K; k0 += Depth) {
 #pragma unroll
@@ -268,7 +293,10 @@ __global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts,
             const int f = tid + load * 128, row = f / vectors, vec = f % vectors;
             const int k = k0 + vec * 8;
             uint4 av = {};
-            if (row0 + row < T) __builtin_memcpy(&av, input + (size_t)(row0 + row) * K + k, sizeof(av));
+            if (row0 + row < T) {
+                const int token = Activate ? token_rows[load] : row0 + row;
+                __builtin_memcpy(&av, input + (size_t)token * K + k, sizeof(av));
+            }
             a[row][vec] = av;
             if constexpr (Type == kDenseF16) {
                 uint4 bv = {};
@@ -1146,9 +1174,9 @@ void rdna3_expert_gemm(int type, const uint8_t* const* experts, size_t offset, E
 }
 void rdna3_expert_swiglu(int type, const uint8_t* const* experts, ExpertTiles tiles, const uint16_t* input,
                          int K, int F, const float* sg, const float* su, float gate_cap, float up_cap,
-                         uint16_t* hidden, cudaStream_t stream) {
+                         uint16_t* hidden, const int* tokens, cudaStream_t stream) {
     const dim3 grid((F + 31) / 32, tiles.capacity);
-    const ExpertActivation act{sg, su, gate_cap, up_cap, hidden};
+    const ExpertActivation act{sg, su, gate_cap, up_cap, hidden, tokens};
     if (type == kIQ4_NL)
         launch_tiled<kIQ4_NL, true>(grid, nullptr, experts, 0, tiles.data, input, F, K, 0, nullptr, 0, stream, nullptr, nullptr, act);
     else if (type == kNVFP4)

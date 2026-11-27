@@ -524,6 +524,31 @@ void test_route(int E) {
     release({dl, db, dw, dt});
 }
 
+#ifdef STRATA_USE_HIP
+void test_project_route() {
+    constexpr int E = 128, K = 8, C = 256;
+    auto wf = fvec(E*C);
+    for (float& value : wf) value = std::round(value * 8) / 8;
+    std::vector<uint16_t> wh(wf.size());
+    for (size_t i = 0; i < wf.size(); ++i) wh[i] = f2h_host(wf[i]);
+    auto x = fvec(64*C);
+    for (float& value : x) value = std::round(value * 8) / 8;
+    std::fill_n(x.begin(), C, 0.f); // all logits and biases tie for the first token
+    auto* w = dev(wh);
+    auto *dx = dev(x), *bias = dev(std::vector<float>(E)), *logs = dev_n<float>(64*E);
+    auto *a = dev_n<int>(64*K), *b = dev_n<int>(64*K);
+    auto *aw = dev_n<float>(64*K), *bw = dev_n<float>(64*K);
+    for (int rows : {1, 8, 32, 64}) {
+        for (int i = 0; i < rows; ++i) k::mv_f16(w, E, C, dx+i*C, logs+i*E, 0);
+        k::route_rows(logs, bias, rows, E, K, 1.f, a, aw, 0);
+        k::rdna3_project_route(w, dx, C, rows, bias, 1.f, b, bw, 0);
+        expect_true("fused router picks and weights", host(a,rows*K) == host(b,rows*K) &&
+                    host(aw,rows*K) == host(bw,rows*K));
+    }
+    release({w,dx,bias,logs,a,b,aw,bw});
+}
+#endif
+
 void test_moe_pieces() {
     const int n = 37, F = 2304, C = 4608, T = 11, K = 8;
     // swiglu_cap over FP16 gate | up rows
@@ -1636,7 +1661,7 @@ float e4m3fn_to_f32_host(uint8_t q);
 // first token, a context shorter than a step, splits with and without keys; the FP8 cache with every finite byte
 // (the subnormals among them).
 #ifdef STRATA_USE_HIP
-constexpr int attention_formats[] = {0, 1, 2, 3}; // Half, E4M3 rows, E4M3 pages, block-scaled E2M1 rows.
+constexpr int attention_formats[] = {0, 1, 2, 3, 4}; // Half, E4M3 rows/pages, E2M1 rows/pages.
 #else
 constexpr int attention_formats[] = {0, 1, 3};
 #endif
@@ -1644,7 +1669,8 @@ constexpr int attention_formats[] = {0, 1, 3};
 k::Fp8KvLayout test_fp8_layout(int format, int ring) {
     if (format == 3) return k::Fp8KvLayout::global_fp4();
 #ifdef STRATA_USE_HIP
-    if (format == 2) return k::Fp8KvLayout::global_pages();
+    if (format == 5) return k::Fp8KvLayout::fp4_ring(ring);
+    if (format == 2 || format == 4) return k::Fp8KvLayout::global_pages(format == 4);
 #endif
     return ring;
 }
@@ -1683,6 +1709,18 @@ std::vector<uint8_t> page_cache(const std::vector<uint8_t>& linear, int heads, b
         for (int h = 0; h < heads; ++h)
             for (int d = 0; d < 128; ++d)
                 pages[page_offset(t, h, d, heads, value)] = linear[((size_t)t * heads + h) * 128 + d];
+    return pages;
+}
+
+// Independent serialization of [page][head][token][four E2M1 blocks].
+std::vector<uint8_t> page_fp4(const std::vector<uint8_t>& rows, int heads) {
+    constexpr size_t bytes = 4 * sizeof(k::Fp4KvBlock);
+    const size_t tokens = rows.size() / (heads * bytes);
+    std::vector<uint8_t> pages(((tokens + 15) / 16) * 16 * heads * bytes, 0xff);
+    for (size_t t = 0; t < tokens; ++t)
+        for (int h = 0; h < heads; ++h)
+            std::copy_n(rows.data() + (t * heads + h) * bytes, bytes,
+                        pages.data() + ((t / 16 * heads + h) * 16 + t % 16) * bytes);
     return pages;
 }
 
@@ -1941,14 +1979,14 @@ void test_deep_attention() {
         std::memset(packed_k[block].pairs, 0x77, sizeof(packed_k[block].pairs));
         packed_v[block] = packed_k[block];
     }
-    const char* prefill_names[] = {"393K linear causal prefill", "393K paged causal prefill", "393K FP4 causal prefill"};
-    const char* decode_names[] = {"393K linear decode", "393K paged decode", "393K FP4 decode"};
+    const char* prefill_names[] = {"393K linear causal prefill", "393K paged causal prefill", "393K FP4 causal prefill", "393K paged FP4 prefill"};
+    const char* decode_names[] = {"393K linear decode", "393K paged decode", "393K FP4 decode", "393K paged FP4 decode"};
     for (int format : attention_formats) {
         if (!format) continue;
         const auto layout = test_fp8_layout(format, 0);
-        auto* dk = format == 3 ? reinterpret_cast<uint8_t*>(dev(packed_k)) :
+        auto* dk = format >= 3 ? reinterpret_cast<uint8_t*>(dev(packed_k)) :
                    dev(format == 2 ? page_cache(keys, 1, false) : keys);
-        auto* dv = format == 3 ? reinterpret_cast<uint8_t*>(dev(packed_v)) :
+        auto* dv = format >= 3 ? reinterpret_cast<uint8_t*>(dev(packed_v)) :
                    dev(format == 2 ? page_cache(values, 1, true) : values);
         k::attn_flash_fp8(dq, H * D, dk, dv, layout, H, 1, D, T, n - T, 1.f, 1.f, zero, 1, n,
                           zero, out, H * D, scratch, scratch_n, 16, nullptr);
@@ -2008,7 +2046,10 @@ void test_attn_decode_mma() {
                     }
                 }
             }
-            if (fp8 == 3) { fp4_fixture(k8, kf); fp4_fixture(v8, vf); }
+            if (fp8 >= 3) {
+                fp4_fixture(k8, kf); fp4_fixture(v8, vf);
+                if (fp8 == 4) { k8 = page_fp4(k8, KV); v8 = page_fp4(v8, KV); }
+            }
             auto qf = fvec((size_t) H * D, fp8 ? 2.0f : 4.0f);
             std::vector<uint16_t> q16(qf.size());
             for (size_t i = 0; i < qf.size(); ++i) q16[i] = f2h_host(qf[i]);
@@ -2085,7 +2126,7 @@ void test_attn_decode_mma() {
                 }
             }
             char label[96];
-            std::snprintf(label, sizeof label, "mma %s %s", fp8 == 3 ? "block fp4" : fp8 == 2 ? "paged fp8" : fp8 ? "fp8" : "f16", c.name);
+            std::snprintf(label, sizeof label, "mma %s %s", fp8 == 4 ? "paged fp4" : fp8 == 3 ? "block fp4" : fp8 == 2 ? "paged fp8" : fp8 ? "fp8" : "f16", c.name);
             // (P is FP16 in the P V product: 2^-11 of a term)
             expect("split attention and gate", host(gated, want.size()), want, 1e-3, 1e-5);
             if (fp8 >= 2) {
@@ -2118,7 +2159,7 @@ void test_attn_flash() {
         bool block = false;
         bool fp4_only = false;
     };
-    const Case cases[] = {
+    std::vector<Case> cases = {
         {65, 113, 71, 9, 0, 1, "fp4 sliding mask across query tiles", false, true},
         {2, 8191, 1 << 30, 11, 0, 3, "fp4 8193 keys, final single-key tile", false, true},
         {130, 0, 1 << 30, 64, 0, 1, "attn_flash from 0"},
@@ -2134,9 +2175,17 @@ void test_attn_flash() {
         {8, 127, 64, 35, 80, 3, "verify attention ring, three column tiles", true},
 #endif
     };
-    for (int fp8 : attention_formats) for (const Case& c : cases) {
-        if (c.fp4_only && fp8 != 3) continue;
-        if (fp8 >= 2 && c.kv_cap) continue;
+#ifdef STRATA_USE_HIP
+    for (int t = 4; t <= 7; ++t)
+        cases.push_back({t, 31, 23, 9, 0, 3, "FP4 verify across page boundary", true, true});
+#endif
+    std::vector<int> formats(std::begin(attention_formats), std::end(attention_formats));
+#ifdef STRATA_USE_HIP
+    formats.push_back(5);
+#endif
+    for (int fp8 : formats) for (const Case& c : cases) {
+        if (c.fp4_only && fp8 < 3) continue;
+        if (fp8 == 5 ? !c.kv_cap : (fp8 >= 2 && c.kv_cap)) continue;
         const int n_pos = c.qpos0 + c.Tq;   // positions written so far
         const int rows = c.kv_cap > 0 ? c.kv_cap : n_pos;
         std::vector<uint8_t> k8((size_t) rows * KV * D), v8(k8.size());
@@ -2156,7 +2205,10 @@ void test_attn_flash() {
                 }
             }
         }
-        if (fp8 == 3) { fp4_fixture(k8, kc); fp4_fixture(v8, vc); }
+        if (fp8 >= 3) {
+            fp4_fixture(k8, kc); fp4_fixture(v8, vc);
+            if (fp8 == 4) { k8 = page_fp4(k8, KV); v8 = page_fp4(v8, KV); }
+        }
         const int q_ld = H * D + (c.block ? 0 : 64);
         auto qf = fvec((size_t) c.Tq * q_ld, 4.0f);
         std::vector<uint16_t> q16(qf.size());
@@ -2249,7 +2301,7 @@ void test_attn_flash() {
             }
         }
         char name[96];
-        std::snprintf(name, sizeof name, "%s %s", c.name, fp8 == 3 ? "block fp4" : fp8 == 2 ? "paged fp8" : fp8 ? "fp8" : "f16");
+        std::snprintf(name, sizeof name, "%s %s", c.name, fp8 == 5 ? "ring fp4" : fp8 == 4 ? "paged fp4" : fp8 == 3 ? "block fp4" : fp8 == 2 ? "paged fp8" : fp8 ? "fp8" : "f16");
         expect(name, got, want, 1e-2, 2e-3);
         release({dq});
         for (float* p : {db, ds, dout, dscr}) release({p});
@@ -2598,13 +2650,14 @@ float time_attention_graph(Launch launch, cudaStream_t stream) {
     return ms * 1000 / runs;
 }
 
-void test_sequence_attention(int depth, int rows_per_slot, bool time_graphs, bool ring = false) {
+void test_sequence_attention(int depth, int rows_per_slot, bool time_graphs, bool ring = false, bool paged = false, bool fp4_ring = false) {
     constexpr int H = 24, KV = 8, D = 128, dr = 16, extent = 1024;
     const int window = ring ? 64 : 1 << 30;
     constexpr int KD = KV * D, HD = H * D, ld = 2 * HD + H * dr, slots = 3;
-    const int T = 2 * rows_per_slot, cap = ring ? 80 : depth + rows_per_slot + 8, splits = depth < 1024 ? 16 : 32;
-    const size_t stride = ring ? (size_t)cap * KD : (size_t)cap * KD / 32 * sizeof(k::Fp4KvBlock);
-    const auto layout = ring ? k::Fp8KvLayout(cap) : k::Fp8KvLayout::global_fp4();
+    const int used = depth + rows_per_slot + 8;
+    const int T = 2 * rows_per_slot, cap = ring ? 80 : paged ? (used + 15) / 16 * 16 : used, splits = depth < 1024 ? 16 : 32;
+    const size_t stride = ring && !fp4_ring ? (size_t)cap * KD : (size_t)cap * KD / 32 * sizeof(k::Fp4KvBlock);
+    const auto layout = test_fp8_layout(fp4_ring ? 5 : ring ? 1 : paged ? 4 : 3, ring ? cap : 0);
     std::vector<int> slot_ids, positions;
     for (int t = 0; t < T; ++t) {
         slot_ids.push_back(t < rows_per_slot ? 2 : 0);
@@ -2614,7 +2667,7 @@ void test_sequence_attention(int depth, int rows_per_slot, bool time_graphs, boo
     auto* dp = dev(positions);
     std::vector<float> decoded((size_t)slots * cap * KD);
     std::vector<uint8_t> packed_k, packed_v;
-    if (ring) {
+    if (ring && !fp4_ring) {
         packed_k.assign(slots * stride, 0x30);
         packed_v.assign(slots * stride, 0x38);
     } else {
@@ -2704,9 +2757,14 @@ void test_sequence_attention(int depth, int rows_per_slot, bool time_graphs, boo
     CU(cudaFree(dp));
 }
 
-void test_fp4_kv_write() {
-    constexpr int D = 128, T = 3, KV = 2, P = 17, KD = D * KV;
-    const auto layout = k::Fp8KvLayout::global_fp4();
+static_assert(k::kv_page_head(1048575, 63, 64) * (4 * sizeof(k::Fp4KvBlock)) ==
+              1048576ull * 64 * 72 - 72, "FP4 page byte offsets must exceed 32 bits");
+
+void test_fp4_kv_write(bool paged = false) {
+    constexpr int D = 128, T = 3, KV = 2, KD = D * KV;
+    const int P = paged ? 262143 : 17;
+    const int capacity = paged ? ((P + T + 15) / 16) * 16 : P + T;
+    const auto layout = test_fp8_layout(paged ? 4 : 3, 0);
     auto key = fvec(T * KD, 9.f), value = fvec(T * KD, 7.f);
     std::fill_n(key.begin(), 32, 0.f);
     std::fill_n(value.begin()+KD, 32, 0.f);
@@ -2716,8 +2774,8 @@ void test_fp4_kv_write() {
     std::copy_n(midpoints, 8, key.begin() + D);
     auto* dk = dev(key); auto* dv = dev(value);
     auto* q = dev(fvec(T * D)); auto* r = dev(fvec(T * 16));
-    auto* kc = dev_n<uint8_t>((P + T) * KD / 32 * 18);
-    auto* vc = dev_n<uint8_t>((P + T) * KD / 32 * 18);
+    auto* kc = dev_n<uint8_t>(size_t(capacity) * KD / 32 * sizeof(k::Fp4KvBlock));
+    auto* vc = dev_n<uint8_t>(size_t(capacity) * KD / 32 * sizeof(k::Fp4KvBlock));
     k::prep_qkv_r_fp8(q, nullptr, dk, kc, dv, vc, r, nullptr, T, 1, KV, D, 16,
                       22.f, 8.f, 1e-6f, nullptr, 0.f, 1.f, P, layout, 16.f, 32.f, nullptr);
     auto* uk = dev_n<uint16_t>(T * KD); auto* uv = dev_n<uint16_t>(T * KD);
@@ -2725,9 +2783,12 @@ void test_fp4_kv_write() {
     for (bool keys : {true, false}) {
         const auto& input = keys ? key : value;
         auto actual = host(keys ? uk : uv, T * KD);
-        auto packed = host(reinterpret_cast<k::Fp4KvBlock*>(keys ? kc : vc) + P * KD / 32, T * KD / 32);
+        auto* blocks = reinterpret_cast<k::Fp4KvBlock*>(keys ? kc : vc);
         int mismatch = 0;
         for (int h=0; h<T*KV; ++h) {
+            const size_t token = P + h / KV, head = h % KV;
+            const size_t index = paged ? ((token / 16 * KV + head) * 16 + token % 16) : token * KV + head;
+            const auto packed = host(blocks + index * (D / 32), D / 32);
             double ss=0;
             for (int d=0; d<D; ++d) ss += (double)input[h*D+d] * input[h*D+d];
             double norm = keys ? std::min(1.,22./(std::sqrt(ss)+1e-6)) : 1./std::sqrt(ss/D+1e-6);
@@ -2737,7 +2798,7 @@ void test_fp4_kv_write() {
                 double peak=0;
                 for (int d=0; d<32; ++d) peak=std::max(peak,std::abs(src[d]*norm));
                 double block_scale=h2f_host(f2h_host(peak*external/6.))/external;
-                const auto& block = packed[(h * D + g) / 32];
+                const auto& block = packed[g / 32];
                 mismatch += block.scale != f2h_host(peak * external / 6.);
                 for (int d=0; d<32; ++d) {
                     const double target=std::abs(src[d]*norm);
@@ -2795,7 +2856,7 @@ void test_fp8_kv() {
         const float qk_clip = 22.627416610717773f, rel_clip = 8.0f, eps = 1e-6f, alpha = 0.1f, n_floor = 128000.0f;
         const float k_scale = 16.0f, v_scale = 32.0f, k_inv = 1.0f / k_scale, v_inv = 1.0f / v_scale;
         for (int full : attention_formats) {
-            if (full == 3) continue;
+            if (full >= 3) continue;
             const int cap = full ? 0 : kv_cap, pos0 = full ? 109 : 1054;
             const int kc_rows = full == 2 ? ((pos0 + T + 15) / 16) * 16 : cap > 0 ? cap : pos0 + T;
             auto q = fvec((size_t) T * H * D, 4.0f), qc = fvec((size_t) H * D, 2.0f),
@@ -3628,7 +3689,16 @@ void test_rdna3_expert_gemm(int type, int K, const char* name) {
     auto* fused = dev_n<uint16_t>(T * N);
     k::rdna3_expert_gemm(type, db, 0, tiles, dx, K, 2 * N, tmp, 0);
     k::swiglu_cap_f32(tmp, T, N, dsg, dsu, 12.f, 19.f, split, 0);
-    k::rdna3_expert_swiglu(type, db, tiles, dx, K, N, dsg, dsu, 12.f, 19.f, fused, 0);
+    auto unsorted = x;
+    std::vector<int> token_map(T);
+    for (int t = 0; t < T; ++t) {
+        token_map[t] = T - 1 - t;
+        std::copy_n(x.data() + t*K, K, unsorted.data() + token_map[t]*K);
+    }
+    auto* tokens = dev(token_map);
+    auto* input = dev(unsorted);
+    k::rdna3_expert_swiglu(type, db, tiles, input, K, N, dsg, dsu, 12.f, 19.f, fused, tokens, 0);
+    release({tokens, input});
     auto result = host(fused, T * N);
     expect_true("WMMA fused expert SwiGLU matches separate projections and activation", result == host(split, T * N));
     std::vector<float> floats(result.size());
@@ -4471,7 +4541,10 @@ int main(int argc, char** argv) {
     if (argc == 2 && !std::strcmp(argv[1], "--fp4-batch")) {
         for (int depth : {256, 2048})
             for (int rows_per_slot : {1, 4}) test_sequence_attention(depth, rows_per_slot, true);
+        test_sequence_attention(257, 8, false, false, true);
         test_fp4_kv_write();
+        test_fp4_kv_write(true);
+        test_attn_flash();
         test_attn_decode_mma();
         test_attn_multi();
         return g_fail ? 1 : 0;
@@ -4514,7 +4587,9 @@ int main(int argc, char** argv) {
     test_attn_probs();
     test_route(384);
 #ifdef STRATA_USE_HIP
+    test_fp4_kv_write(true);
     test_route(128);
+    test_project_route();
 #endif
     test_moe_pieces();
     test_decode();
@@ -4558,6 +4633,10 @@ int main(int argc, char** argv) {
 #ifdef STRATA_USE_HIP
     test_experts_mma(2304, 1152, 1);
     test_rdna3_speculative_kernels();
+#endif
+#ifdef STRATA_USE_HIP
+    test_sequence_attention(257, 8, false, false, true);
+    test_sequence_attention(238, 8, false, true, false, true);
 #endif
     test_sequence_attention(256, 1, false);
     test_sequence_attention(256, 4, false);

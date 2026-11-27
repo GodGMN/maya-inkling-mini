@@ -5,7 +5,7 @@
 // experts' GEMMs of the prompt path take FP16 rows (an NVFP4 weight is exact in FP16).  docs/INKLING2.md has the model.
 //
 // Layouts: rows of tokens; a token's heads back to back ([T][H][D]); the K / V caches by position, [ctx][Hkv][D] F32.
-// CUDA sm_80+ and the scalar HIP port for gfx1100 (docs/HIP-PORT.md).
+// CUDA sm_80+ and the Wave32 HIP port for RDNA 3 and 3.5 (docs/HIP-PORT.md).
 #pragma once
 #include <algorithm>
 
@@ -16,19 +16,25 @@
 namespace ik2::k {
 
 // A positive capacity wraps token-major rows. Global E4M3 pages hold sixteen tokens per KV head.
-// Packed global E2M1 uses token-major rows of Fp4KvBlock.
+// Paged E2M1 keeps each token/head contiguous in both K and V to preserve its block scales.
 struct Fp8KvLayout {
     constexpr Fp8KvLayout(int ring_capacity) : ring_capacity(ring_capacity), paged(false), fp4(false) {}
     const int ring_capacity;
     const bool paged;
     const bool fp4;
 #ifdef STRATA_USE_HIP
-    static constexpr Fp8KvLayout global_pages() { return Fp8KvLayout(true, false); }
+    static constexpr Fp8KvLayout fp4_ring(int capacity) { return Fp8KvLayout(false, true, capacity); }
+    static constexpr Fp8KvLayout global_pages(bool fp4 = false) { return Fp8KvLayout(true, fp4); }
 #endif
     static constexpr Fp8KvLayout global_fp4() { return Fp8KvLayout(false, true); }
 private:
-    constexpr Fp8KvLayout(bool pages, bool packed) : ring_capacity(0), paged(pages), fp4(packed) {}
+    constexpr Fp8KvLayout(bool pages, bool packed, int capacity = 0) : ring_capacity(capacity), paged(pages), fp4(packed) {}
 };
+
+// Head index within [page][head][16 tokens], before scaling to bytes or elements.
+__host__ __device__ constexpr size_t kv_page_head(int token, int head, int heads) {
+    return (size_t(token / 16) * heads + head) * 16 + token % 16;
+}
 
 // E2M1 cache block. The FP16 scale applies to 32 consecutive channels within a KV head.
 struct Fp4KvBlock {
@@ -500,7 +506,7 @@ void rdna3_expert_gemm(int type, const uint8_t* const* experts, size_t offset, E
 /// Tile gate and up projections together, apply per-row scales and write the capped FP16 activation.
 void rdna3_expert_swiglu(int type, const uint8_t* const* experts, ExpertTiles tiles, const uint16_t* input,
                          int K, int F, const float* sg, const float* su, float gate_cap, float up_cap,
-                         uint16_t* hidden, cudaStream_t stream);
+                         uint16_t* hidden, const int* tokens, cudaStream_t stream);
 /// Native RDNA3 single-token NVFP4 experts (no LDS staging, direct v_perm_b32 decode).
 void rdna3_nvfp4_token_gu(const uint8_t* const* blob, const int* tok, int S, size_t eb0, const float* x, int C, int F,
                           const float* sg, const float* su, float gcap, float ucap, uint16_t* h, cudaStream_t s);
@@ -590,6 +596,11 @@ void prep_qkv_r_f16_block(float* q, int q_ld, const float* q_clip, const float* 
                           float n_floor, int kv_cap, uint16_t* q16, cudaStream_t s, const uint16_t* sink_w,
                           const float* sink_x, int sink_k, float* sink_y);
 /// route() for a window, a block a token (the same picks and weights to the bit).
+#ifdef STRATA_USE_HIP
+// Fused projection and routing for 128 experts, 8 picks and contiguous FP32 token rows.
+void rdna3_project_route(const uint16_t* weights, const float* x, int width, int rows, const float* bias,
+                         float scale, int* top, float* picks, cudaStream_t stream);
+#endif
 void route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
                 cudaStream_t s);
 #ifndef STRATA_USE_HIP

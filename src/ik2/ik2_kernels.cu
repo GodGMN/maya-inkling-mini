@@ -343,7 +343,7 @@ __device__ __forceinline__ void l2clip_fp8_warp(const float* src, uint8_t* dst8,
 }
 
 __device__ __forceinline__ size_t kv_page_base(int token, int head, int heads) {
-    return ((size_t)(token / 16) * heads + head) * 16 * 128;
+    return kv_page_head(token & ~15, head, heads) * 128;
 }
 
 __device__ __forceinline__ void rms_fp8_warp(const float* src, uint8_t* dst8, int D, float eps, float v_scale, bool paged = false) {
@@ -474,7 +474,8 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
         const float* kp = k_in + ((size_t) t * KVh + kv) * D;
         if constexpr (sizeof(KV) == 1) {
             if (fp4) {
-                store_fp4_head(kp, kc, (size_t)slot * KVh + kv, true, qk_clip, eps, k_scale);
+                const size_t head = paged ? kv_page_head(slot, kv, KVh) : (size_t)slot * KVh + kv;
+                store_fp4_head(kp, kc, head, true, qk_clip, eps, k_scale);
                 return;
             }
         }
@@ -486,7 +487,8 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
         const float* vp = v_in + ((size_t) t * KVh + kv) * D;
         if constexpr (sizeof(KV) == 1) {
             if (fp4) {
-                store_fp4_head(vp, vc, (size_t)slot * KVh + kv, false, qk_clip, eps, v_scale);
+                const size_t head = paged ? kv_page_head(slot, kv, KVh) : (size_t)slot * KVh + kv;
+                store_fp4_head(vp, vc, head, false, qk_clip, eps, v_scale);
                 return;
             }
         }
@@ -1888,12 +1890,12 @@ struct RouteGather {
 
 // Four waves select their best eight experts. A final wave finds the eighth of those 32.
 template <bool Gather>
-__global__ void rdna3_route_eight(const float* logits, const float* bias, float scale, int* top, float* weights,
-                                 RouteGather tables) {
-    constexpr int E = 128, K = 8;
+__device__ __forceinline__ void rdna3_select_eight(float logit, const float* bias, float scale,
+                                                    int* top, float* weights, RouteGather tables) {
+    constexpr int K = 8;
     const int e = threadIdx.x, lane = e & 31, wave = e >> 5;
     const int token = blockIdx.x;
-    const float sig = 1.f / (1.f + expf(-logits[(size_t)token * E + e]));
+    const float sig = 1.f / (1.f + expf(-logit));
     const uint64_t key = route_key(sig + bias[e], e);
     const uint64_t local = route_sort_wave(key, lane);
     __shared__ uint64_t finalists[32], cutoff;
@@ -1930,6 +1932,29 @@ __global__ void rdna3_route_eight(const float* logits, const float* bias, float 
         tables.su[pos] = tables.up_scale ? tables.up_scale[e] : 1.f;
         tables.wt[pos] = weight * (tables.down_scale ? tables.down_scale[e] : 1.f);
     }
+}
+template <bool Gather>
+__global__ void rdna3_route_eight(const float* logits, const float* bias, float scale, int* top, float* weights,
+                                  RouteGather tables) {
+    rdna3_select_eight<Gather>(logits[blockIdx.x * 128 + threadIdx.x], bias, scale, top, weights, tables);
+}
+
+// Wave32 router projection adapted from CIRU hip_glue_decode.hip (Copyright 2026 Ciru, Apache-2.0).
+// Keep one token's logits in LDS so the workgroup can also select and normalize the eight experts.
+__global__ void rdna3_project_route_kernel(const uint16_t* weights, const float* x, int width, const float* bias,
+                                           float scale, int* top, float* picks) {
+    __shared__ float logits[128];
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    x += size_t(blockIdx.x) * width;
+    for (int expert = wave; expert < 128; expert += 4) {
+        const uint16_t* w = weights + size_t(expert) * width;
+        float acc = 0.f;
+        for (int i = lane; i < width; i += 32) acc = fmaf(h2f(w[i]), x[i], acc);
+        const float sum = wsum(acc);
+        if (!lane) logits[expert] = sum;
+    }
+    __syncthreads();
+    rdna3_select_eight<false>(logits[threadIdx.x], bias, scale, top, picks, {});
 }
 bool rdna3_route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
                       cudaStream_t stream) {
@@ -4090,8 +4115,12 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
             if constexpr (sizeof(KV) == 1) {
                 if (fp4) {
                     const size_t i = head_off + lane * 4;
-                    return make_float4(fp4_read(cache, i), fp4_read(cache, i+1),
-                                       fp4_read(cache, i+2), fp4_read(cache, i+3));
+                    const auto& block = reinterpret_cast<const Fp4KvBlock*>(cache)[i / 32];
+                    const float scale = h2f(block.scale);
+                    const unsigned lo = block.pairs[(i % 32) / 2];
+                    const unsigned hi = block.pairs[(i % 32) / 2 + 1];
+                    return make_float4(fp4_value(lo & 15) * scale, fp4_value(lo >> 4) * scale,
+                                       fp4_value(hi & 15) * scale, fp4_value(hi >> 4) * scale);
                 }
             }
             return v_load4(cache + head_off, lane);
@@ -4120,7 +4149,7 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
         if (l > -INFINITY) {
             float4 v4;
             if constexpr (sizeof(KV) == 1) {
-                if (paged) {
+                if (paged && !fp4) {
                     const KV* v = vc + page + slot % 16 + lane * 4 * 16;
                     v4 = make_float4(e4m3fn_to_f32(v[0]), e4m3fn_to_f32(v[16]), e4m3fn_to_f32(v[32]), e4m3fn_to_f32(v[48]));
                 } else v4 = load(vc);
@@ -4191,14 +4220,14 @@ __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, 
 #ifdef STRATA_USE_HIP
 __global__ void sequence_fp4_split(const float* q, const float* r, int ld, const uint8_t* kc, const uint8_t* vc,
                                    size_t stride, const int* slots, const int* pos, int H, int Hkv, float scale,
-                                   const float* proj, int dr, int extent, int window, float* part) {
+                                   const float* proj, int dr, int extent, int window, float* part, bool paged, int ring) {
     const int t = blockIdx.z, last = pos[t];
     const int first = max(0, last + 1 - window);
     const size_t cache = (size_t)slots[t] * stride;
     // Each row can see keys only through its own position, including packed verify rows sharing a slot.
-    attn_split_row(q + (size_t)t * ld, r + (size_t)t * ld, kc + cache, vc + cache, 0, H, Hkv, first,
+    attn_split_row(q + (size_t)t * ld, r + (size_t)t * ld, kc + cache, vc + cache, ring, H, Hkv, first,
                    last + 1 - first, last, scale, proj, dr, extent, window, part + (size_t)t * H * gridDim.y * 130,
-                   false, true);
+                   paged, true);
 }
 #endif
 
@@ -4373,8 +4402,8 @@ __global__ void unpack_kv_fp8_to_f16_kernel(const uint8_t* kc, const uint8_t* vc
         const size_t page = paged ? kv_page_base(slot, d / 128, KD / 128) : 0;
         const size_t k = paged ? page + (slot % 16) * 128 + d % 128 : src;
         const size_t v = paged ? page + (d % 128) * 16 + slot % 16 : src;
-        if (k_out16) k_out16[idx] = fp4 ? f2h(fp4_read(kc, src) * k_inv_scale) : unpack_scaled_byte(kc[k], k_inv_scale);
-        if (v_out16) v_out16[idx] = fp4 ? f2h(fp4_read(vc, src) * v_inv_scale) : unpack_scaled_byte(vc[v], v_inv_scale);
+        if (k_out16) k_out16[idx] = fp4 ? f2h(fp4_read(kc, k) * k_inv_scale) : unpack_scaled_byte(kc[k], k_inv_scale);
+        if (v_out16) v_out16[idx] = fp4 ? f2h(fp4_read(vc, k) * v_inv_scale) : unpack_scaled_byte(vc[v], v_inv_scale);
     }
 }
 
@@ -6188,7 +6217,7 @@ void rdna3_flash(const uint16_t* q, int q_ld, const KV* kc, const KV* vc, Fp8KvL
         if constexpr (sizeof(KV) == 1) {
             if (layout.fp4) {
                 rdna3_attn_part<true, false, Waves, (Waves > 1), false, true><<<grid, Waves * 32, 0, stream>>>(
-                    q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias);
+                    q, nullptr, kc, vc, ring, H, Hkv, nullptr, pos, scale, nullptr, 0, extent, window, scratch, T, q_ld, bias, 0, nullptr, layout.paged);
                 return;
             }
             if (layout.paged) {
@@ -7247,20 +7276,45 @@ void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t
     check("prep_qkv_r_fp8_at");
 }
 
+#ifdef STRATA_USE_HIP
+static bool use_subwave_decode() {
+    static const bool enabled = getenv("IK2_DECODE_SUBWAVE") && atoi(getenv("IK2_DECODE_SUBWAVE"));
+    return enabled;
+}
+
+template <bool Sequences, class KV>
+void launch_subwave_decode(const float* q, const float* r, const KV* kc, const KV* vc, Fp8KvLayout layout,
+                           int rows, int H, int Hkv, const int* pos, int splits, float scale, const float* proj,
+                           int dr, int extent, int window, float* scratch, cudaStream_t stream,
+                           const int* slots = nullptr, size_t stride = 0, int ld = 0) {
+    auto launch = [&]<bool Paged, bool Packed>() {
+        rdna3_decode_split<KV, Paged, Sequences, Packed><<<dim3(H, splits, rows), 128, 0, stream>>>(
+            q, r, kc, vc, layout.ring_capacity, H, Hkv, pos, scale, proj, dr, extent, window, scratch, slots, stride, ld);
+    };
+    if constexpr (sizeof(KV) == 1) {
+        if (layout.fp4) {
+            if (layout.paged) launch.template operator()<true, true>();
+            else launch.template operator()<false, true>();
+            return;
+        }
+        if (layout.paged) {
+            launch.template operator()<true, false>();
+            return;
+        }
+    }
+    launch.template operator()<false, false>();
+}
+#endif
+
 template <class KV>
 void split_token_attention(const float* q, const float* r, const KV* kc, const KV* vc, Fp8KvLayout layout,
                            int H, int Hkv, const int* pos, int splits, float scale, const float* proj,
                            int dr, int extent, int window, float* scratch, cudaStream_t stream) {
     const int ring = layout.ring_capacity;
 #ifdef STRATA_USE_HIP
-    static const bool grouped = getenv("IK2_DECODE_SUBWAVE") && atoi(getenv("IK2_DECODE_SUBWAVE"));
-    if (grouped && !layout.fp4) {
-        if (layout.paged)
-            rdna3_decode_split<KV, true><<<dim3(H, splits), 128, 0, stream>>>(q, r, kc, vc, ring, H, Hkv, pos, scale,
-                                                              proj, dr, extent, window, scratch);
-        else
-            rdna3_decode_split<<<dim3(H, splits), 128, 0, stream>>>(q, r, kc, vc, ring, H, Hkv, pos, scale,
-                                                              proj, dr, extent, window, scratch);
+    if (use_subwave_decode()) {
+        launch_subwave_decode<false>(q, r, kc, vc, layout, 1, H, Hkv, pos, splits, scale, proj, dr, extent,
+                                     window, scratch, stream);
         check("rdna3_decode_split");
         return;
     }
@@ -7300,16 +7354,12 @@ void sequence_attention_quantized(float* q, float* r, float* gate, int ld, const
     attn_decode_mma_combine_kernel<true><<<dim3(H, T), kFaD, (kFaD + splits * kWaNW) * sizeof(float), stream>>>(
         scratch, ml, splits, H, sink, 1.f / vscale, pos, 0, window, gate, out, nullptr, ld);
 #else
-    const dim3 grid(H, splits, T);
-    if (layout.fp4)
-        sequence_fp4_split<<<grid, 128, 0, stream>>>(q, r, ld, kc, vc, stride, slots, pos, H, KV,
-                                                     scale, rel, dr, extent, window, scratch);
-    else if (layout.paged)
-        rdna3_decode_split<uint8_t, true, true><<<grid, 128, 0, stream>>>(
-            q, r, kc, vc, ring, H, KV, pos, scale, rel, dr, extent, window, scratch, slots, stride, ld);
+    if (layout.fp4 && !use_subwave_decode())
+        sequence_fp4_split<<<dim3(H, splits, T), 128, 0, stream>>>(q, r, ld, kc, vc, stride, slots, pos, H, KV,
+                                                              scale, rel, dr, extent, window, scratch, layout.paged, ring);
     else
-        rdna3_decode_split<uint8_t, false, true><<<grid, 128, 0, stream>>>(
-            q, r, kc, vc, ring, H, KV, pos, scale, rel, dr, extent, window, scratch, slots, stride, ld);
+        launch_subwave_decode<true>(q, r, kc, vc, layout, T, H, KV, pos, splits, scale, rel, dr, extent,
+                                    window, scratch, stream, slots, stride, ld);
     check("sequence attention");
     static const bool shared = getenv("IK2_SHARED_COMBINE") && atoi(getenv("IK2_SHARED_COMBINE"));
     if (shared && splits >= 16)
@@ -7399,7 +7449,7 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
     static const bool staged = getenv("IK2_ATTN_STAGED") && atoi(getenv("IK2_ATTN_STAGED"));
     if (layout.fp4)
         rdna3_attn_part<false, false, 1, true, false, true><<<dim3(Hkv, n_split), 32, 0, s>>>(q16, r, kc, vc, kv_cap, H, Hkv, pos, qpos,
-                                                      qk_scale, proj, d_rel, extent, window, scratch, 1, H * 128, nullptr);
+                                                      qk_scale, proj, d_rel, extent, window, scratch, 1, H * 128, nullptr, 0, nullptr, layout.paged);
     else if (layout.paged)
         rdna3_attn_part<false, false, 1, false, true><<<dim3(Hkv, n_split), 32, 0, s>>>(q16, r, kc, vc, kv_cap, H, Hkv, pos, qpos,
                                                       qk_scale, proj, d_rel, extent, window, scratch, 1, H * 128, nullptr);
@@ -7545,7 +7595,7 @@ static void attn_block_impl(const uint16_t* q16, const float* r, int r_ld, const
     if (layout.fp4)
         rdna3_attn_part<false, true, 1, false, false, true><<<dim3(Hkv, n_split, (columns + 15) / 16), 32, 0, s>>>(
         q16, r, kc, vc, kv_cap, H, Hkv, pos, 0, qk_scale, proj, d_rel, extent, window,
-        scratch, T, H * 128, nullptr, r_ld);
+        scratch, T, H * 128, nullptr, r_ld, nullptr, layout.paged);
     else if (layout.paged)
         rdna3_attn_part<false, true, 1, false, true><<<dim3(Hkv, n_split, (columns + 15) / 16), 32, 0, s>>>(
         q16, r, kc, vc, kv_cap, H, Hkv, pos, 0, qk_scale, proj, d_rel, extent, window,
@@ -7717,6 +7767,13 @@ void attn_res_jobs_block(const ResStates& states, int n, const float* q, int nq,
     launch_attn_res<false>(states, n, q, nq, T, C, eps, 0.0f, out, RmsOuts{}, s, jobs);
 }
 
+#ifdef STRATA_USE_HIP
+void rdna3_project_route(const uint16_t* weights, const float* x, int width, int rows, const float* bias,
+                         float scale, int* top, float* picks, cudaStream_t stream) {
+    rdna3_project_route_kernel<<<rows, 128, 0, stream>>>(weights, x, width, bias, scale, top, picks);
+    check("rdna3_project_route");
+}
+#endif
 void route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
                 cudaStream_t s) {
     if (T <= 0) return;
