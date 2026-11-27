@@ -463,7 +463,8 @@ bool g_dense_q8 = false;
 #ifdef STRATA_USE_HIP
 bool fused_router(int experts, int picks, int rows) {
     static const bool enabled = getenv("IK2_FUSED_ROUTER") && atoi(getenv("IK2_FUSED_ROUTER"));
-    return enabled && experts == 128 && picks == 8 && rows <= 64;
+    // One workgroup per row under-utilizes wide RDNA3 GPUs on single-token decode.
+    return enabled && experts == 128 && picks == 8 && rows >= 16 && rows <= 64;
 }
 #endif
 enum class KVPrecision { f16, fp8, fp8_global, fp4_global, fp4 };
@@ -2703,19 +2704,10 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
         static const bool exp_mma = !getenv("IK2_EXPERT_MMA") || atoi(getenv("IK2_EXPERT_MMA"));
 #endif
         const bool exp_tc = exp_mma && !fast_gate && !fast_down && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
-#ifdef STRATA_USE_HIP
-        if (fused_router(c.E, c.K, 1) && !fast_gate && !exp_tc) {
-            k::rdna3_project_route(Ly.router16, W.xq, C, 1, Ly.probs_b, c.route_scale, rtop, rw, g_s);
-            k::route_gather(rtop, rw, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2],
-                            c.K, c.K, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s);
-        } else
-#endif
-        {
-            k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
-            k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
-                           Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
-                           fast_gate ? W.gu32 : nullptr, q8_gate || iq4_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr);
-        }
+        k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
+        k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
+                       Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
+                       fast_gate ? W.gu32 : nullptr, q8_gate || iq4_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr);
 
 #ifdef IK2_HOST_AVX2
         if ((tier_active || host_plan.forced) && !host_plan.active.empty() && host_plan.active[l]) {
