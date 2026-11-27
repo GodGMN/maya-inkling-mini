@@ -3672,42 +3672,70 @@ void test_linear_block_verify(int type, int T) {
     std::vector<float> weights(3 * C * F);
     k::decode_host(type, raw.data(), weights.size(), weights.data());
     auto x = fvec(T * C, 0.1f);
-    std::vector<int> tokens(2 * k::kGroupMax), rows(tokens.size());
-    std::vector<double> hidden(T * F), down(T * C);
-    for (int t = 0; t < T; ++t) {
-        tokens[t] = T - 1 - t;
-        rows[t] = (t + 1) % T;
+    // Every token picks expert zero. Wide batches also pick seven singleton experts apiece.
+    const int K = T > k::kGroupMax ? 8 : 1;
+    const int S = T * K, G = std::max(2, S);
+    const int chunks = (T + k::kGroupMax - 1) / k::kGroupMax;
+    std::vector<int> tokens(G * k::kGroupMax, -1), rows(tokens.size(), -1), count(G);
+    auto gate_scale = fvec(S), up_scale = fvec(S);
+    std::vector<double> hidden(S * F), down(S * C);
+    for (int slot = 0; slot < S; ++slot) {
+        const int t = slot / K, pick = slot % K;
+        const int group = pick ? chunks + t * (K - 1) + pick - 1 : t / k::kGroupMax;
+        const int entry = group * k::kGroupMax + count[group]++;
+        tokens[entry] = T - 1 - t;
+        rows[entry] = (slot + 1) % S;
         for (int f = 0; f < F; ++f) {
             double g = 0, u = 0;
             for (int c = 0; c < C; ++c) {
-                const double v = x[tokens[t] * C + c];
+                const double v = x[tokens[entry] * C + c];
                 g += v * weights[f * C + c];
                 u += v * weights[(F + f) * C + c];
             }
-            hidden[rows[t] * F + f] = 4 * std::tanh(g / 4) / (1 + std::exp(-g)) * 25 * std::tanh(u / 25);
+            g *= gate_scale[rows[entry]];
+            u *= up_scale[rows[entry]];
+            hidden[rows[entry] * F + f] = 4 * std::tanh(g / 4) / (1 + std::exp(-g)) * 25 * std::tanh(u / 25);
         }
     }
     auto* w = dev(raw);
-    auto** blobs = dev(std::vector<const uint8_t*>{w, nullptr});
-    auto* counts = dev(std::vector<int>{T, 0});
+    std::vector<const uint8_t*> ptrs(G);
+    for (int g = 0; g < G; ++g)
+        if (count[g]) ptrs[g] = w;
+    auto** blobs = dev(ptrs);
+    auto* counts = dev(count);
     auto* dt = dev(tokens);
     auto* dr = dev(rows);
     auto* dx = dev(x);
     auto* limbs = dev_n<uint16_t>(T * 2 * C);
-    auto* dh = dev_n<uint16_t>(T * F);
-    auto* dy = dev_n<float>(T * C);
-    k::f16_limbs_rows(dx, T, C, limbs, 0);
-    k::experts_block_gu_linear(type, blobs, counts, dt, dr, 2, T, matrix, C, F, limbs, nullptr, nullptr, 4, 25, dh, 0);
-    auto h = host(dh, T * F);
+    auto* dh = dev_n<uint16_t>(S * F);
+    auto* dy = dev_n<float>(S * C);
+    auto* sg = dev(gate_scale);
+    auto* su = dev(up_scale);
+    cudaStream_t stream;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    CU(cudaStreamCreate(&stream));
+    CU(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    k::f16_limbs_rows(dx, T, C, limbs, stream);
+    k::experts_block_gu_linear(type, blobs, counts, dt, dr, G, T, matrix, C, F, limbs, sg, su, 4, 25, dh, stream);
+    k::experts_block_down_linear(type, blobs, counts, dr, G, 2 * matrix, C, F, dh, dy, stream);
+    CU(cudaStreamEndCapture(stream, &graph));
+    CU(cudaGraphInstantiate(&exec, graph, 0));
+    CU(cudaGraphLaunch(exec, stream));
+    CU(cudaStreamSynchronize(stream));
+    CU(cudaGraphExecDestroy(exec));
+    CU(cudaGraphDestroy(graph));
+    CU(cudaStreamDestroy(stream));
+    auto h = host(dh, S * F);
     std::vector<float> actual(h.size());
     std::transform(h.begin(), h.end(), actual.begin(), h2f_host);
     expect("block verify gate/up vs FP64", actual, hidden, 1e-3, 2e-3);
-    for (int t = 0; t < T; ++t)
+    for (int t = 0; t < S; ++t)
         for (int c = 0; c < C; ++c)
             for (int f = 0; f < F; ++f)
                 down[t * C + c] += double(actual[t * F + f]) * weights[2 * C * F + c * F + f];
-    k::experts_block_down_linear(type, blobs, counts, dr, 2, 2 * matrix, C, F, dh, dy, 0);
     expect("block verify down vs FP64", host(dy, down.size()), down, 1e-4, 0.01);
+    cudaFree(sg); cudaFree(su);
     cudaFree(w); cudaFree(blobs); cudaFree(counts); cudaFree(dt); cudaFree(dr);
     cudaFree(dx); cudaFree(limbs); cudaFree(dh); cudaFree(dy);
 }
@@ -4093,7 +4121,10 @@ int main(int argc, char** argv) {
 #ifndef STRATA_USE_HIP
     if (argc == 2 && !std::strcmp(argv[1], "--batch-mma")) {
         setenv("IK2_GROUP_MMA", "3", 1);
-        for (int T : {16, 32}) test_batch_groups(T, k::kNVFP4);
+        for (int T : {16, 32}) {
+            test_batch_groups(T, k::kNVFP4);
+            for (int type : {k::kIQ4_NL, k::kQ8_0}) test_linear_block_verify(type, T);
+        }
         return g_fail ? 1 : 0;
     }
     if (argc == 2 && !std::strcmp(argv[1], "--blackwell")) {
