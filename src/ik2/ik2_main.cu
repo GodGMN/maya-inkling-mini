@@ -2935,17 +2935,20 @@ void sequence_attention(Model& M, Work& W, int vis, bool sep, const SequenceRows
     const bool same_split = ly.sliding || std::all_of(rows.buckets.begin(), rows.buckets.end(),
                                                       [bucket](int b) { return b == bucket; });
     const bool scalar = g_attn_mma != 1 && (ly.sliding || (g_attn_mma != 2 && bucket < 3));
-    if (ly.kc8 && c.D == 128 && same_split && scalar) {
+    static const bool grouped = getenv("IK2_DECODE_SUBWAVE") && atoi(getenv("IK2_DECODE_SUBWAVE"));
+    if (grouped && ly.kc8 && c.D == 128 && same_split && scalar) {
         const int splits = ly.sliding ? std::min(128, (c.window + 63) / 64) : bucket == 1 ? 16 : bucket == 2 ? 32 : 128;
         const size_t cap = ly.paged_kv ? ((size_t)ly.kv_cap + 15) / 16 * 16 : ly.kv_cap;
         float* r = W.qkv + HD + (ly.sliding ? 2 * KD : 0);
-        if ((size_t)T * c.H * splits * 130 <= W.lg_cap &&
-            k::sequence_attention_fp8(W.qkv, r, r + c.H * c.d_rel, N, ly.q_clip, ly.r_clip, W.kconv, W.vconv,
+        if ((size_t)T * c.H * splits * 130 <= W.lg_cap) {
+            k::sequence_attention_quantized(W.qkv, r, r + c.H * c.d_rel, N, ly.q_clip, ly.r_clip, W.kconv, W.vconv,
                                       ly.kc8, ly.vc8, ly.fp8_layout(), cap * kv_row_bytes(KD, ly.sliding),
                                       rows.device_slots, W.pos, T, c.H, c.KV, c.d_rel, c.qk_clip, c.rel_clip,
                                       c.eps, c.alpha, c.n_floor, c.qk_clip <= 28.f ? 16.f : 1.f, 32.f, ly.rel_proj,
                                       ly.sliding ? c.extent_swa : c.extent, ly.sliding ? c.window : 1 << 30,
-                                      splits, W.sink, W.lg, W.o, g_s)) return;
+                                      splits, W.sink, W.lg, W.o, g_s);
+            return;
+        }
     }
 #endif
     for (int t = 0; t < T; ++t) {

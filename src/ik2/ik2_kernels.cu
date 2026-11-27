@@ -3918,23 +3918,18 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
     __syncthreads();
 }
 
-// Unified split kernel for both attn_decode (gridDim.z = 1) and attn_multi (gridDim.z = nq).
 template <class KV>
-__global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int H,
-                                  int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel,
-                                  int extent, int window, float* part, const int* pos_d, bool paged = false, bool fp4 = false) {
-    if (pos_d) {   // (tokens of a replayed graph: the first's position read here, the keys they may see from it)
-        qpos0 = *pos_d;
-        k0 = window < (1 << 30) ? max(0, qpos0 - window + 1) : 0;
-        nk = qpos0 + (int) gridDim.z - k0;
-    }
+__device__ __forceinline__ void attn_split_row(const float* q, const float* r, const KV* kc, const KV* vc,
+                                               int kv_cap, int H, int Hkv, int k0, int nk, int qpos, float qk_scale,
+                                               const float* proj, int d_rel, int extent, int window, float* part,
+                                               bool paged, bool fp4) {
     __shared__ float sm_m[4], sm_s[4];
     __shared__ __align__(16) float sm_o[4][128];
-    const int h = blockIdx.x, p = blockIdx.y, P = gridDim.y, qi = blockIdx.z, g = h / (H / Hkv), tid = threadIdx.x;
-    const int KD = Hkv * 128, qpos = qpos0 + qi;
+    const int h = blockIdx.x, p = blockIdx.y, P = gridDim.y, g = h / (H / Hkv), tid = threadIdx.x;
+    const int KD = Hkv * 128;
     const int len = (nk + P - 1) / P, j0 = p * len, j1 = min(nk, j0 + len);
-    const float* qh = q + ((size_t) qi * H + h) * 128;
-    const float* rh = r + ((size_t) qi * H + h) * d_rel;
+    const float* qh = q + (size_t)h * 128;
+    const float* rh = r + (size_t)h * d_rel;
     attn_flash_range(qh, rh, kc, vc, KD, g, kv_cap, k0, j0, j1, qpos, qk_scale, proj, d_rel, extent, window, sm_m,
                      sm_s, sm_o, paged, fp4);
     const float M = fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3]));
@@ -3948,10 +3943,38 @@ __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, 
             o += sm_o[w][tid] * f;
         }
     }
-    float* pp = part + (((size_t) qi * H + h) * P + p) * 130;
+    float* pp = part + ((size_t)h * P + p) * 130;
     if (tid == 0) pp[0] = M, pp[1] = sum;
     pp[2 + tid] = o;
 }
+
+template <class KV>
+__global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int H,
+                                  int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel,
+                                  int extent, int window, float* part, const int* pos_d, bool paged = false, bool fp4 = false) {
+    if (pos_d) {
+        qpos0 = *pos_d;
+        k0 = window < (1 << 30) ? max(0, qpos0 - window + 1) : 0;
+        nk = qpos0 + (int)gridDim.z - k0;
+    }
+    const size_t row = (size_t)blockIdx.z * H;
+    attn_split_row(q + row * 128, r + row * d_rel, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0 + (int)blockIdx.z,
+                   qk_scale, proj, d_rel, extent, window, part + row * gridDim.y * 130, paged, fp4);
+}
+
+#ifdef STRATA_USE_HIP
+__global__ void sequence_fp4_split(const float* q, const float* r, int ld, const uint8_t* kc, const uint8_t* vc,
+                                   size_t stride, const int* slots, const int* pos, int H, int Hkv, float scale,
+                                   const float* proj, int dr, int extent, int window, float* part) {
+    const int t = blockIdx.z, last = pos[t];
+    const int first = max(0, last + 1 - window);
+    const size_t cache = (size_t)slots[t] * stride;
+    // Each row can see keys only through its own position, including packed verify rows sharing a slot.
+    attn_split_row(q + (size_t)t * ld, r + (size_t)t * ld, kc + cache, vc + cache, 0, H, Hkv, first,
+                   last + 1 - first, last, scale, proj, dr, extent, window, part + (size_t)t * H * gridDim.y * 130,
+                   false, true);
+}
+#endif
 
 __global__ void attn_combine_kernel(const float* sink, const float* part, int H, int P, float v_inv_scale, float* out,
                                      const float* gate = nullptr, uint16_t* out16 = nullptr, int o_ld = 0, int gate_ld = 0) {
@@ -6897,23 +6920,24 @@ void split_token_attention(const float* q, const float* r, const KV* kc, const K
 }
 
 #ifdef STRATA_USE_HIP
-bool sequence_attention_fp8(float* q, float* r, float* gate, int ld, const float* qclip, const float* rclip,
+void sequence_attention_quantized(float* q, float* r, float* gate, int ld, const float* qclip, const float* rclip,
                             const float* keys, const float* values, uint8_t* kc, uint8_t* vc, Fp8KvLayout layout,
                             size_t stride, const int* slots, const int* pos, int T, int H, int KV, int dr,
                             float qcap, float rcap, float eps, float alpha, float floor, float kscale, float vscale,
                             const float* rel, int extent, int window, int splits, const float* sink,
                             float* scratch, float* out, cudaStream_t stream) {
-    static const bool grouped = getenv("IK2_DECODE_SUBWAVE") && atoi(getenv("IK2_DECODE_SUBWAVE"));
-    if (!grouped || layout.fp4) return false;
     const int ring = layout.ring_capacity;
     prep_qkv_r_impl_kernel<uint8_t, true><<<T * (2 * H + 2 * KV), 32, 0, stream>>>(
         q, qclip, keys, kc, values, vc, r, rclip, T, H, KV, 128, dr, qcap, rcap, eps,
         ring ? nullptr : pos, alpha, floor, 0, ring, kscale, vscale, pos, nullptr, nullptr, nullptr,
-        0, nullptr, ld, ld, layout.paged, false, slots, stride);
+        0, nullptr, ld, ld, layout.paged, layout.fp4, slots, stride);
     check("sequence KV append");
     const dim3 grid(H, splits, T);
     const float scale = (1.f / sqrtf(128.f)) / kscale;
-    if (layout.paged)
+    if (layout.fp4)
+        sequence_fp4_split<<<grid, 128, 0, stream>>>(q, r, ld, kc, vc, stride, slots, pos, H, KV,
+                                                     scale, rel, dr, extent, window, scratch);
+    else if (layout.paged)
         rdna3_decode_split<uint8_t, true, true><<<grid, 128, 0, stream>>>(
             q, r, kc, vc, ring, H, KV, pos, scale, rel, dr, extent, window, scratch, slots, stride, ld);
     else
@@ -6928,7 +6952,6 @@ bool sequence_attention_fp8(float* q, float* r, float* gate, int ld, const float
         attn_combine_kernel<<<dim3(H, T), 128, 0, stream>>>(
             sink, scratch, H, splits, 1.f / vscale, out, gate, nullptr, 0, ld);
     check("sequence attention combine");
-    return true;
 }
 #endif
 

@@ -338,7 +338,7 @@ struct MvF16Jobs { MvF16Job job[3] = {}; };
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
              cudaStream_t s);
 #ifdef STRATA_USE_HIP
-bool sequence_attention_fp8(float* q, float* r, float* gate, int ld, const float* qclip, const float* rclip,
+void sequence_attention_quantized(float* q, float* r, float* gate, int ld, const float* qclip, const float* rclip,
                             const float* keys, const float* values, uint8_t* kc, uint8_t* vc, Fp8KvLayout layout,
                             size_t stride, const int* slots, const int* pos, int T, int H, int KV, int dr,
                             float qcap, float rcap, float eps, float alpha, float floor, float kscale, float vscale,
