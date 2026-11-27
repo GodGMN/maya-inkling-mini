@@ -1,12 +1,14 @@
 // Inkling-2-Mini DFlash2. All GEMM outputs enter the next operator rounded to BF16.
 #pragma once
+#include "ik2_draft.hpp"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdint>
 #include <cmath>
 
 namespace ik2::draft::df2 {
 constexpr int width = 2304, groups = width / 16, dyn_width = 4 * groups;
-constexpr int vocab = 200058, codebook_rows = 201024, rank = 256, top = 16, chunk = 4096;
+constexpr int vocab = 200058, codebook_rows = 201024, rank = 256, top = kCandidates, chunk = 4096;
 constexpr int parts = (vocab + chunk - 1) / chunk;
 
 #ifndef STRATA_USE_HIP
@@ -21,18 +23,41 @@ static __global__ void pack_projection(const uint16_t* w, int k, uint4* packed) 
         make_uint4(word(p), word(p + 8*k), word(p + 8), word(p + 8*k + 8));
 }
 
+// Fragment bytes store biased integers. Converting two lanes at once via 1024 + u
+// is exact in FP16. Each output channel has its own FP32 scale.
+template<int Bits>
+__device__ inline unsigned unpack_pair(unsigned packed) {
+    constexpr unsigned mask = (1u << Bits) - 1;
+    unsigned lanes = 0x64006400u | (packed & mask) | (((packed >> Bits) & mask) << 16);
+    unsigned result;
+    constexpr unsigned bias = 0x6400u + (1u << (Bits - 1));
+    asm("sub.f16x2 %0, %1, %2;" : "=r"(result) : "r"(lanes), "r"(bias | (bias << 16)));
+    return result;
+}
+
 // Each output uses four K partitions and the same ordered MMA reductions for every batch size.
 // A warp keeps its weight fragment in registers across all of the tile's 8-row input panels.
-template <int Panels, bool Half = false>
+template <int Panels, bool Half = false, int Bits = 16>
 static __global__ void project(const uint16_t* weight, const uint16_t* x, int n, int k, int rows,
-                               float* y, int ld) {
+                               float* y, int ld, const float* scales) {
     const int lane = threadIdx.x % 32, split = threadIdx.x / 32;
     const int g = lane / 4, pair = 2 * (lane % 4), col = blockIdx.x * 16 + g;
     const int first = blockIdx.y * Panels * 8;
     float acc[Panels][4]{};
     for (int i = 16 * split; i < k; i += 64) {
         uint4 a;
-        if constexpr (Half) {
+        if constexpr (Bits < 16) {
+            const size_t index = (size_t(blockIdx.x) * k / 16 + i / 16) * 32 + lane;
+            if constexpr (Bits == 8) {
+                uint2 b = reinterpret_cast<const uint2*>(weight)[index];
+                a = make_uint4(unpack_pair<8>(b.x), unpack_pair<8>(b.x >> 16),
+                               unpack_pair<8>(b.y), unpack_pair<8>(b.y >> 16));
+            } else {
+                unsigned b = reinterpret_cast<const unsigned*>(weight)[index];
+                a = make_uint4(unpack_pair<4>(b), unpack_pair<4>(b >> 8),
+                               unpack_pair<4>(b >> 16), unpack_pair<4>(b >> 24));
+            }
+        } else if constexpr (Half) {
             const uint16_t* w0 = weight + size_t(min(col, n - 1)) * k + i + pair;
             const uint16_t* w1 = weight + size_t(min(col + 8, n - 1)) * k + i + pair;
             a = make_uint4(*reinterpret_cast<const unsigned*>(w0), *reinterpret_cast<const unsigned*>(w1),
@@ -50,7 +75,7 @@ static __global__ void project(const uint16_t* weight, const uint16_t* x, int n,
     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" \
     : "+f"(acc[p][0]), "+f"(acc[p][1]), "+f"(acc[p][2]), "+f"(acc[p][3]) \
     : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1))
-            if constexpr (Half) { IK2_DRAFT_MMA("f16"); }
+            if constexpr (Half || Bits < 16) { IK2_DRAFT_MMA("f16"); }
             else { IK2_DRAFT_MMA("bf16"); }
 #undef IK2_DRAFT_MMA
         }
@@ -67,6 +92,10 @@ static __global__ void project(const uint16_t* weight, const uint16_t* x, int n,
                 const float4 a = partial[j][lane];
                 v.x += a.x; v.y += a.y; v.z += a.z; v.w += a.w;
             }
+            if constexpr (Bits < 16) {
+                v.x *= scales[col]; v.y *= scales[col];
+                v.z *= scales[col+8]; v.w *= scales[col+8];
+            }
             const int t = first + 8*p + pair;
             if (t < rows && col < n) y[size_t(t) * ld + col] = v.x;
             if (t+1 < rows && col < n) y[size_t(t+1) * ld + col] = v.y;
@@ -77,14 +106,14 @@ static __global__ void project(const uint16_t* weight, const uint16_t* x, int n,
     }
 }
 
-template <bool Half = false>
+template <bool Half = false, int Bits = 16>
 static void project_rows(const uint16_t* weight, const uint16_t* x, int n, int k, int rows, float* y,
-                         int ld, cudaStream_t stream) {
+                         int ld, cudaStream_t stream, const float* scales = nullptr) {
     const int blocks = (n + 15) / 16;
-    if (rows <= 8) project<1, Half><<<blocks, 128, 0, stream>>>(weight, x, n, k, rows, y, ld);
-    else if (rows <= 16) project<2, Half><<<blocks, 128, 0, stream>>>(weight, x, n, k, rows, y, ld);
-    else if (rows <= 32) project<4, Half><<<blocks, 128, 0, stream>>>(weight, x, n, k, rows, y, ld);
-    else project<8, Half><<<dim3(blocks, (rows+63)/64), 128, 0, stream>>>(weight, x, n, k, rows, y, ld);
+    if (rows <= 8) project<1, Half, Bits><<<blocks, 128, 0, stream>>>(weight, x, n, k, rows, y, ld, scales);
+    else if (rows <= 16) project<2, Half, Bits><<<blocks, 128, 0, stream>>>(weight, x, n, k, rows, y, ld, scales);
+    else if (rows <= 32) project<4, Half, Bits><<<blocks, 128, 0, stream>>>(weight, x, n, k, rows, y, ld, scales);
+    else project<8, Half, Bits><<<dim3(blocks, (rows+63)/64), 128, 0, stream>>>(weight, x, n, k, rows, y, ld, scales);
 }
 #endif
 
@@ -94,6 +123,76 @@ __device__ inline uint16_t bits(float x) {
 }
 __device__ inline float expand(uint16_t b) { return __uint_as_float(uint32_t(b) << 16); }
 __device__ inline float rounded(float x) { return expand(bits(x)); }
+
+// Quantize on the loading stream. All backbone shapes are multiples of 16 by 64.
+template<int Bits>
+static __global__ void quantize_rows(const uint16_t* input, int k, uint8_t* packed, float* scales) {
+    const int row = blockIdx.x, lane = threadIdx.x;
+    input += size_t(row) * k;
+    __shared__ float peak[256];
+    float m = 0;
+    for (int j = lane; j < k; j += 256) m = fmaxf(m, fabsf(expand(input[j])));
+    peak[lane] = m;
+    __syncthreads();
+    for (int n = 128; n; n /= 2) {
+        if (lane < n) peak[lane] = fmaxf(peak[lane], peak[lane+n]);
+        __syncthreads();
+    }
+    constexpr int bias = 1 << (Bits-1);
+    const float scale = peak[0] / (bias-1);
+    if (!lane) scales[row] = scale;
+    for (int j = 2*lane; j < k; j += 512) {
+        unsigned pair = 0;
+        for (int t = 0; t < 2; ++t) {
+            int q = scale ? __float2int_rn(expand(input[j+t]) / scale) : 0;
+            pair |= unsigned(bias + q) << (Bits*t);
+        }
+#ifdef STRATA_USE_HIP
+        size_t index = size_t(row) * (k/2) + j/2;
+#else
+        const int frag_lane = 4*(row%8) + (j%8)/2;
+        size_t index = (((size_t(row/16)*(k/16) + j/16)*32 + frag_lane)*4
+                        + 2*((j%16)/8) + (row%16)/8);
+#endif
+        if constexpr (Bits == 8) reinterpret_cast<uint16_t*>(packed)[index] = pair;
+        else packed[index] = pair;
+    }
+}
+
+#ifdef STRATA_USE_HIP
+template<int Bits>
+static __global__ void project_quant(const uint8_t* weights, const float* scales, const uint16_t* x,
+                                     int n, int k, int rows, float* y, int ld) {
+    using Half16 = _Float16 __attribute__((ext_vector_type(16)));
+    using Float8 = float __attribute__((ext_vector_type(8)));
+    const int lane = threadIdx.x % 32, l = lane % 16;
+    const int col = blockIdx.x*64 + (threadIdx.x/32)*16 + l;
+    const int token = blockIdx.y*16 + l;
+    Float8 acc{};
+    for (int j = 0; j < k; j += 16) {
+        Half16 a{}, b{};
+        if (token < rows) __builtin_memcpy(&a, x + size_t(token)*k + j, sizeof(a));
+        if (col < n) {
+            const auto* w = weights + (size_t(col)*k + j) / (8/Bits);
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const int u = (w[i/(8/Bits)] >> ((i%(8/Bits))*Bits)) & ((1<<Bits)-1);
+                b[i] = _Float16(u - (1<<(Bits-1)));
+            }
+        }
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc);
+    }
+    for (int i = 0; i < 8; ++i) {
+        int t = blockIdx.y*16 + 2*i + lane/16;
+        if (t < rows && col < n) y[size_t(t)*ld+col] = acc[i]*scales[col];
+    }
+}
+#endif
+
+static __global__ void bf16_to_half(uint16_t* x, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) x[i] = __half_as_ushort(__float2half(expand(x[i])));
+}
 
 static __global__ void gather(const float* taps, int ld, int first, uint16_t* packed) {
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -229,9 +328,42 @@ static __global__ void merge_parts(const float* logits, int stride, const int* p
     }
 }
 
-// One warp per candidate, with the winning token fed into the next row.
+__device__ inline int sample_candidate(const float* scores, const int* ids, int winner,
+                                       double temperature, double uniform, DraftMass* mass) {
+    // Sort by corrected score so a common uniform draw also couples
+    // the batch scheduler's target and draft categorical samples.
+    int order[top];
+    double weights[top], total = 0;
+    for (int i = 0; i < top; ++i) {
+        weights[i] = exp(double(scores[i] - scores[winner]) / temperature);
+        total += weights[i];
+        int j = i;
+        while (j && (scores[i] > scores[order[j-1]] ||
+               (scores[i] == scores[order[j-1]] && ids[i] < ids[order[j-1]]))) {
+            order[j] = order[j-1];
+            --j;
+        }
+        order[j] = i;
+    }
+    double u = uniform * total;
+    winner = order[top-1];
+    for (int j = 0; j < top; ++j) {
+        int i = order[j];
+        if ((u -= weights[i]) < 0) { winner = i; break; }
+    }
+    for (int i = 0; i < top; ++i) {
+        mass->ids[i] = ids[i];
+        mass->probabilities[i] = weights[i] / total;
+    }
+    return winner;
+}
+
+// Conditional selector with the post-correction softcap, following qwen3_dflash2.py
+// (vLLM contributors and Ciru, Apache-2.0). Sample only within the top-16 support.
+template<bool Sample = false>
 static __global__ void walk(const float* logits, int stride, const int* ids, const float* hidden,
-                            const uint16_t* pred, const uint16_t* succ, int rows, int* tokens) {
+                            const uint16_t* pred, const uint16_t* succ, int rows, int* tokens,
+                            const Draws* draws = nullptr, DraftMass* mass = nullptr) {
     logits += size_t(blockIdx.x) * rows * stride;
     ids += blockIdx.x * rows * top;
     hidden += blockIdx.x * rows * rank;
@@ -251,6 +383,13 @@ static __global__ void walk(const float* logits, int stride, const int* ids, con
         if (threadIdx.x == 0) {
             int winner = 0;
             for (int i = 1; i < top; ++i) if (scores[i] > scores[winner]) winner = i;
+            if constexpr (Sample) {
+                const auto& draw = draws[blockIdx.x];
+                if (draw.temperature > 0) {
+                    winner = sample_candidate(scores, ids + r*top, winner, draw.temperature, draw.uniform[r],
+                                              mass + blockIdx.x*rows + r);
+                }
+            }
             tokens[r+1] = ids[r * top + winner];
         }
         __syncthreads();
