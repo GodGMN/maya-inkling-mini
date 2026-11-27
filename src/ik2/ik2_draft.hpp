@@ -29,9 +29,12 @@ struct Drafter;
 const std::vector<int>& tap_layers();
 constexpr int kTaps = 8, kBlock = 8;
 
-/// Loads mtp.safetensors (path) onto the current device; ctx: positions the context caches hold.  C: the target's
-/// width (4608).  Throws (std::runtime_error) on a file it does not understand.
+/// Load a DSpark or Mini DFlash2 checkpoint. A directory resolves to its model.safetensors.
+/// C is the target width and ctx is the cache capacity in positions.
 Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s);
+/// Destination for the normed target mask embedding, or nullptr for DSpark.
+float* dflash2_mask(Drafter* d);
+constexpr int kDFlash2MaskToken = 200056;
 /// The Markov head's bias folded through the target's output head (FP16 [n_rows][C], on the device).
 void fold(Drafter* d, const uint16_t* lm_f16, int n_rows);
 /// The context caches for positions pos0 .. pos0 + m - 1 from tap rows r0 .. r0 + m - 1 (taps [8][ld][C] F32).

@@ -3861,6 +3861,7 @@ void test_draft_attn_online() {
     int* dP = dev(std::vector<int>{P});
     float *scratch = dev_n<float>((size_t) 64 * H * 8 * 130), *out = dev_n<float>((size_t) nq * H * D);
     std::vector<double> want((size_t) nq * H * D, 0.0);
+    auto row_window = want;
     for (int h = 0; h < H; ++h) {
         const int g = h / (H / Hkv);
         for (int qi = 0; qi < nq; ++qi) {
@@ -3876,14 +3877,19 @@ void test_draft_attn_online() {
             }
             double den = 0.0;
             for (double& s : sc) { s = std::exp(s - mx); den += s; }
+            double row_den = 0;
+            for (int j = qi; j < nk; ++j) row_den += sc[j];
             for (int d = 0; d < D; ++d) {
+                double row_acc = 0;
                 double acc = 0.0;
                 for (int j = 0; j < nk; ++j) {
                     const float* vr = j < nc ? vc.data() + ((size_t) ((k_lo + j) % cap) * Hkv + g) * D
                                              : vb.data() + ((size_t) (j - nc) * Hkv + g) * D;
                     acc += sc[j] * vr[d];
+                    if (j >= qi) row_acc += sc[j] * vr[d];
                 }
                 want[((size_t) qi * H + h) * D + d] = acc / den;
+                row_window[((size_t) qi * H + h) * D + d] = row_acc / row_den;
             }
         }
     }
@@ -3891,6 +3897,8 @@ void test_draft_attn_online() {
     expect("draft_attn online (ring wrap)", host(out, want.size()), want, 1e-4, 2e-5);
     k::draft_attn_graph(dq, dkc, dvc, dP, window, dkb, dvb, nq, H, Hkv, scale, 4, scratch, out, 0, cap);
     expect("draft_attn_graph online (d_P, S=4)", host(out, want.size()), want, 1e-4, 2e-5);
+    k::dflash2_attn(dq, dkc, dvc, dP, window, dkb, dvb, nq, H, Hkv, scale, 4, scratch, out, 0, cap);
+    expect("DFlash2 per-row window after wrap", host(out, want.size()), row_window, 1e-4, 2e-5);
     auto* dk16 = dev(kc16);
     auto* dv16 = dev(vc16);
     cudaStream_t stream;

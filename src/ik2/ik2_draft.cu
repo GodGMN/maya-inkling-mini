@@ -1,31 +1,15 @@
 // src/ik2/ik2_draft.cu - tintero's drafter (the design: ik2_draft.hpp).
 #include "ik2_draft.hpp"
+#include "ik2_dflash2_kernels.cuh"
+#include "ik2_draft_weights.hpp"
 #include "ik2_kernels.cuh"
 
 #include <cuda_fp16.h>
-#include <fcntl.h>
-
-#ifdef _WIN32
-#include <io.h>
-#include <BaseTsd.h>
-typedef SSIZE_T ssize_t;
-#define O_RDONLY (_O_RDONLY | _O_BINARY)
-#define open _open
-#define close _close
-static inline ssize_t pread(int fd, void* buf, size_t count, int64_t offset) {
-    if (_lseeki64(fd, offset, SEEK_SET) == -1) return -1;
-    return _read(fd, buf, (unsigned int)count);
-}
-#else
-#include <unistd.h>
-#endif
-
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <stdexcept>
 
 namespace ik2::draft {
@@ -53,86 +37,11 @@ float bf(uint16_t b) {
     return f;
 }
 
-// ---- safetensors: the header's tensors (name -> dtype, shape, byte range)
-struct StTensor {
-    std::string dtype;
-    std::vector<int64_t> shape;
-    uint64_t begin = 0, end = 0;
-};
-struct StFile {
-    std::string path;
-    uint64_t data0 = 0;
-    std::map<std::string, StTensor> t;
-};
-
-StFile st_open(const std::string& path) {
-    StFile f;
-    f.path = path;
-    FILE* fp = std::fopen(path.c_str(), "rb");
-    if (!fp) throw std::runtime_error("drafter: cannot open " + path);
-    uint64_t n = 0;
-    if (std::fread(&n, 8, 1, fp) != 1 || n > (64u << 20)) throw std::runtime_error("drafter: not a safetensors file");
-    std::string h(n, '\0');
-    if (std::fread(&h[0], 1, n, fp) != n) throw std::runtime_error("drafter: short header");
-    std::fclose(fp);
-    f.data0 = 8 + n;
-    // {"name":{"dtype":"BF16","shape":[a,b],"data_offsets":[x,y]}, ...}: a flat scan is enough for this header
-    size_t i = h.find('{') + 1;
-    while (true) {
-        const size_t q0 = h.find('"', i);
-        if (q0 == std::string::npos) break;
-        const size_t q1 = h.find('"', q0 + 1);
-        const std::string name = h.substr(q0 + 1, q1 - q0 - 1);
-        const size_t ob = h.find('{', q1), oe = h.find('}', ob);
-        const std::string body = h.substr(ob, oe - ob);
-        i = oe + 1;
-        if (name == "__metadata__") continue;
-        StTensor t;
-        const size_t d0 = body.find("\"dtype\"");
-        const size_t d1 = body.find('"', body.find(':', d0) + 1), d2 = body.find('"', d1 + 1);
-        t.dtype = body.substr(d1 + 1, d2 - d1 - 1);
-        auto ints = [&](const char* key) {
-            std::vector<int64_t> v;
-            const size_t a = body.find(key);
-            const size_t b0 = body.find('[', a), b1 = body.find(']', b0);
-            const std::string list = body.substr(b0 + 1, b1 - b0 - 1);
-            for (const char* p = list.c_str(); *p;) {
-                while (*p == ' ' || *p == ',') ++p;
-                if (!*p) break;
-                v.push_back(std::strtoll(p, (char**) &p, 10));
-            }
-            return v;
-        };
-        t.shape = ints("\"shape\"");
-        const auto off = ints("\"data_offsets\"");
-        if (off.size() != 2) throw std::runtime_error("drafter: bad entry " + name);
-        t.begin = (uint64_t) off[0], t.end = (uint64_t) off[1];
-        f.t[name] = t;
-    }
-    return f;
-}
-
-std::vector<uint16_t> st_bf16(const StFile& f, const std::string& name, const std::vector<int64_t>& shape) {
-    auto it = f.t.find(name);
-    if (it == f.t.end()) throw std::runtime_error("drafter: no tensor " + name);
-    if (it->second.dtype != "BF16") throw std::runtime_error("drafter: " + name + " is " + it->second.dtype);
-    if (it->second.shape != shape) throw std::runtime_error("drafter: " + name + ": unexpected shape");
-    const size_t n = (it->second.end - it->second.begin) / 2;
-    std::vector<uint16_t> v(n);
-    const int fd = ::open(f.path.c_str(), O_RDONLY);
-    size_t done = 0;
-    while (done < n * 2) {
-        const ssize_t r = ::pread(fd, (char*) v.data() + done, n * 2 - done, (off_t) (f.data0 + it->second.begin + done));
-        if (r <= 0) throw std::runtime_error("drafter: read failed");
-        done += (size_t) r;
-    }
-    ::close(fd);
-    return v;
-}
-
 }  // namespace
 
 struct DLayer {
+    struct Conv { uint16_t *projection, *base; };
+    Conv attention_conv{}, mlp_conv{};
     bool local = false;
     float *in_norm, *post_norm, *dflare, *q_norm, *k_norm, *k_norm_ctx;
     uint16_t *wq, *wk, *wv, *wo, *wkc, *wvc, *wgu, *wd;   // BF16 [out][in]
@@ -142,6 +51,13 @@ struct DLayer {
 };
 
 struct Drafter {
+    struct DFlash2 {
+        uint16_t *fc, *selector, *pred, *succ, *packed;
+        float *hidden_norm, *dynamic;
+        int *parts, *ids;
+        const uint16_t* head = nullptr;
+    };
+    DFlash2* flash = nullptr;
     int taps = 8, C = 4608, H = 48, KV = 8, F = 18432, R = 256, V = 0, ctx = 0;
     int cap = 0;   // the rows of the layer without a window's context cache (IK2_DRAFT_CTX, default the context)
     float* ctx_tmp = nullptr;   // write_context's K and V rows before an FP16 cache, [2][kMixRows][KV * 128]
@@ -356,15 +272,20 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     } else if (C != 4608) {
         throw std::runtime_error("drafter: unsupported target width");
     }
-    const int layers = mini ? 3 : 5;
+    if (f.t.count("candidate_selector.hidden_projection.weight")) {
+        if (!mini) throw std::runtime_error("DFlash2 requires Inkling-2-Mini");
+        d->flash = new Drafter::DFlash2;
+        d->H = 32;
+        d->F = 6912;
+        d->theta = 10000.f;
+    }
+    const int layers = mini && !d->flash ? 3 : 5;
     const int64_t H = d->H, KV = d->KV, F = d->F, R = d->R;
-    {
+    if (!d->flash) {
         auto it = f.t.find("markov_head.markov_w1.weight");
         if (it == f.t.end() || it->second.shape.size() != 2) throw std::runtime_error("drafter: no markov_w1");
         d->V = (int) it->second.shape[0];
-    }
-    // fuse_weight [6][8] -> softmax over each row
-    {
+        // DSpark mixes taps separately for each layer.
         const auto fw = st_bf16(f, "fuse_weight", {layers + 1, d->taps});
         std::vector<float> a(fw.size());
         for (int r = 0; r <= layers; ++r) {
@@ -381,19 +302,29 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     for (int i = 0; i < layers; ++i) {
         DLayer& l = d->L[i];
         const std::string b = "layers." + std::to_string(i) + ".";
-        l.local = mini ? i != 1 : std::find(std::begin(local_ids), std::end(local_ids), i) != std::end(local_ids);
+        l.local = d->flash || (mini ? i != 1 : std::find(std::begin(local_ids), std::end(local_ids), i) != std::end(local_ids));
         l.in_norm = up32(d, st_bf16(f, b + "input_layernorm.weight", {C}));
         l.post_norm = up32(d, st_bf16(f, b + "post_attention_layernorm.weight", {C}));
-        l.dflare = up32(d, st_bf16(f, b + "dflare_norm.weight", {C}));
+        if (!d->flash) l.dflare = up32(d, st_bf16(f, b + "dflare_norm.weight", {C}));
         l.q_norm = up32(d, st_bf16(f, b + "self_attn.q_norm.weight", {128}));
         l.k_norm = up32(d, st_bf16(f, b + "self_attn.k_norm.weight", {128}));
-        l.k_norm_ctx = up32(d, st_bf16(f, b + "self_attn.k_norm_ctx.weight", {128}));
+        if (!d->flash) l.k_norm_ctx = up32(d, st_bf16(f, b + "self_attn.k_norm_ctx.weight", {128}));
         l.wq = up16(d, st_bf16(f, b + "self_attn.q_proj.weight", {H * 128, C}));
         l.wk = up16(d, st_bf16(f, b + "self_attn.k_proj.weight", {KV * 128, C}));
         l.wv = up16(d, st_bf16(f, b + "self_attn.v_proj.weight", {KV * 128, C}));
         l.wo = up16(d, st_bf16(f, b + "self_attn.o_proj.weight", {C, H * 128}));
-        l.wkc = up16(d, st_bf16(f, b + "self_attn.k_proj_ctx.weight", {KV * 128, C}));
-        l.wvc = up16(d, st_bf16(f, b + "self_attn.v_proj_ctx.weight", {KV * 128, C}));
+        if (d->flash) {
+            auto load_conv = [&](const std::string& name) {
+                return DLayer::Conv{
+                    up16(d, st_bf16(f, b + name + ".kernel_projection.weight", {df2::dyn_width, C})),
+                    up16(d, st_bf16(f, b + name + ".base_kernel", {2, 2, C}))};
+            };
+            l.attention_conv = load_conv("attention_conv");
+            l.mlp_conv = load_conv("mlp_conv");
+        } else {
+            l.wkc = up16(d, st_bf16(f, b + "self_attn.k_proj_ctx.weight", {KV * 128, C}));
+            l.wvc = up16(d, st_bf16(f, b + "self_attn.v_proj_ctx.weight", {KV * 128, C}));
+        }
         {
             auto g = st_bf16(f, b + "mlp.gate_proj.weight", {F, C});
             const auto u = st_bf16(f, b + "mlp.up_proj.weight", {F, C});
@@ -414,28 +345,46 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
         }
     }
     d->norm = up32(d, st_bf16(f, "norm.weight", {C}));
-    d->mask = up32(d, st_bf16(f, "mask_embed", {C}));
-    d->mk_dflare = up32(d, st_bf16(f, "markov_head.dflare_norm.weight", {C}));
-    d->w1 = up16(d, st_bf16(f, "markov_head.markov_w1.weight", {d->V, R}));
-    d->rnn_w = up16(d, st_bf16(f, "markov_head.rnn_proj.weight", {3 * R, 2 * R + 2 * C}));
-    d->rnn_b = up32(d, st_bf16(f, "markov_head.rnn_proj.bias", {3 * R}));
-    d->hout_w = st_bf16(f, "markov_head.hidden_out.weight", {C, R});
-    d->hout_b = st_bf16(f, "markov_head.hidden_out.bias", {C});
+    if (d->flash) {
+        auto& flash = *d->flash;
+        flash.fc = up16(d, st_bf16(f, "fc.weight", {C, 4 * C}));
+        flash.hidden_norm = up32(d, st_bf16(f, "hidden_norm.weight", {C}));
+        flash.selector = up16(d, st_bf16(f, "candidate_selector.hidden_projection.weight", {R, C}));
+        flash.pred = up16(d, st_bf16(f, "candidate_selector.predecessor_codebook", {df2::codebook_rows, R}));
+        flash.succ = up16(d, st_bf16(f, "candidate_selector.successor_codebook", {df2::codebook_rows, R}));
+        flash.packed = dalloc<uint16_t>(kMixRows * 4 * C);
+        flash.dynamic = dalloc<float>(kBlock * df2::dyn_width);
+        flash.parts = dalloc<int>((kBlock - 1) * df2::parts * df2::top);
+        flash.ids = dalloc<int>((kBlock - 1) * df2::top);
+        d->mask = dalloc<float>(C);
+        d->proj = dalloc<float>((kBlock - 1) * R);
+        d->base = dalloc<float>((kBlock - 1) * df2::vocab);
+    } else {
+        d->mask = up32(d, st_bf16(f, "mask_embed", {C}));
+        d->mk_dflare = up32(d, st_bf16(f, "markov_head.dflare_norm.weight", {C}));
+        d->w1 = up16(d, st_bf16(f, "markov_head.markov_w1.weight", {d->V, R}));
+        d->rnn_w = up16(d, st_bf16(f, "markov_head.rnn_proj.weight", {3 * R, 2 * R + 2 * C}));
+        d->rnn_b = up32(d, st_bf16(f, "markov_head.rnn_proj.bias", {3 * R}));
+        d->hout_w = st_bf16(f, "markov_head.hidden_out.weight", {C, R});
+        d->hout_b = st_bf16(f, "markov_head.hidden_out.bias", {C});
+    }
     // work buffers
     const size_t T = kBlock;
     d->x = dalloc<float>(T * C), d->res = dalloc<float>(T * C), d->h = dalloc<float>(T * C);
     d->q = dalloc<float>(T * H * 128), d->o = dalloc<float>(T * H * 128);
-    d->kk = dalloc<float>(std::max<size_t>(T, kMixRows) * KV * 128), d->vv = dalloc<float>(T * KV * 128);
+    d->kk = dalloc<float>((d->flash ? T : kMixRows) * KV * 128), d->vv = dalloc<float>(T * KV * 128);
     d->gu = dalloc<float>(T * 2 * F);
     d->hb = dalloc<uint16_t>(std::max<size_t>(T * std::max<int64_t>(C, H * 128), (size_t) kMixRows * C));
     d->hb2 = dalloc<uint16_t>(T * F);
     // (online-softmax draft_attn's: only the chunks' outputs [64][H][8][128] and (max, sum))
-    d->ctx_tmp = dalloc<float>((size_t) 2 * kMixRows * KV * 128);
-    d->scratch = dalloc<float>((size_t) 64 * H * 8 * 130);
+    if (!d->flash) d->ctx_tmp = dalloc<float>((size_t) 2 * kMixRows * KV * 128);
+    d->scratch = dalloc<float>((size_t) (d->flash ? 8 : 64) * H * 8 * 130);
     d->mix = dalloc<float>((size_t) kMixRows * C);
-    d->f_rnn = dalloc<float>(C);
-    d->state = dalloc<float>(R), d->latent = dalloc<float>(R), d->proj = dalloc<float>(3 * R);
-    d->rnn_in = dalloc<uint16_t>(2 * R + 2 * C);
+    if (!d->flash) {
+        d->f_rnn = dalloc<float>(C);
+        d->state = dalloc<float>(R), d->latent = dalloc<float>(R), d->proj = dalloc<float>(3 * R);
+        d->rnn_in = dalloc<uint16_t>(2 * R + 2 * C);
+    }
     d->x16 = dalloc<__half>((kBlock - 1) * (size_t) C);
     d->pos = dalloc<int>(T), d->ctx_pos = dalloc<int>(kMixRows), d->toks = dalloc<int>(kBlock);
     cu(cudaHostAlloc(&d->h_out, (kBlock - 1) * sizeof(int), cudaHostAllocDefault), "h_out");
@@ -454,9 +403,15 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     return d;
 }
 
+float* dflash2_mask(Drafter* d) { return d->flash ? d->mask : nullptr; }
+
 void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) {
     const int C = d->C, R = d->R;
     d->n_rows = n_rows;
+    if (d->flash) {
+        d->flash->head = lm_f16;
+        return;
+    }
     if (getenv("IK2_DRAFT_SHORTLIST") && atoi(getenv("IK2_DRAFT_SHORTLIST"))) {
         const int stride = (n_rows + 31) / 32;
         d->shortlist = dalloc<int>((kBlock - 1) * stride);
@@ -498,7 +453,10 @@ void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) {
     d->vram += ((size_t) R + 1) * n_rows * 2 + (size_t) (kBlock - 1) * n_rows * 4;
 }
 
+#include "ik2_dflash2.cuh"
+
 void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos0) {
+    if (d->flash) return df2::context(d, taps, ld, r0, m, pos0);
     const int C = d->C, KD = d->KV * 128;
     for (auto& l : d->L) {
         const int li = (int) (&l - d->L.data());
@@ -525,55 +483,15 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
 }
 
 void set_f_rnn(Drafter* d, const float* taps, int ld, int row) {
+    if (d->flash) return;
     k::mix_rms(taps + (size_t) row * d->C, d->taps, (size_t) ld * d->C, 1, d->C, d->alpha + d->L.size() * d->taps, d->mk_dflare,
                d->eps, d->f_rnn, d->s);
 }
 
-void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
-             int* out, int proposals) {
+static void dspark_block(Drafter* d, int proposals, int P, const uint16_t* lm_f16, int n_rows, int n_vocab, int splits) {
     const int C = d->C, T = kBlock;
     const size_t TC = (size_t) T * C;
     const int shortlist_n = (n_vocab + 31) / 32;
-    static const bool use_graph = !getenv("IK2_DRAFT_GRAPH") || atoi(getenv("IK2_DRAFT_GRAPH"));
-    bool graph_ok = use_graph && d->head_q8 && proposals >= 1 && proposals < kBlock;
-#ifdef STRATA_USE_HIP
-    static const bool bf16_mv = !getenv("IK2_DRAFT_BF16_MV") || atoi(getenv("IK2_DRAFT_BF16_MV"));
-    graph_ok = graph_ok && bf16_mv && C % 128 == 0 && d->F % 128 == 0 && (2 * d->R + 2 * C) % 128 == 0;
-#endif
-    Drafter::PropGraph* capture = nullptr;
-    int splits = 0;
-    if (graph_ok) {
-        const int bkt = P < 256 ? 0 : (P < 1024 ? 1 : (P < 4096 ? 2 : 3));
-        static constexpr int kSplits[4] = {2, 8, 16, 64};
-        d->h_meta[0] = P;
-        d->h_meta[1] = anchor;
-        auto& G = d->pgraph[proposals][bkt];
-        if (G.exec && (G.anchor_h != anchor_h || G.n_rows != n_rows || G.n_vocab != n_vocab)) {
-            cu(cudaGraphExecDestroy(G.exec), "pgraph destroy exec");
-            cu(cudaGraphDestroy(G.graph), "pgraph destroy");
-            G = {};
-        }
-        if (G.exec) {
-            cu(cudaGraphLaunch(G.exec, d->s), "pgraph launch");
-            cu(cudaStreamSynchronize(d->s), "propose");
-            std::memcpy(out, d->h_out, proposals * sizeof(int));
-            return;
-        }
-        capture = &G;
-        splits = kSplits[bkt];
-        G.anchor_h = anchor_h;
-        G.n_rows = n_rows;
-        G.n_vocab = n_vocab;
-        cu(cudaStreamBeginCapture(d->s, cudaStreamCaptureModeGlobal), "pgraph begin");
-        cu(cudaMemcpyAsync(d->d_meta, d->h_meta, 2 * sizeof(int), cudaMemcpyHostToDevice, d->s), "meta h2d");
-        init_block_kernel_d<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
-            anchor_h, d->mask, d->res, d->pos, d->toks, T, C, d->d_meta);
-    } else {
-        // Initialize the residual stream [anchor_h; mask x 7], block positions, and anchor token in one kernel.
-        // Layer 0 reads d->res and overwrites d->x, so d->x does not need pre-filling.
-        init_block_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
-            anchor_h, d->mask, d->res, d->pos, d->toks, T, C, P, anchor);
-    }
     // pre-norm layers, the residual carried apart (res = x + res before each norm)
     for (size_t i = 0; i < d->L.size(); ++i) {
         DLayer& l = d->L[i];
@@ -613,6 +531,55 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
                            d->toks + t + 1, d->s);
         }
     }
+}
+
+void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
+             int* out, int proposals) {
+    const int C = d->C, T = kBlock;
+    if (d->flash && (n_vocab != df2::vocab || n_rows < n_vocab || anchor < 0 || anchor >= n_vocab))
+        throw std::runtime_error("DFlash2 requires the Inkling-2-Mini vocabulary");
+    static const bool use_graph = !getenv("IK2_DRAFT_GRAPH") || atoi(getenv("IK2_DRAFT_GRAPH"));
+    bool graph_ok = use_graph && (d->head_q8 || d->flash) && proposals >= 1 && proposals < kBlock;
+#ifdef STRATA_USE_HIP
+    static const bool bf16_mv = !getenv("IK2_DRAFT_BF16_MV") || atoi(getenv("IK2_DRAFT_BF16_MV"));
+    graph_ok = graph_ok && bf16_mv && C % 128 == 0 && d->F % 128 == 0 && (2 * d->R + 2 * C) % 128 == 0;
+#endif
+    Drafter::PropGraph* capture = nullptr;
+    int splits = 0;
+    if (graph_ok) {
+        const int bkt = (d->flash || P < 256) ? 0 : (P < 1024 ? 1 : (P < 4096 ? 2 : 3));
+        static constexpr int kSplits[4] = {2, 8, 16, 64};
+        d->h_meta[0] = P;
+        d->h_meta[1] = anchor;
+        auto& G = d->pgraph[proposals][bkt];
+        if (G.exec && (G.anchor_h != anchor_h || G.n_rows != n_rows || G.n_vocab != n_vocab)) {
+            cu(cudaGraphExecDestroy(G.exec), "pgraph destroy exec");
+            cu(cudaGraphDestroy(G.graph), "pgraph destroy");
+            G = {};
+        }
+        if (G.exec) {
+            cu(cudaGraphLaunch(G.exec, d->s), "pgraph launch");
+            cu(cudaStreamSynchronize(d->s), "propose");
+            std::memcpy(out, d->h_out, proposals * sizeof(int));
+            return;
+        }
+        capture = &G;
+        splits = kSplits[bkt];
+        G.anchor_h = anchor_h;
+        G.n_rows = n_rows;
+        G.n_vocab = n_vocab;
+        cu(cudaStreamBeginCapture(d->s, cudaStreamCaptureModeGlobal), "pgraph begin");
+        cu(cudaMemcpyAsync(d->d_meta, d->h_meta, 2 * sizeof(int), cudaMemcpyHostToDevice, d->s), "meta h2d");
+        init_block_kernel_d<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
+            anchor_h, d->mask, d->res, d->pos, d->toks, T, C, d->d_meta);
+    } else {
+        // Initialize the residual stream [anchor_h; mask x 7], block positions, and anchor token in one kernel.
+        // Layer 0 reads d->res and overwrites d->x, so d->x does not need pre-filling.
+        init_block_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
+            anchor_h, d->mask, d->res, d->pos, d->toks, T, C, P, anchor);
+    }
+    if (d->flash) df2::block(d, proposals);
+    else dspark_block(d, proposals, P, lm_f16, n_rows, n_vocab, splits);
     cu(cudaMemcpyAsync(d->h_out, d->toks + 1, proposals * 4, cudaMemcpyDeviceToHost, d->s), "tokens");
     if (capture) {
         cu(cudaStreamEndCapture(d->s, &capture->graph), "pgraph end");
@@ -624,7 +591,8 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
 }
 
 std::vector<CacheSpan> cache_spans(const Drafter* d) {
-    std::vector<CacheSpan> spans = {{d->f_rnn, 1, d->C * sizeof(float)}};
+    std::vector<CacheSpan> spans;
+    if (!d->flash) spans.push_back({d->f_rnn, 1, d->C * sizeof(float)});
     for (const auto& l : d->L) {
         const size_t stride = d->KV * 128 * (l.kc16 ? sizeof(uint16_t) : sizeof(float));
         spans.push_back({l.kc16 ? (void*)l.kc16 : (void*)l.kc, (size_t)l.cap, stride});
