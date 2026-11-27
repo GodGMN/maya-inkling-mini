@@ -1632,14 +1632,14 @@ float e4m3fn_to_f32_host(uint8_t q);
 // first token, a context shorter than a step, splits with and without keys; the FP8 cache with every finite byte
 // (the subnormals among them).
 #ifdef STRATA_USE_HIP
-constexpr int attention_formats = 4; // Half, E4M3 rows, E4M3 pages, block-scaled E2M1 rows.
+constexpr int attention_formats[] = {0, 1, 2, 3}; // Half, E4M3 rows, E4M3 pages, block-scaled E2M1 rows.
 #else
-constexpr int attention_formats = 2;
+constexpr int attention_formats[] = {0, 1, 3};
 #endif
 
 k::Fp8KvLayout test_fp8_layout(int format, int ring) {
-#ifdef STRATA_USE_HIP
     if (format == 3) return k::Fp8KvLayout::global_fp4();
+#ifdef STRATA_USE_HIP
     if (format == 2) return k::Fp8KvLayout::global_pages();
 #endif
     return ring;
@@ -1804,8 +1804,53 @@ void test_sparse_decode() {
     CU(cudaFree(pages)); CU(cudaFree(out)); CU(cudaFree(scratch));
 }
 
-#ifdef STRATA_USE_HIP
-void test_rdna3_deep_attention() {
+// Each captured launch owns one sequence slot and reads its position on replay.
+void test_fp4_sequence_replay() {
+    constexpr int slots = 2, cap = 19, D = 128, splits = 3;
+    std::vector<k::Fp4KvBlock> values(slots * cap * D / 32);
+    for (int slot = 0; slot < slots; ++slot)
+        for (int t = 0; t < cap; ++t)
+            for (int b = 0; b < D / 32; ++b) {
+                auto& block = values[(slot * cap + t) * (D / 32) + b];
+                block.scale = f2h_host(t + 1);
+                std::memset(block.pairs, slot ? 0xaa : 0x22, sizeof(block.pairs));
+            }
+    auto* cache = dev(values);
+    auto* q = dev(std::vector<uint16_t>(D, 0));
+    auto* zero = dev(std::vector<float>(16, 0));
+    auto* positions = dev_n<int>(slots);
+    auto* out = dev_n<float>(slots * D);
+    auto* scratch = dev_n<float>(k::attn_decode_mma_scratch(1, splits));
+    cudaStream_t stream;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    CU(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CU(cudaDeviceSynchronize());
+    CU(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    for (int slot = 0; slot < slots; ++slot) {
+        const auto* row = reinterpret_cast<const uint8_t*>(cache + slot * cap * (D / 32));
+        k::attn_decode_mma_fp8(q, zero, zero, row, row, k::Fp8KvLayout::global_fp4(), 1, 1,
+                               positions + slot, 0, splits, 1.f, 1.f, zero, 16, 1, cap,
+                               scratch, out + slot * D, nullptr, nullptr, stream);
+    }
+    CU(cudaStreamEndCapture(stream, &graph));
+    CU(cudaGraphInstantiate(&exec, graph, 0));
+    for (int replay = 0; replay < 2; ++replay) {
+        const int pos[slots] = {replay ? 18 : 0, replay ? 4 : 17};
+        CU(cudaMemcpy(positions, pos, sizeof(pos), cudaMemcpyHostToDevice));
+        CU(cudaGraphLaunch(exec, stream));
+        CU(cudaStreamSynchronize(stream));
+        std::vector<double> want(slots * D);
+        // All scores are zero. The extra sink contributes one to the denominator.
+        for (int slot = 0; slot < slots; ++slot)
+            std::fill_n(want.begin() + slot * D, D, (slot ? -.5 : .5) * (pos[slot] + 1));
+        expect("FP4 batch slots at replayed positions", host(out, want.size()), want, 1e-5, 1e-5);
+    }
+    CU(cudaGraphExecDestroy(exec)); CU(cudaGraphDestroy(graph)); CU(cudaStreamDestroy(stream));
+    CU(cudaFree(cache)); CU(cudaFree(q)); CU(cudaFree(zero)); CU(cudaFree(positions)); CU(cudaFree(out)); CU(cudaFree(scratch));
+}
+
+void test_deep_attention() {
     constexpr int n = 392957, D = 128, H = 3, T = 2, splits = 512, padded = ((n + 15) / 16) * 16;
     const int marks[] = {n / 20, n / 2, 19 * n / 20, n - 1};
     std::vector<uint8_t> keys(size_t(padded) * D), values(keys.size());
@@ -1855,7 +1900,8 @@ void test_rdna3_deep_attention() {
     }
     const char* prefill_names[] = {"393K linear causal prefill", "393K paged causal prefill", "393K FP4 causal prefill"};
     const char* decode_names[] = {"393K linear decode", "393K paged decode", "393K FP4 decode"};
-    for (int format : {1, 2, 3}) {
+    for (int format : attention_formats) {
+        if (!format) continue;
         const auto layout = test_fp8_layout(format, 0);
         auto* dk = format == 3 ? reinterpret_cast<uint8_t*>(dev(packed_k)) :
                    dev(format == 2 ? page_cache(keys, 1, false) : keys);
@@ -1872,7 +1918,6 @@ void test_rdna3_deep_attention() {
     }
     CU(cudaFree(dq)); CU(cudaFree(zero)); CU(cudaFree(pos)); CU(cudaFree(out)); CU(cudaFree(scratch));
 }
-#endif
 
 void test_attn_decode_mma() {
     const int D = 128, d_rel = 16;
@@ -1893,7 +1938,7 @@ void test_attn_decode_mma() {
         {12, 2, 2000, 256, 256, 400, 2, "ring 400, window 256, 6 heads"},
         {10, 2, 5000, 1024, 1024, 1056, 4, "ring 1056, window 1024, 5 heads"},
     };
-    for (int fp8 = 0; fp8 < attention_formats; ++fp8)
+    for (int fp8 : attention_formats)
         for (const Case& c : cases) {
             if (fp8 >= 2 && c.kv_cap) continue;
             const int H = c.H, KV = c.KV, n_pos = c.qpos + 1, rows = c.kv_cap > 0 ? c.kv_cap : n_pos;
@@ -2035,13 +2080,15 @@ void test_attn_flash() {
         {77, 1500, 1 << 30, 200, 0, 7, "attn_flash at 1500, 7 splits"},
         {70, 2000, 256, 256, 400, 2, "attn_flash ring 400, window 256"},
         {9, 40, 1 << 30, 64, 0, 7, "attn_flash 9 queries, empty splits"},
-#ifdef STRATA_USE_HIP
         {3, 0, 1 << 30, 23, 0, 7, "verify attention from 0, empty splits", true},
+        {1, 33, 1 << 30, 23, 0, 3, "verify one column tile", true},
+        {2, 95, 1 << 30, 23, 0, 3, "verify two column tiles", true},
+#ifdef STRATA_USE_HIP
         {8, 127, 64, 35, 0, 3, "verify attention with an unaligned window", true},
         {8, 127, 64, 35, 80, 3, "verify attention ring, three column tiles", true},
 #endif
     };
-    for (int fp8 = 0; fp8 < attention_formats; ++fp8) for (const Case& c : cases) {
+    for (int fp8 : attention_formats) for (const Case& c : cases) {
         if (fp8 >= 2 && c.kv_cap) continue;
         const int n_pos = c.qpos0 + c.Tq;   // positions written so far
         const int rows = c.kv_cap > 0 ? c.kv_cap : n_pos;
@@ -2085,7 +2132,7 @@ void test_attn_flash() {
         const int o_ld = H * D + (c.block ? 0 : 32);
         uint16_t* dq = dev(q16);
         float *db = dev(bias), *ds = dev(sink), *dout = dev_n<float>((size_t) c.Tq * o_ld);
-        const size_t scr = (size_t) 8 * c.Tq * H * (D + 2);
+        const size_t scr = c.block ? k::attn_block_scratch(H, c.Tq, c.n_split) : (size_t) 8 * c.Tq * H * (D + 2);
         float* dscr = dev_n<float>(scr);
         if (c.block) {
             int* pos = dev(std::vector<int>{c.qpos0});
@@ -2479,13 +2526,16 @@ float e4m3fn_to_f32_host(uint8_t q) {
     return sgn * std::ldexp(1.0f + (float) m / 8.0f, (int) e - 7);
 }
 
-#ifdef STRATA_USE_HIP
 void test_fp4_kv_write() {
     constexpr int D = 128, T = 3, KV = 2, P = 17, KD = D * KV;
     const auto layout = k::Fp8KvLayout::global_fp4();
     auto key = fvec(T * KD, 9.f), value = fvec(T * KD, 7.f);
     std::fill_n(key.begin(), 32, 0.f);
     std::fill_n(value.begin()+KD, 32, 0.f);
+    // An unclipped head with an exact scale exercises every E2M1 midpoint.
+    std::fill_n(key.begin() + D, D, 0.f);
+    const float midpoints[] = {.25f, -.75f, 1.25f, -1.75f, 2.5f, -3.5f, 5.f, 6.f};
+    std::copy_n(midpoints, 8, key.begin() + D);
     auto* dk = dev(key); auto* dv = dev(value);
     auto* q = dev(fvec(T * D)); auto* r = dev(fvec(T * 16));
     auto* kc = dev_n<uint8_t>((P + T) * KD / 32 * 18);
@@ -2497,6 +2547,7 @@ void test_fp4_kv_write() {
     for (bool keys : {true, false}) {
         const auto& input = keys ? key : value;
         auto actual = host(keys ? uk : uv, T * KD);
+        auto packed = host(reinterpret_cast<k::Fp4KvBlock*>(keys ? kc : vc) + P * KD / 32, T * KD / 32);
         int mismatch = 0;
         for (int h=0; h<T*KV; ++h) {
             double ss=0;
@@ -2508,12 +2559,19 @@ void test_fp4_kv_write() {
                 double peak=0;
                 for (int d=0; d<32; ++d) peak=std::max(peak,std::abs(src[d]*norm));
                 double block_scale=h2f_host(f2h_host(peak*external/6.))/external;
+                const auto& block = packed[(h * D + g) / 32];
+                mismatch += block.scale != f2h_host(peak * external / 6.);
                 for (int d=0; d<32; ++d) {
                     const double target=std::abs(src[d]*norm);
                     int best=0;
                     for (int i=1; i<8; ++i)
-                        if (std::abs(kv_fp4_levels[i]*block_scale-target)<std::abs(kv_fp4_levels[best]*block_scale-target))
-                            best=i;
+                        if (block_scale > 0) {
+                            const double error = std::abs(kv_fp4_levels[i] * block_scale - target);
+                            const double previous = std::abs(kv_fp4_levels[best] * block_scale - target);
+                            if (error < previous || (error == previous && !(i & 1))) best = i;
+                        }
+                    const int code = (block.pairs[d / 2] >> (4 * (d % 2))) & 15;
+                    mismatch += code != (best | (src[d] < 0.f ? 8 : 0));
                     const float wanted=std::copysign(kv_fp4_levels[best]*block_scale,src[d]);
                     mismatch += h2f_host(actual[h*D+g+d]) != h2f_host(f2h_host(wanted));
                 }
@@ -2524,7 +2582,6 @@ void test_fp4_kv_write() {
     for (auto* ptr : {dk, dv, q, r}) cudaFree(ptr);
     cudaFree(kc); cudaFree(vc); cudaFree(uk); cudaFree(uv);
 }
-#endif
 
 void test_fp8_kv() {
     // 1. All 254 finite E4M3FN byte values -> unpack_kv_fp8_to_f16 bit-for-bit equality vs exact FP16
@@ -2559,7 +2616,8 @@ void test_fp8_kv() {
         const int T = 5, H = 48, KV = 8, D = 128, d_rel = 16, kv_cap = 1056;
         const float qk_clip = 22.627416610717773f, rel_clip = 8.0f, eps = 1e-6f, alpha = 0.1f, n_floor = 128000.0f;
         const float k_scale = 16.0f, v_scale = 32.0f, k_inv = 1.0f / k_scale, v_inv = 1.0f / v_scale;
-        for (int full = 0; full < std::min(3, attention_formats); ++full) {
+        for (int full : attention_formats) {
+            if (full == 3) continue;
             const int cap = full ? 0 : kv_cap, pos0 = full ? 109 : 1054;
             const int kc_rows = full == 2 ? ((pos0 + T + 15) / 16) * 16 : cap > 0 ? cap : pos0 + T;
             auto q = fvec((size_t) T * H * D, 4.0f), qc = fvec((size_t) H * D, 2.0f),
@@ -3602,12 +3660,66 @@ void test_q8_verify_tile() {
     cudaFree(ds);
 }
 
+#ifndef STRATA_USE_HIP
+void test_linear_block_verify(int type, int T) {
+    constexpr int C = 96, F = 64;
+    auto raw = rand_blocks(type, 3 * C * F);
+    const size_t matrix = raw.size() / 3;
+    std::vector<float> weights(3 * C * F);
+    k::decode_host(type, raw.data(), weights.size(), weights.data());
+    auto x = fvec(T * C, 0.1f);
+    std::vector<int> tokens(2 * k::kGroupMax), rows(tokens.size());
+    std::vector<double> hidden(T * F), down(T * C);
+    for (int t = 0; t < T; ++t) {
+        tokens[t] = T - 1 - t;
+        rows[t] = (t + 1) % T;
+        for (int f = 0; f < F; ++f) {
+            double g = 0, u = 0;
+            for (int c = 0; c < C; ++c) {
+                const double v = x[tokens[t] * C + c];
+                g += v * weights[f * C + c];
+                u += v * weights[(F + f) * C + c];
+            }
+            hidden[rows[t] * F + f] = 4 * std::tanh(g / 4) / (1 + std::exp(-g)) * 25 * std::tanh(u / 25);
+        }
+    }
+    auto* w = dev(raw);
+    auto** blobs = dev(std::vector<const uint8_t*>{w, nullptr});
+    auto* counts = dev(std::vector<int>{T, 0});
+    auto* dt = dev(tokens);
+    auto* dr = dev(rows);
+    auto* dx = dev(x);
+    auto* limbs = dev_n<uint16_t>(T * 2 * C);
+    auto* dh = dev_n<uint16_t>(T * F);
+    auto* dy = dev_n<float>(T * C);
+    k::f16_limbs_rows(dx, T, C, limbs, 0);
+    k::experts_block_gu_linear(type, blobs, counts, dt, dr, 2, T, matrix, C, F, limbs, nullptr, nullptr, 4, 25, dh, 0);
+    auto h = host(dh, T * F);
+    std::vector<float> actual(h.size());
+    std::transform(h.begin(), h.end(), actual.begin(), h2f_host);
+    expect("block verify gate/up vs FP64", actual, hidden, 1e-3, 2e-3);
+    for (int t = 0; t < T; ++t)
+        for (int c = 0; c < C; ++c)
+            for (int f = 0; f < F; ++f)
+                down[t * C + c] += double(actual[t * F + f]) * weights[2 * C * F + c * F + f];
+    k::experts_block_down_linear(type, blobs, counts, dr, 2, 2 * matrix, C, F, dh, dy, 0);
+    expect("block verify down vs FP64", host(dy, down.size()), down, 1e-4, 0.01);
+    cudaFree(w); cudaFree(blobs); cudaFree(counts); cudaFree(dt); cudaFree(dr);
+    cudaFree(dx); cudaFree(limbs); cudaFree(dh); cudaFree(dy);
+}
+#endif
+
 void test_draft_attn_online() {
     constexpr int H = 4, Hkv = 2, D = 128, nq = 8, cap = 64, P = 90, window = 50;
     const int k_lo = std::max(0, P - window), nc = P - k_lo, nk = nc + nq;
     const float scale = 1.0f / std::sqrt((float) D);
     auto q = fvec((size_t) nq * H * D, 1.5f);
     auto kc = fvec((size_t) cap * Hkv * D, 1.0f), vc = fvec((size_t) cap * Hkv * D, 1.0f);
+    std::vector<uint16_t> kc16(kc.size()), vc16(vc.size());
+    for (size_t i = 0; i < kc.size(); ++i) {
+        kc[i] = h2f_host(kc16[i] = f2h_host(kc[i]));
+        vc[i] = h2f_host(vc16[i] = f2h_host(vc[i]));
+    }
     auto kb = fvec((size_t) nq * Hkv * D, 1.0f), vb = fvec((size_t) nq * Hkv * D, 1.0f);
     float *dq = dev(q), *dkc = dev(kc), *dvc = dev(vc), *dkb = dev(kb), *dvb = dev(vb);
     int* dP = dev(std::vector<int>{P});
@@ -3643,6 +3755,32 @@ void test_draft_attn_online() {
     expect("draft_attn online (ring wrap)", host(out, want.size()), want, 1e-4, 2e-5);
     k::draft_attn_graph(dq, dkc, dvc, dP, window, dkb, dvb, nq, H, Hkv, scale, 4, scratch, out, 0, cap);
     expect("draft_attn_graph online (d_P, S=4)", host(out, want.size()), want, 1e-4, 2e-5);
+    auto* dk16 = dev(kc16);
+    auto* dv16 = dev(vc16);
+    cudaStream_t stream;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    CU(cudaStreamCreate(&stream));
+    CU(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    k::draft_attn_f16_graph(dq, dk16, dv16, dP, window, dkb, dvb, nq, H, Hkv, scale, 4, scratch, out, stream, cap);
+    CU(cudaStreamEndCapture(stream, &graph));
+    CU(cudaGraphInstantiate(&exec, graph, 0));
+    for (int pos : {0, P}) {
+        CU(cudaMemcpy(dP, &pos, sizeof(pos), cudaMemcpyHostToDevice));
+        CU(cudaGraphLaunch(exec, stream));
+        CU(cudaStreamSynchronize(stream));
+        const auto result = host(out, want.size());
+        if (pos == P) expect("FP16 draft graph replay after ring wrap vs FP64", result, want, 1e-4, 2e-5);
+        else {
+            k::draft_attn(dq, dkc, dvc, 0, 0, dkb, dvb, nq, H, Hkv, scale, scratch, out, 0, cap);
+            const auto eager = host(out, want.size());
+            expect("FP16 draft graph at empty context", result, std::vector<double>(eager.begin(), eager.end()), 1e-4, 2e-5);
+        }
+    }
+    CU(cudaGraphExecDestroy(exec));
+    CU(cudaGraphDestroy(graph));
+    CU(cudaStreamDestroy(stream));
+    cudaFree(dk16); cudaFree(dv16);
     // Also verify vectorized multi-token mv_f16_rows (T=5, K=256)
     constexpr int N = 35, K = 256, T = 5;
     std::vector<uint16_t> W(N * K);
@@ -3771,6 +3909,114 @@ void test_rdna3_speculative_kernels() {
 #endif
 
 #ifndef STRATA_USE_HIP
+// Replay the same graph with fully distinct picks, then with hot experts. This also
+// checks that a smaller group count clears the unused groups from the previous replay.
+void test_batch_groups(int T, int ty) {
+    constexpr int K = 8, C = 320, F = 64;
+    const int S = T * K, E = S + 3;
+    const size_t matrix = C * F / k::block_values(ty) * k::block_bytes(ty);
+    auto weights = rand_blocks(ty, size_t(E) * 3 * C * F);
+    for (size_t off = 0; off < weights.size(); off += k::block_bytes(ty)) {
+        if (ty == k::kNVFP4) std::fill_n(weights.data() + off, 4, uint8_t(0x18));
+        else {
+            const uint16_t scale = f2h_host(1.f / 256);
+            std::memcpy(weights.data() + off, &scale, 2);
+        }
+    }
+    auto* pool = dev(weights);
+    std::vector<const uint8_t*> table(E);
+    for (int e = 0; e < E; ++e) table[e] = pool + e * 3 * matrix;
+    auto** tab = dev(table);
+    auto scales = fvec(E), weights_in = fvec(S);
+    auto* scale = dev(scales);
+    auto* w = dev(weights_in);
+    auto* top = dev_n<int>(S);
+    auto** blobs = dev_n<const uint8_t*>(S);
+    auto* n = dev_n<int>(S);
+    auto* tok = dev_n<int>(S * k::kGroupMax);
+    auto* row = dev_n<int>(S * k::kGroupMax);
+    auto* sg = dev_n<float>(S);
+    auto* su = dev_n<float>(S);
+    auto* wt = dev_n<float>(S);
+    auto* inv = dev_n<int>(S);
+    auto* x = dev(fvec(T * C));
+    auto* x16 = dev_n<uint16_t>(T * C);
+    k::to_f16(x, T * C, x16, 0);
+    auto* h = dev_n<uint16_t>(S * F);
+    auto* y = dev_n<float>(S * C);
+    auto* href = dev_n<uint16_t>(S * F);
+    auto* yref = dev_n<float>(S * C);
+    cudaStream_t stream;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    CU(cudaStreamCreate(&stream));
+    CU(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    k::group_route(top, w, S, K, tab, scale, nullptr, scale, blobs, n, tok, row, sg, su, wt, inv, stream);
+    k::experts_gate_up_swiglu_g(blobs, n, tok, row, S, ty, ty, matrix, x, C, F, sg, su, 20, 20, h, stream, x16);
+    k::experts_down_g(blobs, n, row, S, ty, 2 * matrix, h, C, F, y, stream);
+    CU(cudaStreamEndCapture(stream, &graph));
+    CU(cudaGraphInstantiate(&exec, graph, 0));
+    for (bool skew : {false, true}) {
+        std::vector<int> picks(S), tokens(S);
+        std::vector<const uint8_t*> per_slot(S);
+        std::vector<std::vector<int>> members(E);
+        for (int i = 0; i < S; ++i) {
+            const int t = i / K, rank = i % K;
+            // Expert E-1 receives 19 picks at T=32. Experts 1..7 receive all T.
+            const int e = skew ? (rank ? rank : t < 19 ? E - 1 : t + K) : i + 2;
+            picks[i] = e;
+            members[e].push_back(i);
+            per_slot[i] = table[e];
+            tokens[i] = t;
+        }
+        CU(cudaMemcpy(top, picks.data(), S * sizeof(int), cudaMemcpyHostToDevice));
+        CU(cudaGraphLaunch(exec, stream));
+        auto counts = host(n, S), rows = host(row, S * k::kGroupMax), toks = host(tok, S * k::kGroupMax);
+        auto ptrs = host(blobs, S);
+        auto gates = host(sg, S), ups = host(su, S), scaled = host(wt, S);
+        auto inverse = host(inv, S);
+        bool ok = true;
+        int groups = 0;
+        for (int i = 0; i < S; ++i) {
+            int e = picks[i];
+            ok &= gates[i] == scales[e] && ups[i] == 1 && scaled[i] == weights_in[i] * scales[e] && inverse[i] == i;
+            if (members[e].front() != i) continue;
+            for (int j = 0; j < int(members[e].size()); ++j) {
+                if (j % k::kGroupMax == 0) {
+                    ok &= ptrs[groups] == table[e] && counts[groups] == std::min(k::kGroupMax, int(members[e].size()) - j);
+                    ++groups;
+                }
+                int idx = (groups - 1) * k::kGroupMax + j % k::kGroupMax;
+                ok &= rows[idx] == members[e][j] && toks[idx] == members[e][j] / K;
+            }
+        }
+        expect_true("wide route chunks, scales and slot order", ok && std::all_of(counts.begin() + groups, counts.end(),
+                                                                                  [](int v) { return v == 0; }));
+        auto** refs = dev(per_slot);
+        auto* rt = dev(tokens);
+        k::experts_gate_up_swiglu(refs, rt, S, ty, ty, matrix, x, C, F, sg, su, 20, 20, href, 0);
+        k::experts_down(refs, S, ty, 2 * matrix, href, C, F, yref, 0);
+        auto actual_h = host(h, S * F), ref_h = host(href, S * F);
+        auto actual_y = host(y, S * C), ref_y = host(yref, S * C);
+        if (ty == k::kIQ4_NL) {
+            expect_true("wide IQ4_NL grouped SwiGLU bits", actual_h == ref_h);
+            expect_true("wide IQ4_NL grouped down bits", !std::memcmp(actual_y.data(), ref_y.data(), ref_y.size() * sizeof(float)));
+        } else {
+            std::vector<float> hidden(actual_h.size());
+            std::vector<double> reference(ref_h.size());
+            std::transform(actual_h.begin(), actual_h.end(), hidden.begin(), h2f_host);
+            std::transform(ref_h.begin(), ref_h.end(), reference.begin(), h2f_host);
+            expect(ty == k::kNVFP4 ? "wide NVFP4 grouped SwiGLU" : "wide Q8_0 grouped SwiGLU", hidden, reference, 2e-3, 5e-3);
+            expect(ty == k::kNVFP4 ? "wide NVFP4 grouped down" : "wide Q8_0 grouped down", actual_y, std::vector<double>(ref_y.begin(), ref_y.end()), 2e-3, 5e-3);
+        }
+        cudaFree(refs); cudaFree(rt);
+    }
+    cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
+    cudaFree(pool); cudaFree(tab); cudaFree(scale); cudaFree(w); cudaFree(top); cudaFree(blobs); cudaFree(n);
+    cudaFree(tok); cudaFree(row); cudaFree(sg); cudaFree(su); cudaFree(wt); cudaFree(inv); cudaFree(x); cudaFree(x16);
+    cudaFree(h); cudaFree(y); cudaFree(href); cudaFree(yref);
+}
+
 // A forced peak of six fixes each vector's UE4M3 scale. Off-grid inputs
 // distinguish native quantization from the FP16 fallback.
 void test_blackwell_group(int members, int K, int N, bool gate) {
@@ -3841,6 +4087,11 @@ int main(int argc, char** argv) {
     std::printf("ik2_kernels_test on %s (sm_%d%d)\n", p.name, p.major, p.minor);
 #endif
 #ifndef STRATA_USE_HIP
+    if (argc == 2 && !std::strcmp(argv[1], "--batch-mma")) {
+        setenv("IK2_GROUP_MMA", "3", 1);
+        for (int T : {16, 32}) test_batch_groups(T, k::kNVFP4);
+        return g_fail ? 1 : 0;
+    }
     if (argc == 2 && !std::strcmp(argv[1], "--blackwell")) {
         if (p.major != 12 || p.minor > 1) return 77;
         setenv("IK2_BLACKWELL_NVFP4", "1", 1);
@@ -3887,9 +4138,7 @@ int main(int argc, char** argv) {
     test_attn_f16();
     test_round2_fused();
     test_fp8_kv();
-#ifdef STRATA_USE_HIP
     test_fp4_kv_write();
-#endif
     test_round6();
     test_attn_flash();
     test_attn_decode_mma();
@@ -3899,13 +4148,22 @@ int main(int argc, char** argv) {
     test_experts_mma(256, 128, 5);
     test_q8_verify_tile();
     test_draft_attn_online();
+#ifndef STRATA_USE_HIP
+    for (int t = 2; t <= 8; ++t)
+        for (int type : {k::kIQ4_NL, k::kQ8_0}) test_linear_block_verify(type, t);
+#endif
 #ifdef STRATA_USE_HIP
     test_experts_mma(2304, 1152, 1);
     test_rdna3_speculative_kernels();
-    test_rdna3_deep_attention();
 #endif
+    test_deep_attention();
+    test_fp4_sequence_replay();
     test_sequence_kernels();
     test_sparse_decode();
+#ifndef STRATA_USE_HIP
+    for (int T : {16, 32})
+        for (int ty : {k::kIQ4_NL, k::kQ8_0, k::kNVFP4}) test_batch_groups(T, ty);
+#endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -24,10 +24,10 @@ struct Fp8KvLayout {
     const bool fp4;
 #ifdef STRATA_USE_HIP
     static constexpr Fp8KvLayout global_pages() { return Fp8KvLayout(true, false); }
+#endif
     static constexpr Fp8KvLayout global_fp4() { return Fp8KvLayout(false, true); }
 private:
     constexpr Fp8KvLayout(bool pages, bool packed) : ring_capacity(0), paged(pages), fp4(packed) {}
-#endif
 };
 
 // E2M1 cache block. The FP16 scale applies to 32 consecutive channels within a KV head.
@@ -232,6 +232,7 @@ void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* 
 /// The same grouped: group g's expert at blob[g], picked by n[g] <= 8 tokens - x rows tok[g * 8 + j], output (and, for
 /// down, input h) rows row[g * 8 + j] - its blocks read once for all of them.
 constexpr int kGroupMax = 8;
+constexpr int kGroupRouteSlots = 256;
 void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int ty_gate,
                        int ty_up, size_t eb0, const float* x, int C, int F, float* gu, cudaStream_t s);
 void enable_grouped_tensor_products(bool enabled);
@@ -555,8 +556,8 @@ void mv_f16_rows(const uint16_t* W, int N, int K, const float* x, int x_ld, int 
                  cudaStream_t s);
 /// x [T][C] as two FP16 limbs a token: out [T][2][C] (hi, lo).
 void f16_limbs_rows(const float* x, int T, int C, uint16_t* out, cudaStream_t s);
-/// route()'s picks of a window (S = T K <= 64 slots) grouped by expert on the device: blob [S], n [S] (0 past the
-/// last group), tok / row [S][kGroupMax], and a slot's sg, su, wt (down's scale folded) and inv (the slot).
+/// route()'s picks of a window (S = T K <= kGroupRouteSlots slots) grouped by expert on the device: blob [S], n [S] (0 past the
+/// last group, at most kGroupMax members per group), tok / row [S][kGroupMax], and a slot's sg, su, wt (down's scale folded) and inv (the slot).
 void group_route(const int* top, const float* w, int S, int K, const uint8_t* const* tab, const float* sg_t,
                  const float* su_t, const float* sd_t, const uint8_t** blob, int* n, int* tok, int* row, float* sg,
                  float* su, float* wt, int* inv, cudaStream_t s);
@@ -583,11 +584,15 @@ void prep_qkv_r_f16_block(float* q, int q_ld, const float* q_clip, const float* 
 /// route() for a window, a block a token (the same picks and weights to the bit).
 void route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
                 cudaStream_t s);
-/// experts_block_gu / _down over Q8_0 experts (a block's sum scaled in FP32: the int8 values exact).
-void experts_block_gu_q8(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
+#ifndef STRATA_USE_HIP
+/// Selected NVFP4 grouped MMA products for verification (bit 0 gate/up, bit 1 down).
+int block_nvfp4_mma_mask();
+#endif
+/// Q8_0 and IQ4_NL grouped products apply each block scale to its FP32 sum.
+void experts_block_gu_linear(int type, const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int T,
                          size_t off_up, int C, int F, const uint16_t* limbs, const float* sg, const float* su,
                          float gcap, float ucap, uint16_t* h, cudaStream_t s);
-void experts_block_down_q8(const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
+void experts_block_down_linear(int type, const uint8_t* const* blob, const int* n, const int* row, int G, size_t off_down, int C,
                            int F, const uint16_t* h, float* y, cudaStream_t s);
 /// attn_res_jobs for T tokens: job j's queries q + j nq C, its output out + j nq T C ([nq][T][C]).
 void attn_res_jobs_block(const ResStates& states, int n, const float* q, int nq, int jobs, int T, int C, float eps,
