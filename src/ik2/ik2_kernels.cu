@@ -1196,14 +1196,14 @@ __device__ __forceinline__ void fa_load_tile_wg(uint16_t* Ks, uint16_t* Vs, cons
 __device__ __forceinline__ uint2 kv_half4(const Fp4KvBlock* cache, size_t element) {
     const auto& block = cache[element / 32];
     uint16_t codes;
-    __builtin_memcpy(&codes, block.pairs + (element % 32) / 2, sizeof(codes));
+    std::memcpy(&codes, block.pairs + (element % 32) / 2, sizeof(codes));
 #if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
     const __half2 scale = __half2half2(__ushort_as_half(block.scale));
     auto pair = [&](uint8_t byte) {
         const __half2 values(__nv_cvt_fp4x2_to_halfraw2(byte, __NV_E2M1));
         const __half2 scaled = __hmul2(values, scale);
         uint32_t bits;
-        __builtin_memcpy(&bits, &scaled, sizeof(bits));
+        std::memcpy(&bits, &scaled, sizeof(bits));
         return bits;
     };
     return make_uint2(pair(codes), pair(codes >> 8));
@@ -1255,7 +1255,7 @@ __device__ __forceinline__ uint32_t fa_fp4_half2(unsigned codes, uint32_t scale)
     uint32_t halves;
 #if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
     const __half2 values(__nv_cvt_fp4x2_to_halfraw2(uint8_t(codes), __NV_E2M1));
-    __builtin_memcpy(&halves, &values, sizeof(halves));
+    std::memcpy(&halves, &values, sizeof(halves));
 #else
     // Half bits for |E2M1| are 0000, 3800, 3c00, 3e00, 4000, 4200, 4400, 4600.
     const unsigned selectors = ((codes & 7) << 4) | ((codes & 0x70) << 8);
@@ -6154,7 +6154,7 @@ __global__ void select_sparse_pages(const uint16_t* q, const uint8_t* kc, int gr
         for (int sample = 16; sample < kSparsePageSize; sample += 32) {
             const size_t row = (size_t)(page * kSparsePageSize + sample) * Hkv + head;
             uint32_t bytes;
-            __builtin_memcpy(&bytes, kc + row * 128 + lane * 4, sizeof(bytes));
+            std::memcpy(&bytes, kc + row * 128 + lane * 4, sizeof(bytes));
             const float2 a = e4m3fnx2_to_f2((uint16_t)bytes), b = e4m3fnx2_to_f2(bytes >> 16);
             for (int h = 0; h < group; ++h) {
                 const uint16_t* x = q + (head * group + h) * 128 + lane * 4;
