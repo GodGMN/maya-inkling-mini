@@ -63,14 +63,16 @@ class Scripted:
 
     def __init__(self, tok, *scripts):
         self.tok, self.max_context, self.scripts = tok, 32768, scripts
-        self.prompts, self.sampling = [], []
+        self.prompts, self.sampling, self.generated = [], [], []
         self.info = {"engine": "ik2", "engine_kind": "ik2"}
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.prompts.append(list(ids))
         self.sampling.append(dict(sampling or {}))
         text = self.scripts[min(len(self.prompts), len(self.scripts)) - 1]
+        self.generated.append([])
         for t in (self.tok.encode(text, parse_special=True) + [self.tok.special_tokens[EOS]])[:max_new]:
+            self.generated[-1].append(t)
             yield t
 
 
@@ -186,6 +188,33 @@ class Parser(unittest.TestCase):
                     with self.subTest(name=name, thinking=thinking, step=step):
                         self.assertEqual(self.feed(text, thinking, step), (reasoning, content, calls))
 
+    def test_recover_call_envelope(self):
+        args = {"city": 'Paris, "args": {}', "days": 0, "opts": [None, False, {"x": "<b>"}]}
+        value = json.dumps(args)
+        for body in (
+            '{"name":"get_weather""args":' + value + '}',
+            '{"name":"get_weather" ,,"args":' + value + '}',
+            '{"name":"get_weather", "args"' + value + '}',
+            '{"name":"get_weather","args"::' + value + '}',
+            '{"name":"get_weather","arguments":' + value + '} trailing',
+            '{"name":"get_weather","arguments":' + json.dumps(value) + '}',
+            '{"name":"get_weather","args":' + value,
+            '{"name":"get_weather","args":' + value + ',}',
+            value,
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(self.feed(MODEL + "get_weather" + CALL + body + END, False, 2),
+                                 ("", "", [("get_weather", args)]))
+
+    def test_invalid_arguments_stay_text(self):
+        for body in ('{"name":"get_weather"}', 'null', '{"args":false}', '{"args":[]}', '{"args":null}',
+                     '{"name":"get_weather""args":{"city":}}', '{"arguments":"{"}',
+                     '{"args":{},"arguments":{}}', '{"args":{},"args":{"city":"Paris"}}',
+                     '{"args":{}}{"args":{"city":"Paris"}}'):
+            with self.subTest(body=body):
+                self.assertEqual(self.feed(MODEL + "get_weather" + CALL + body + END, True, 1),
+                                 ("", body, []))
+
     def test_unfinished_call_is_text(self):
         r = InklingRewriter(thinking=False)
         out = r.feed(MODEL + "get_weather" + CALL + '{"name":"get_weather","args":{"ci') + r.finish()
@@ -263,6 +292,67 @@ class Serving(unittest.TestCase):
                     finally:
                         httpd.shutdown()
                         httpd.server_close()
+
+    def test_disabled_reasoning_over_http(self):
+        for path in ("chat/completions", "messages", "responses"):
+            for stream in (False, True):
+                for with_tools in (False, True):
+                    with self.subTest(path=path, stream=stream, tools=with_tools):
+                        fn = TOOLS[0]["function"]
+                        follow = call(fn["name"], {"city": "Paris"}) if with_tools else "OK" + END
+                        svc, eng, tok = service(MODEL + THINK + "secret draft", follow, model_name="inkling-2-mini")
+                        httpd = server.serve(svc, port=0)
+                        try:
+                            if path == "responses":
+                                body = {"input": "Hi", "reasoning": {"effort": 0.0}}
+                                tools = [{"type": "function", **fn}]
+                            elif path == "messages":
+                                body = {"messages": ASK, "max_tokens": 200, "thinking": {"type": "disabled"}}
+                                tools = [{"name": fn["name"], "input_schema": fn["parameters"]}]
+                            else:
+                                body = {"messages": ASK, "reasoning_effort": "none"} if stream else {
+                                    "messages": ASK, "chat_template_kwargs": {"enable_thinking": False}}
+                                tools = TOOLS
+                            if with_tools:
+                                body["tools"] = tools
+                            body.update(stream=stream, thinking_budget=5)
+                            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_port}/v1/{path}",
+                                                         json.dumps(body).encode(), {"Content-Type": "application/json"})
+                            with urllib.request.urlopen(req, timeout=10) as response:
+                                wire = response.read().decode()
+                            self.assertNotIn("secret", wire)
+                            reasoning_field = {"responses": '"type": "reasoning"', "messages": '"thinking_delta"',
+                                               "chat/completions": '"reasoning_content"'}[path]
+                            self.assertNotIn(reasoning_field, wire)
+                            if stream and not with_tools and path != "responses":
+                                frames = [json.loads(line[6:]) for line in wire.splitlines()
+                                          if line.startswith("data: ") and line != "data: [DONE]"]
+                                if path == "messages":
+                                    content = [f["delta"]["text"] for f in frames if f["type"] == "content_block_delta"]
+                                else:
+                                    content = [f["choices"][0]["delta"].get("content", "") for f in frames if f["choices"]]
+                                self.assertEqual("".join(content), "OK")
+                            else:
+                                self.assertIn("get_weather" if with_tools else "OK", wire)
+                            self.assertEqual(tok.decode(eng.generated[0]), MODEL + THINK)
+                            if with_tools:
+                                self.assertIn({"responses": "function_call", "messages": "tool_use",
+                                               "chat/completions": "tool_calls"}[path], wire)
+                                self.assertIn("Paris", wire)
+                            self.assertEqual(len(eng.prompts), 2)
+                            close = END if with_tools else END + MODEL + TEXT
+                            self.assertEqual(tok.decode(eng.prompts[1][len(eng.prompts[0]):]), MODEL + THINK + close)
+                        finally:
+                            httpd.shutdown()
+                            httpd.server_close()
+
+    def test_numeric_zero_and_disabled_tools(self):
+        for effort in (0, 0.0):
+            svc, eng, tok = service(MODEL + THINK + "secret", "OK" + END)
+            svc.loop_guard = False
+            got = answer(svc, {"messages": ASK, "tools": TOOLS, "tool_choice": "none", "reasoning_effort": effort})
+            self.assertEqual((got["reasoning"], got["done"]["reasoning_tokens"], got["content"]), ("", 0, "OK"))
+            self.assertTrue(tok.decode(eng.prompts[0]).endswith(MODEL + TEXT))
 
     def test_repeated_reasoning_can_finish_with_its_own_answer(self):
         draft = "Check hours at the end of each month. " * 3

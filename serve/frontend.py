@@ -287,7 +287,7 @@ def effort_kwargs(value) -> dict:
     """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
     if value is None or value == "":
         return {}
-    if value is False:
+    if value == 0:
         return {"enable_thinking": False}
     key = str(value).strip().lower()
     if key not in EFFORT:
@@ -769,13 +769,15 @@ def openai_to_messages(req: dict, deepseek: bool = False,
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
-    kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
+    kwargs.update(effort_kwargs(req.get("reasoning_effort", reasoning.get("effort"))))
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
     for k, v in (req.get("chat_template_kwargs") or {}).items():
         if k == "enable_thinking" and not v:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+    if req.get("enable_thinking") is False:
+        kwargs["enable_thinking"] = False
     if glm_dsa:
         kwargs.update(_clear_thinking(req))
     # "required" / a named function: the answer starts with the call (Service.prepare; from Strata #790)
@@ -845,10 +847,12 @@ def anthropic_to_messages(req: dict, deepseek: bool = False,
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
         kwargs["enable_thinking"] = False
-    elif effort or (deepseek and effort is not None and effort != ""):
+    elif effort is not None and effort != "":
         kwargs.update(deepseek_effort_kwargs(effort) if deepseek else effort_kwargs(effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
+    if req.get("enable_thinking") is False:
+        kwargs["enable_thinking"] = False
     if glm_dsa:
         kwargs.update(_clear_thinking(req))
     tc = req.get("tool_choice") if isinstance(req.get("tool_choice"), dict) else {}
@@ -1373,7 +1377,8 @@ class InklingRewriter:
 
     MARKS = (INK_THINK, INK_TEXT, INK_CALL, INK_MODEL, INK_END, INK_EOS) + INK_OTHER_TEXT
 
-    def __init__(self, thinking: bool = True):
+    def __init__(self, thinking: bool = True, tools=None):
+        self.tools = {tool.get("name") for tool in tools or []}
         self.buf = ""
         self.mode = "lead"           # lead (before any segment) | think | text | name | call | between
         self.open = thinking         # the parser is in its reasoning state (it starts there when thinking)
@@ -1447,16 +1452,63 @@ class InklingRewriter:
 
     def _call(self) -> str:
         try:
-            j = json.loads(self.body)
-            name = (j.get("name") if isinstance(j, dict) else None) or self.name.strip()
-            args = (j.get("args") if isinstance(j, dict) else None) or {}
-            if not name or not isinstance(args, dict):
+            name, args = self._call_parts()
+            if not isinstance(name, str) or not name.strip() or "<" in name or not isinstance(args, dict):
                 raise ValueError(self.body)
+            if any("<" in key or key != key.strip() for key in args):
+                raise ValueError(self.body)  # these keys cannot round-trip through the GLM tags
+            fields = []
+            for key, value in args.items():
+                encoded = json.dumps(value, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c")
+                fields.append(ARG_KEY + key + ARG_KEY_END + ARG_VAL + encoded + ARG_VAL_END)
+            return self._close() + CALL_START + name + "".join(fields) + CALL_END
         except ValueError:
-            return self._close() + self.body   # (not a call the parser can read: its text, as the answer's)
-        val = lambda v: json.dumps(v, ensure_ascii=False).replace("<", "\\u003c")   # ("<" occurs in strings only)
-        return (self._close() + CALL_START + name +
-                "".join(ARG_KEY + k + ARG_KEY_END + ARG_VAL + val(v) + ARG_VAL_END for k, v in args.items()) + CALL_END)
+            return self._close() + self.body
+
+    def _call_parts(self):
+        decoder = json.JSONDecoder(object_pairs_hook=_inkling_object)
+        body = self.body.strip()
+        header = self.name.strip()
+        try:
+            obj, end = decoder.raw_decode(body)
+        except json.JSONDecodeError:
+            # Repair only the envelope. The name and argument value must each decode in full.
+            start = re.match(r'\{\s*"name"\s*:\s*', body)
+            if not start:
+                raise
+            name, end = decoder.raw_decode(body, start.end())
+            field = re.match(r'[\s,:]*"(args|arguments)"[\s:]*', body[end:])
+            if not field:
+                raise
+            value, end = decoder.raw_decode(body, end + field.end())
+            if not re.fullmatch(r"\s*(?:,\s*)?\}?", body[end:]):
+                raise
+            obj = {"name": name, field[1]: value}
+        else:
+            if not isinstance(obj, dict):
+                raise ValueError(body)
+            if not ({"name", "args", "arguments"} & obj.keys()):
+                if end == len(body) and header in self.tools:
+                    return header, obj
+                raise ValueError(body)
+            # A complete envelope may be followed by stray text, but never merge two calls.
+            if any(c in body[end:] for c in '{["'):
+                raise ValueError(body)
+        keys = obj.keys() - {"name"}
+        if keys not in ({"args"}, {"arguments"}):
+            raise ValueError(body)
+        key = next(iter(keys))
+        value = obj[key]
+        if key == "arguments" and isinstance(value, str):
+            value = decoder.decode(value)
+        return obj.get("name", header), value
+
+
+def _inkling_object(pairs):
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise ValueError("duplicate Inkling JSON key")
+    return obj
 
 
 class OutputParser:
@@ -1477,7 +1529,7 @@ class OutputParser:
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
         self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else \
-            InklingRewriter(thinking) if inkling else None   # (Inkling 2: its typed segments, InklingRewriter)
+            InklingRewriter(thinking, tools) if inkling else None   # (Inkling 2: its typed segments, InklingRewriter)
         self.buf = ""
         self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False

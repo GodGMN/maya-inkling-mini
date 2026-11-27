@@ -2575,10 +2575,10 @@ class RequestStat:
 class InklingThinkingBudget:
     """Count reasoning payload IDs across all decode slices of one request."""
 
-    def __init__(self, marks: dict[str, int], limit: int, max_new: int):
+    def __init__(self, marks: dict[str, int], limit: int, max_new: int, allow_tools: bool = False):
         self.think = marks[INK_THINK]
         self.markers = frozenset(marks.values())
-        self.close = (marks[INK_END], marks[INK_MODEL], marks[INK_TEXT])
+        self.close = (marks[INK_END],) if allow_tools else (marks[INK_END], marks[INK_MODEL], marks[INK_TEXT])
         self.answer_reserve = max(1, min(1024, max_new // 4))
         self.remaining = limit
         self.active = False
@@ -2828,7 +2828,7 @@ class Service:
         if effort:
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
-                if not req.get("reasoning_effort") and not req.get("reasoning") and \
+                if req.get("reasoning_effort") is None and not req.get("reasoning") and \
                         "enable_thinking" not in ctk and "reasoning_effort" not in ctk:
                     req["reasoning_effort"] = effort
                     filled = True
@@ -3818,14 +3818,13 @@ class Service:
                 prefill = "<|message_model|>" + (force + "<|content_invoke_tool_json|>" if force else "")
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
-        if not prefill and not tools and getattr(self.template, "inkling", False) and \
-                (kwargs.get("enable_thinking") is False or kwargs.get("reasoning_effort") == "none"):
-            # Inkling 2 has no switch for its thinking, only its effort level - and at the lowest ("none": 0.0) it
-            # still thinks a little.  With thinking off the prompt opens the answer's text segment itself, as the
-            # template writes an earlier turn that had no reasoning.  (With tools the turn is left to the model: its
-            # first segment may be a call.)
-            kwargs = {**kwargs, "enable_thinking": False}
-            prefill = "<|message_model|><|content_text|>"
+        if getattr(self.template, "inkling", False) and (
+                kwargs.get("enable_thinking") is False or kwargs.get("reasoning_effort") in ("none", 0)):
+            if not self.native_inkling_guard:
+                raise ValueError("disabling Inkling thinking requires single-token segment markers")
+            kwargs["enable_thinking"] = False
+            if not tools:
+                prefill = INK_MODEL + INK_TEXT
         given["_prefill"] = prefill
         if prefill and getattr(self.template, "hy4", False):
             # Hy4-flash: GLM's form under its own suffixed tags, inside its <tool_calls:..> wrapper.  The prompt gets
@@ -4694,8 +4693,11 @@ class Service:
                 in_think = bool(thinking) and self.think_end_id is not None   # (tracked with no budget too, #786)
                 requested_budget = (sampling or {}).get("thinking_budget")
                 think_budget = self.think_budget if requested_budget is None else requested_budget
-                ink_budget = InklingThinkingBudget(self.inkling_marks, think_budget, max_new) if (
-                    self.native_inkling_guard and thinking and think_budget > 0) else None
+                ink_budget = None
+                if self.native_inkling_guard and (not thinking or think_budget > 0):
+                    # Disabling reasoning takes precedence over any token allowance.
+                    ink_budget = InklingThinkingBudget(self.inkling_marks, think_budget if thinking else 0,
+                                                       max_new, allow_tools=bool(tools) and not thinking)
                 budgeted = in_think and think_budget > 0   # (0 = no budget: the end token is still tracked)
                 # The thinking budget is the config's ("thinking_budget"); a request's max_tokens (or the context
                 # left) lowers it only when that output limit is tiny, THINK_TINY_LIMIT (1024) tokens or fewer - a
@@ -4833,7 +4835,7 @@ class Service:
                         if my_first is None:
                             my_first = time.time()
                         raw_ids.append(t)
-                        if t == direct_end:
+                        if t == direct_end and parser.dsml.mode != "think":
                             finish = "stop"
                             break
                         end_think = bool(in_think and t == self.think_end_id)
