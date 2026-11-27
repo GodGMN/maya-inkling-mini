@@ -11,6 +11,8 @@ Choose a JSON file from `docs/inkling2-mini/`. Each preset uses a 1,024-token pr
 | DGX Spark GB10, 121 GiB | 32 concurrent streams | `dgx-spark-batched-nvfp4.json` | UD-Q4_K_XL | FP8 | 131,072 total (4,096 per stream) |
 | DGX Spark GB10, 121 GiB | One very long conversation | `dgx-spark-longctx-fp4.json` | IQ4_NL | FP4 global | 1,048,576 |
 
+On the DGX Spark, 32-stream batching reaches 130.3 tok/s with `UD-Q4_K_XL` (native NVFP4) and 119.0 tok/s with `IQ4_NL`.
+
 The project reports hardware measurements for the RX 7900 XTX, A100-SXM4-80GB and GB10. The context budgets above are configuration values. Available memory and other GPU workloads affect how much fits.
 
 ## Run a preset

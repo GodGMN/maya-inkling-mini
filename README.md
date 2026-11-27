@@ -13,7 +13,7 @@ Tintero is a local Linux inference server for [Inkling-2-Mini](https://huggingfa
 | A100 80 GB | CUDA `sm_80` | **98.8** | — | 2,184 | 393K (FP8) |
 | DGX Spark GB10 | CUDA `sm_121a` | **49.1** | 130.3 | 1,366 | 1M (FP8 / FP4) |
 
-All figures in tok/s. Decode is one stream after a 512-token prompt (`IQ4_NL`); DGX Spark batched (`130.3`) and peak prefill (`1,366`) use `UD-Q4_K_XL` native NVFP4 (`119.0 tok/s` batched on `IQ4_NL`, `0.6 s` resident load). Runtime abliteration (`v21-pc4`) costs 2–3.5% of decode speed.
+All figures in tok/s. Decode is one stream after a 512-token prompt. DGX Spark batched and prefill use the `UD-Q4_K_XL` GGUF; the others use `IQ4_NL`. Runtime abliteration (`v21-pc4`) costs 1.8–3.4% of decode speed.
 
 Both backends support continuous batching, FP8/FP4-global KV cache, sparse long-context decode, graphed MTP speculative decoding, and runtime abliteration. CUDA covers `sm_80` through `sm_121a` (Ampere through Blackwell, x86_64 and ARM64). See [presets](docs/PRESETS.md) and [settings](docs/SETTINGS.md).
 
