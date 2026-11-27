@@ -7,32 +7,72 @@ Tintero is a local Linux inference server for [Inkling-2-Mini](https://huggingfa
 
 ### Tested hardware
 
-| Backend | Target | Tested GPU | Single-stream decode (512p) | Abliterated (`v21-pc4`) | Batched / Prefill / Long-context notes |
-|---|---|---|---:|---:|---|
-| **AMD HIP** | `gfx1100` (RDNA3) | RX 7900 XTX (24 GB) | **117.1 tok/s** | 114.6 tok/s (`-3.4%`) | Up to **327.8 tok/s** across 32 streams (`IK2_BATCH`); 393K FP8 KV |
-| **NVIDIA CUDA** | `sm_80+` (Ampere–Blackwell) | A100-SXM4-80GB (`sm_80`) | **98.8 tok/s** | 95.6 tok/s (`-3.3%`) | **2,155–2,184 tok/s** prefill (4K–32K); 393K FP8 KV |
-| **NVIDIA CUDA** | `sm_121a` (Grace Blackwell, ARM64) | DGX Spark GB10 (121 GiB unified) | **49.1 tok/s** | 48.2 tok/s (`-1.8%`) | Up to **99.5 tok/s** across 32 streams (`IK2_BATCH`); **1,139 tok/s** peak prefill; **1M** FP8 KV (`16.2 GiB`); **40.9 tok/s** at 256K (`IK2_SPARSE_DECODE=1`); **0.6 s** resident load (`IK2_FAST_LOAD=1`) |
+| GPU | Backend | Decode | Batched (32 streams) | Prefill | Max KV |
+|---|---|---:|---:|---:|---:|
+| RX 7900 XTX 24 GB | HIP `gfx1100` | **117.1** | 327.8 | — | 393K (FP8) |
+| A100 80 GB | CUDA `sm_80` | **98.8** | — | 2,184 | 393K (FP8) |
+| DGX Spark GB10 | CUDA `sm_121a` | **49.1** | 130.3 | 1,366 | 1M (FP8 / FP4) |
+
+All figures in tok/s. Decode is one stream after a 512-token prompt (`IQ4_NL`); DGX Spark batched (`130.3`) and peak prefill (`1,366`) use `UD-Q4_K_XL` native NVFP4 (`119.0 tok/s` batched on `IQ4_NL`, `0.6 s` resident load). Runtime abliteration (`v21-pc4`) costs 2–3.5% of decode speed.
+
+Both backends support continuous batching, FP8/FP4-global KV cache, sparse long-context decode, graphed MTP speculative decoding, and runtime abliteration. CUDA covers `sm_80` through `sm_121a` (Ampere through Blackwell, x86_64 and ARM64). See [presets](docs/PRESETS.md) and [settings](docs/SETTINGS.md).
 
 [![RX 7900 XTX: one chat generates 117.1 tokens/s after a 512-token prompt. Total batched throughput reaches 327.8 tokens/s across 32 streams.](docs/assets/rx7900xtx-speed.svg)](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
-
-> [!NOTE]
-> Both **AMD HIP (`gfx1100`)** and **NVIDIA CUDA (`sm_80`–`sm_121a`, Linux x86_64 & ARM64)** support full-resident inference, runtime abliteration, `IK2_BATCH` continuous batching (bit-exact greedy parity), and `IK2_SPARSE_DECODE=1` long-context FP8 decode. Blackwell `sm_120a`/`sm_121a` additionally supports native block-scaled FP4 MMA (`IK2_BLACKWELL_NVFP4=1`) and `2 × 64 MiB` pinned-staging fast loads (`IK2_FAST_LOAD=1`).
 
 ## Quick start
 
 > [!TIP]
 > Using a coding agent? Send it this README and ask: “Set up Tintero on this machine and verify it with the test request below.”
 
-This starts a text-only OpenAI-compatible server on Linux. You’ll need a GPU with **24 GB+ VRAM** (AMD ROCm under `/opt/rocm` for `gfx1100`, or NVIDIA CUDA Toolkit for `sm_80+`), a C++20 compiler, CMake 3.24+, Ninja, Git, and Python 3.10+ with `venv`. The `IQ4_NL` model download is about 18 GB.
+You need Linux, a GPU with **24 GB+ VRAM**, and Docker (with the NVIDIA Container Toolkit for CUDA, or ROCm drivers for AMD). The `IQ4_NL` model download is about 18 GB.
 
-**1. Clone and build Tintero.** Pick the command for your GPU:
+**1. Download the model and export the tokenizer.**
+
+```sh
+mkdir -p models ik2
+hf download ggml-org/Inkling-2-Mini-GGUF Inkling-2-Mini-IQ4_NL.gguf --local-dir models
+docker run --rm --entrypoint python3 \
+  -v "$PWD/models:/opt/tintero/models:ro" -v "$PWD/ik2:/opt/tintero/ik2" \
+  ghcr.io/godgmn/tintero:v0.1.0-cuda \
+  tools/strata_tokenizer.py --gguf models/Inkling-2-Mini-IQ4_NL.gguf \
+  --out ik2 --chat-template tools/ik2/chat_template.jinja
+```
+
+*(On AMD, use `ghcr.io/godgmn/tintero:v0.1.0-hip-gfx1100` in the tokenizer command above.)*
+
+**2. Start the server.**
+
+```sh
+# NVIDIA (RTX 30/40/50, A100, H100, DGX Spark — x86_64 & ARM64)
+docker run -d --name tintero --gpus all -p 127.0.0.1:8085:8080 \
+  -v "$PWD/models:/opt/tintero/models:ro" -v "$PWD/ik2:/opt/tintero/ik2:ro" \
+  ghcr.io/godgmn/tintero:v0.1.0-cuda
+
+# AMD RX 7900 XTX (RDNA3 gfx1100)
+docker run -d --name tintero --device=/dev/kfd --device=/dev/dri -p 127.0.0.1:8085:8080 \
+  -v "$PWD/models:/opt/tintero/models:ro" -v "$PWD/ik2:/opt/tintero/ik2:ro" \
+  ghcr.io/godgmn/tintero:v0.1.0-hip-gfx1100
+```
+
+Each image starts with a 24 GB preset by default. For an 80 GB card or a DGX Spark (single-stream, 32-stream NVFP4 batching, or 1M FP4-global context), pass `-e TINTERO_CONFIG=docs/inkling2-mini/<preset>.json` from [docs/PRESETS.md](docs/PRESETS.md). Pass `-e TINTERO_MODEL=models/<file>.gguf` to switch GGUF files, and `-e IK2_ABLATE_MODE=on` for runtime abliteration.
+
+<details>
+<summary>Without Docker: prebuilt release tarball or build from source</summary>
+
+**Prebuilt Ubuntu 24.04 tarballs** (`x86_64-cuda`, `aarch64-cuda`, `x86_64-hip-gfx1100`) are attached to each [GitHub Release](https://github.com/GodGMN/tintero/releases). Extract into an empty directory on a host with matching CUDA 13.1 or ROCm 7.2 runtime libraries, install `requirements.txt` in a Python `venv`, export the tokenizer, and run:
+
+```sh
+TINTERO_CONFIG=docs/inkling2-mini/cuda-24gb-fp4.json ./entrypoint.sh --host 127.0.0.1 --port 8085
+```
+
+**Build from source** (requires a C++20 compiler, CMake 3.24+, Ninja, Git, Python 3.10+ with `venv`, and either ROCm under `/opt/rocm` or the NVIDIA CUDA Toolkit):
 
 ```sh
 git clone https://github.com/GodGMN/tintero
 cd tintero
 ```
 
-**AMD HIP (`gfx1100`, tested with ROCm 7.2.1):**
+AMD HIP (`gfx1100`, tested with ROCm 7.2.1):
 
 ```sh
 cmake -S . -B build-ik2 -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -42,7 +82,7 @@ cmake -S . -B build-ik2 -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-ik2 --target tintero -j4
 ```
 
-**NVIDIA CUDA (`sm_80+` — RTX 30/40/50 series, A100, H100, DGX Spark):**
+NVIDIA CUDA (`sm_80+` — RTX 30/40/50 series, A100, H100, DGX Spark):
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -52,39 +92,17 @@ cmake --build build --target tintero ik2_kernels_test -j4
 ./build/ik2_kernels_test
 ```
 
-**2. Download the model and start the server.** Run these commands from the same directory.
+Install Python dependencies, download the model, export the tokenizer, and start a preset from [docs/PRESETS.md](docs/PRESETS.md):
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install huggingface_hub numpy jinja2 regex pyyaml requests pillow psutil 'jsonschema>=4.18,<5'
+python -m pip install -r docker/requirements.txt huggingface_hub
 hf download ggml-org/Inkling-2-Mini-GGUF Inkling-2-Mini-IQ4_NL.gguf --local-dir models
 python tools/strata_tokenizer.py --gguf models/Inkling-2-Mini-IQ4_NL.gguf \
   --out ik2 --chat-template tools/ik2/chat_template.jinja
-```
-
-Start with the preset for your backend:
-
-```sh
-# AMD RX 7900 XTX (HIP)
-python serve/server.py --engine maya --config docs/inkling2-mini/ik2-mini-gfx1100.json \
+python serve/server.py --engine maya --config docs/inkling2-mini/cuda-24gb-fp4.json \
   --host 127.0.0.1 --port 8085
-
-# NVIDIA GPU (CUDA) — update the model filename in docs/inkling2-mini/ik2-mini-text.json if using IQ4_NL
-python serve/server.py --engine maya --config docs/inkling2-mini/ik2-mini-text.json \
-  --host 127.0.0.1 --port 8085
-```
-
-<details>
-<summary>Already have the AMD r6 Docker image? Start it here instead.</summary>
-
-With the Hugging Face CLI installed and the image loaded locally (runs stock Inkling by default; pass `-e IK2_ABLATE_MODE=on` for runtime abliteration):
-
-```sh
-hf download ggml-org/Inkling-2-Mini-GGUF Inkling-2-Mini-IQ4_NL.gguf --local-dir models
-docker run -d --name inkling-2-mini --device /dev/kfd --device /dev/dri \
-  -v "$PWD/models:/opt/maya/models:ro" -e IK2_TEXT_ONLY=1 \
-  -p 127.0.0.1:8085:8080 hyperion/tintero:gfx1100-service-r6
 ```
 
 </details>
@@ -101,10 +119,11 @@ The answer is in `choices[0].message.content`. To connect a client, set its base
 
 ## Configuration and docs
 
-- [Runtime settings](docs/README.md#settings) cover context size, concurrent requests, sparse decode, and runtime abliteration (`IK2_ABLATE*`).
-- [Vision](docs/HIP-PORT.md#image-encoder-on-the-ryzen-5-3600) requires the image encoder and `mmproj-F16.gguf`. The AMD r6 Docker image includes the encoder.
-- [HIP port & benchmarks](docs/HIP-PORT.md) document the full 393K FP8/FP4 context measurements and kernel parity tests.
+- [Hardware presets](docs/PRESETS.md) list ready-to-run configs for 24 GB CUDA cards, 80 GB GPUs, DGX Spark GB10, and RX 7900 XTX.
+- [Runtime settings](docs/SETTINGS.md) cover context size, KV precision (`fp8` / `fp4-global`), concurrent batching, speculative decoding, and runtime abliteration (`IK2_ABLATE*`).
+- [Vision](docs/HIP-PORT.md#image-encoder-on-the-ryzen-5-3600) requires the image encoder and `mmproj-F16.gguf`.
+- [HIP port & benchmarks](docs/HIP-PORT.md) document the 393K FP8/FP4 context measurements and kernel parity tests.
 
 ## Credits
 
-Tintero builds on [Maya’s Inkling engine](https://github.com/alesha-pro/maya-inkling-mini). [Project Maya](https://github.com/mw00/project-maya) grew out of [Strata](https://github.com/Niko1221/Strata). Thinking Machines released the model, and [ggml-org](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF) provides the IQ4_NL weights. [MIT license](LICENSE)
+Tintero builds on [Maya’s Inkling engine](https://github.com/alesha-pro/maya-inkling-mini). [Project Maya](https://github.com/mw00/project-maya) grew out of [Strata](https://github.com/Niko1221/Strata). Thinking Machines released the model, and [ggml-org](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF) and [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) provide the GGUF weights. [MIT license](LICENSE)
