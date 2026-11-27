@@ -31,7 +31,9 @@ constexpr int kTaps = 8, kBlock = 8;
 
 /// Load a DSpark or Mini DFlash2 checkpoint. A directory resolves to its model.safetensors.
 /// C is the target width and ctx is the cache capacity in positions.
-Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s);
+Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s, int slots = 1);
+/// Bind this slot's KV rings, Markov state and proposal graphs on the scheduler stream.
+void select_slot(Drafter* d, int slot);
 /// Destination for the normed target mask embedding, or nullptr for DSpark.
 float* dflash2_mask(Drafter* d);
 constexpr int kDFlash2MaskToken = 200056;
@@ -39,12 +41,17 @@ constexpr int kDFlash2MaskToken = 200056;
 void fold(Drafter* d, const uint16_t* lm_f16, int n_rows);
 /// The context caches for positions pos0 .. pos0 + m - 1 from tap rows r0 .. r0 + m - 1 (taps [8][ld][C] F32).
 void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos0);
+struct ContextWindow { int slot, first, count, position; };
+void commit_windows(Drafter* d, const float* taps, int ld, const std::vector<ContextWindow>& windows);
 /// f_rnn from tap row `row`.
 void set_f_rnn(Drafter* d, const float* taps, int ld, int row);
 /// Drafts 7 tokens (out, host) after the anchor at position P; anchor_h: its embedding, normed (device [C] F32).
 /// lm_f16: the target's output head; n_vocab: the real rows (the argmax's range).
 void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
              int* out, int proposals = kBlock - 1);
+/// Each token window starts with an anchor. Fill the remaining entries in place.
+void propose_batch(Drafter* d, int active, const int* slots, const int* positions, const float* embeddings,
+                   const uint16_t* lm_f16, int n_rows, int n_vocab, int window, int* tokens);
 /// The base logits through the target's head kept as planar Q8_0 (int8 [n_rows][C], FP16 scales [n_rows][C / 32]):
 /// propose's lm_f16 is not read then (the FP16 copy is fold()'s only).
 void set_head_q8(Drafter* d, const int8_t* q8, const uint16_t* q8d);

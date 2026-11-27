@@ -232,10 +232,14 @@ void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* 
 /// The same grouped: group g's expert at blob[g], picked by n[g] <= 8 tokens - x rows tok[g * 8 + j], output (and, for
 /// down, input h) rows row[g * 8 + j] - its blocks read once for all of them.
 constexpr int kGroupMax = 8;
-constexpr int kGroupRouteSlots = 256;
+constexpr int kGroupRouteSlots = 512;
 void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok, const int* row, int G, int ty_gate,
                        int ty_up, size_t eb0, const float* x, int C, int F, float* gu, cudaStream_t s);
 void enable_grouped_tensor_products(bool enabled);
+void experts_q8_verify(const uint8_t* const* blob, const int* counts, const int* tokens, const int* rows,
+                       int groups, int T, size_t up, size_t down, const float* x, int C, int F,
+                       const float* sg, const float* su, float gcap, float ucap, uint16_t* h, float* y,
+                       cudaStream_t stream);
 void experts_down_g(const uint8_t* const* blob, const int* n, const int* row, int G, int ty_down, size_t off_down,
                     const uint16_t* h, int C, int F, float* y, cudaStream_t s);
 /// Fused gate+up+softcapped-SwiGLU straight to h [S][F] FP16 (or h[row[g*8+t]][F] in _g, where sg/su are also
@@ -337,14 +341,12 @@ struct MvF16Job {
 struct MvF16Jobs { MvF16Job job[3] = {}; };
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
              cudaStream_t s);
-#ifdef STRATA_USE_HIP
 void sequence_attention_quantized(float* q, float* r, float* gate, int ld, const float* qclip, const float* rclip,
                             const float* keys, const float* values, uint8_t* kc, uint8_t* vc, Fp8KvLayout layout,
                             size_t stride, const int* slots, const int* pos, int T, int H, int KV, int dr,
                             float qcap, float rcap, float eps, float alpha, float floor, float kscale, float vscale,
                             const float* rel, int extent, int window, int splits, const float* sink,
-                            float* scratch, float* out, cudaStream_t stream);
-#endif
+                            float* scratch, float* out, cudaStream_t stream, uint16_t* q16);
 void mv_q8p_sequences(const int8_t* q, const uint16_t* d, int N, int K, const float* x, int rows,
                       float* y, int ldy, cudaStream_t s);
 void conv_sequences(const int* slots, int rows, const float* x, int ldx, MvConv cv, cudaStream_t s);
@@ -446,7 +448,7 @@ void draft_attn_graph(const float* q, const float* kc, const float* vc, const in
                       cudaStream_t s, int cap);
 void dflash2_attn(const float* q, const float* kc, const float* vc, const int* d_P, int window, const float* kb,
                       const float* vb, int nq, int H, int Hkv, float scale, int S, float* scratch, float* out,
-                      cudaStream_t s, int cap);
+                      cudaStream_t s, int cap, int active = 1, const int* slots = nullptr);
 void draft_attn_f16_graph(const float* q, const uint16_t* kc, const uint16_t* vc, const int* d_P, int window,
                           const float* kb, const float* vb, int nq, int H, int Hkv, float scale, int S, float* scratch,
                           float* out, cudaStream_t s, int cap);
@@ -545,6 +547,9 @@ size_t attn_block_scratch(int H, int T, int n_split);
 void conv_block(const float* x, int x_ld, float* hist, const float* w, const float* dyn, int d_ld, int heads, int T,
                 int C, const float* res, int res_ld, float* y, int y_ld, float* rec_old, float* rec_x,
                 cudaStream_t s);
+/// Each contiguous window uses the history and fixed-stride rollback record of its first row's slot.
+void conv_windows(const int* slots, int rows, int window, int record_stride, const float* x, int ldx,
+                  MvConv cv, float* old, float* inputs, cudaStream_t s);
 /// A conv's record of a window (conv_block's rec_old, rec_x) and its history.
 struct ConvRec {
     const float* old;

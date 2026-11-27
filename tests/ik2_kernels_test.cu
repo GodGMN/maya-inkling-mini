@@ -38,6 +38,10 @@ std::mt19937 rng(20261116);
         }                                                                                      \
     } while (0)
 
+void release(std::initializer_list<void*> buffers) {
+    for (void* ptr : buffers) CU(cudaFree(ptr));
+}
+
 float frand(float a = 1.0f) { return std::uniform_real_distribution<float>(-a, a)(rng); }
 std::vector<float> fvec(size_t n, float a = 1.0f) {
     std::vector<float> v(n);
@@ -127,7 +131,7 @@ void test_rms() {
         for (int d = 0; d < 128; ++d) want[(size_t) r * 128 + d] = x[(size_t) r * 128 + d] / std::sqrt(ss / 128 + 1e-6);
     }
     expect("rms (rows of 128)", host(dy, want.size()), want, 2e-5);
-    cudaFree(dx), cudaFree(dw), cudaFree(dy);
+    release({dx, dw, dy});
 }
 
 // the refusal ablation's projection: against a double reference, the component left along r, rows independent of T
@@ -166,7 +170,7 @@ void test_project_out() {
         const auto one = host(d1, D);
         expect_true("project_out row bits do not depend on T",
                     std::memcmp(one.data(), got.data() + (size_t) 4 * D, (size_t) D * sizeof(float)) == 0);
-        cudaFree(dy), cudaFree(d1);
+        release({dy, d1});
     }
     {   // per-row strengths: row t takes srow[t] * s (0 leaves it as it was)
         std::vector<float> srow(T);
@@ -180,7 +184,7 @@ void test_project_out() {
             for (int e = 0; e < D; ++e) want[(size_t) t * D + e] = x[(size_t) t * D + e] - srow[t] * d * r[e];
         }
         expect("project_out (per-row strengths)", host(dy, want.size()), want, 2e-5, 1e-4);
-        cudaFree(dy), cudaFree(ds);
+        release({dy, ds});
     }
     {   // norm-preserving: the projection, then each row back to its length
         float* dy = dev(x);
@@ -196,10 +200,10 @@ void test_project_out() {
             for (int e = 0; e < D; ++e) want[(size_t) t * D + e] *= std::sqrt(n0 / n1);
         }
         expect("project_out (norm kept)", host(dy, want.size()), want, 2e-5, 1e-4);
-        cudaFree(dy);
+        release({dy});
     }
     k::project_out(nullptr, dr, 1.0f, 0.0f, 0, D, 0);   // T 0: nothing
-    cudaFree(dr);
+    release({dr});
 }
 
 void test_l2clip() {
@@ -234,7 +238,7 @@ void test_l2clip() {
         std::snprintf(name, sizeof name, "l2clip G%d D%d%s%s (%d clipped)", G, D, scaled ? " scaled" : "",
                       tau ? " tau" : "", clipped);
         expect(name, host(dy, want.size()), want, 2e-5);
-        cudaFree(dx), cudaFree(dsc), cudaFree(dy), cudaFree(dpos);
+        release({dx, dsc, dy, dpos});
     }
     (void) th_cases;
 }
@@ -289,9 +293,9 @@ void test_conv() {
             std::snprintf(name, sizeof name, "conv4 %s, split at %d", with_dyn ? "dyn" : "static", tb);
             expect(name, host(dy, want.size()), want, 2e-5);
         }
-        cudaFree(hist);
+        release({hist});
     }
-    cudaFree(dx), cudaFree(dw), cudaFree(dd), cudaFree(dy);
+    release({dx, dw, dd, dy});
 }
 
 void test_attn_res(int T, int C) {
@@ -332,8 +336,8 @@ void test_attn_res(int T, int C) {
             char name[64];
             std::snprintf(name, sizeof name, "attn_res C=%d %d states, %d queries", C, n, nq);
             expect(name, host(dout, want.size()), want, 1e-4, 1e-6);
-            for (auto* p : ds) cudaFree(p);
-            cudaFree(dq), cudaFree(dout);
+            for (auto* p : ds) release({p});
+            release({dq, dout});
         }
 }
 
@@ -384,7 +388,7 @@ void test_attn_probs() {
             for (int j = 0; j < c.nk; ++j) want[(size_t) i * c.nk + j] = std::exp(l[j] - m) / sum;
         }
         expect(c.name, host(dl, want.size()), want, 2e-4, 1e-9);
-        cudaFree(dl), cudaFree(dr), cudaFree(dp), cudaFree(dsk);
+        release({dl, dr, dp, dsk});
     }
 
     // Batched attn_probs_f16: [H][Tq][nk] F32 logits + [Tq][H][d_rel] r + [Tq][H] sink -> [H][Tq][nk] FP16
@@ -444,7 +448,7 @@ void test_attn_probs() {
         for (size_t i = 0; i < raw2.size(); ++i) got[i] = h2f_host(raw2[i]);
         std::snprintf(nm, sizeof nm, "%s (f16, bias table)", c.name);
         expect(nm, got, want, 2e-3, 1e-4);
-        cudaFree(dl), cudaFree(dr), cudaFree(dp), cudaFree(dsk), cudaFree(dout), cudaFree(dbt);
+        release({dl, dr, dp, dsk, dout, dbt});
     }
 }
 
@@ -510,14 +514,14 @@ void test_route(int E) {
                        d2 = host(u2, K), e1 = host(x1, K), e2 = host(x2, K);
             same &= !std::memcmp(a1.data(), a2.data(), K * 4) && !std::memcmp(c1.data(), c2.data(), K * 4) &&
                     !std::memcmp(d1.data(), d2.data(), K * 4) && !std::memcmp(e1.data(), e2.data(), K * 4);
-            for (int* q : {t1, t2, k1, k2, i1, i2}) cudaFree(q);
-            for (float* q : {w1, w2, g1, g2, u1, u2, x1, x2, dr, db2}) cudaFree(q);
-            cudaFree(b1), cudaFree(bb2);
+            for (int* q : {t1, t2, k1, k2, i1, i2}) release({q});
+            for (float* q : {w1, w2, g1, g2, u1, u2, x1, x2, dr, db2}) release({q});
+            release({b1, bb2});
         }
         expect_true("route_token: route and route_gather's values to the bit (40 tokens, ties among them)", same);
-        cudaFree(dtab), cudaFree(dsg), cudaFree(dsu), cudaFree(dsd);
+        release({dtab, dsg, dsu, dsd});
     }
-    cudaFree(dl), cudaFree(db), cudaFree(dw), cudaFree(dt);
+    release({dl, db, dw, dt});
 }
 
 void test_moe_pieces() {
@@ -540,7 +544,7 @@ void test_moe_pieces() {
             ok &= std::fabs(guf[i] - v[i]) <= 6e-4f * std::fabs(v[i]) + 1e-7f;
         }
         expect_true("gather_f16: FP16 of the rows", ok);
-        cudaFree(dv), cudaFree(di), cudaFree(dg);
+        release({dv, di, dg});
     }
     auto sg = fvec(n, 2.0f), su = fvec(n, 3.0f);
     uint16_t *dgu = dev(gu), *dh = dev_n<uint16_t>((size_t) n * F);
@@ -556,7 +560,7 @@ void test_moe_pieces() {
             hf[(size_t) r * F + c] = h2f_host(h[(size_t) r * F + c]);
         }
     expect("swiglu_cap (FP16 out)", hf, want, 6e-4, 1e-6);
-    cudaFree(dgu), cudaFree(dh), cudaFree(dsg), cudaFree(dsu);
+    release({dgu, dh, dsg, dsu});
 
     // the combine: token t's K slots are rows inv[t][i] of y
     const int rows = T * K;
@@ -585,7 +589,7 @@ void test_moe_pieces() {
             }
         expect(add ? "moe_combine (add)" : "moe_combine (overwrite)", host(dout, w2.size()), w2, 2e-5, 2e-4);
     }
-    cudaFree(dy), cudaFree(dinv), cudaFree(dwt), cudaFree(dout);
+    release({dy, dinv, dwt, dout});
 
     auto lgt = fvec(50000, 90.0f);
     float* dlg = dev(lgt);
@@ -599,7 +603,7 @@ void test_moe_pieces() {
     std::vector<double> w4(o.size());
     for (size_t i = 0; i < o.size(); ++i) w4[i] = (double) o[i] / (1.0 + std::exp(-(double) g[i]));
     expect("gate_mul", host(dob, o.size()), w4, 2e-5);
-    cudaFree(dlg), cudaFree(dob), cudaFree(dgb);
+    release({dlg, dob, dgb});
 }
 
 // NVFP4 by the format's definition (ggml's dequantize_row_nvfp4): 64 values in 36 bytes - four UE4M3 scales, then for
@@ -666,7 +670,7 @@ void test_decode() {
             for (size_t i = 0; i < n; ++i) def &= (double) hostv[i] == nvfp4_def(raw.data(), i);
             expect_true("decode NVFP4: the format's definition", def);
         }
-        cudaFree(dr), cudaFree(d32), cudaFree(d16);
+        release({dr, d32, d16});
     }
 }
 
@@ -858,7 +862,7 @@ void test_experts_mv() {
                 }
             }
             expect(cs.tg == k::kIQ4_NL ? "IQ4_NL fused SwiGLU vs FP64" : "Q8_0 fused SwiGLU vs FP64", got, expected, 1e-3, 1e-4);
-            cudaFree(hidden); cudaFree(dg); cudaFree(du);
+            release({hidden, dg, du});
         }
         // S = 1 path (<4, 2> launch config)
         k::experts_gate_up(dblob, dtok, 1, cs.tg, cs.tu, eb0, dx, C, F, dgu, 0);
@@ -867,7 +871,7 @@ void test_experts_mv() {
         expect(name, host(dgu, 2 * F), std::vector<double>(want_gu.begin(), want_gu.begin() + 2 * F), 2e-4, 2e-3);
         std::snprintf(name, sizeof name, "experts_down S=1 %s", cs.name);
         expect(name, host(dy, C), std::vector<double>(want_y.begin(), want_y.begin() + C), 2e-4, 2e-3);
-        cudaFree(dpool), cudaFree(dblob), cudaFree(dx), cudaFree(dgu), cudaFree(dy), cudaFree(dtok), cudaFree(dh);
+        release({dpool, dblob, dx, dgu, dy, dtok, dh});
     }
 }
 
@@ -897,7 +901,7 @@ void test_rdna3_equal_attention_scores() {
     k::attn_decode_fp8_at(q, zero, zero, k0, v, 0, 1, 1, pos, 2, scale, 1.f / 32.f,
                           zero, 16, 0, nk, scratch, y, 0);
     expect("equal resident E4M3 scores in separate splits", host(y, D), expected, 0., 5e-6);
-    cudaFree(q); cudaFree(k0); cudaFree(v); cudaFree(zero); cudaFree(pos); cudaFree(scratch); cudaFree(y);
+    release({q, k0, v, zero, pos, scratch, y});
 }
 
 void test_rdna3_attention_output_projection() {
@@ -920,7 +924,7 @@ void test_rdna3_attention_output_projection() {
         for (int c = 0; c < width; ++c)
             expected[r] += (double)h2f_host(d[(r * width + c) / 32]) * q[r * width + c] * x[c];
     expect("RDNA3 3072-wide Q8 projection vs FP64", host(dy, rows), expected, 2e-5, 2e-5);
-    cudaFree(dx); cudaFree(dq); cudaFree(dd); cudaFree(dy);
+    release({dx, dq, dd, dy});
 }
 
 void test_rdna3_loop_gate() {
@@ -968,7 +972,7 @@ void test_rdna3_loop_gate() {
     }
     k::loop_gates(gates, jobs, 1, C, R, 1e-6f, scratch, 0);
     expect("three in-place BF16 loop gates vs FP64", host(dx, expected.size()), expected, 2e-5, 2e-6);
-    cudaFree(dx); cudaFree(dm); cudaFree(scratch); cudaFree(dw);
+    release({dx, dm, scratch, dw});
 }
 
 void test_iq4nl_gate_cancellation() {
@@ -997,7 +1001,7 @@ void test_iq4nl_gate_cancellation() {
     std::vector<float> activations;
     for (uint16_t bits : result) activations.push_back(h2f_host(bits));
     expect("IQ4_NL cancelling gate vs FP64", activations, std::vector<double>(F, expected), 5e-4, 1e-7);
-    cudaFree(hidden); cudaFree(input); cudaFree(tokens); cudaFree(blobs); cudaFree(pool);
+    release({hidden, input, tokens, blobs, pool});
 }
 #endif
 
@@ -1081,7 +1085,7 @@ void test_experts_grouped() {
         expect(name, host(y2, wb.size()), wb, 1e-4, 5e-3);
         for (void* q : {(void*) dpool, (void*) dblob, (void*) dgb, (void*) dtok, (void*) dgn, (void*) dgt, (void*) dgr,
                         (void*) dx, (void*) gu1, (void*) gu2, (void*) y1, (void*) y2, (void*) dh})
-            cudaFree(q);
+            release({q});
     }
 }
 
@@ -1112,7 +1116,7 @@ void test_attn_multi() {
         }
         expect(cs.name, got, want, 1e-4, 1e-6);
     }
-    for (float* p : {dk, dv, dq, dr, ds, dp, scratch, out, one}) cudaFree(p);
+    for (float* p : {dk, dv, dq, dr, ds, dp, scratch, out, one}) release({p});
 }
 
 void test_mv_blocks() {
@@ -1151,7 +1155,7 @@ void test_mv_blocks() {
         std::snprintf(name, sizeof name, "mv_blocks %s", cs.name);
         // Cancellation over K=4608..6144 random blocks leaves ~1e-2 F32 rounding residual (same as test_experts_grouped).
         expect(name, host(dy, N), want, 2e-4, K > 2048 ? 3e-2 : 2e-3);
-        cudaFree(dw), cudaFree(dx), cudaFree(dy);
+        release({dw, dx, dy});
     }
 }
 
@@ -1205,7 +1209,7 @@ void test_attn_decode() {
         }
         expect(cs.name, host(dout, want.size()), want, 2e-4, 1e-6);
     }
-    for (float* p : {dk, dv, dq, dr, ds, dp, scratch, dout}) cudaFree(p);
+    for (float* p : {dk, dv, dq, dr, ds, dp, scratch, dout}) release({p});
 }
 
 void test_argmax() {
@@ -1234,7 +1238,7 @@ void test_argmax() {
         expect_true("argmax_sum (unaligned)", host(dout, 1)[0] == want_unaligned);
         k::argmax_sum(da, db, dc, 777, dout, 0);
         expect_true("argmax_sum (single block)", host(dout, 1)[0] == 500);
-        cudaFree(da), cudaFree(db), cudaFree(dc), cudaFree(dout);
+        release({da, db, dc, dout});
     }
     // argmax_rows: 8 rows x 200058 cols with ld = 201024, plus single-block case
     {
@@ -1259,7 +1263,7 @@ void test_argmax() {
         for (int c = 1; c < 500; ++c)
             if (x[c] > x[w1]) w1 = c;
         expect_true("argmax_rows (1 x 500)", host(dout, 1)[0] == w1);
-        cudaFree(dx), cudaFree(dout);
+        release({dx, dout});
     }
     // argmax_gemv_f16: W [R][ld] FP16, x [R] F32, base [n] F32, bias_f16 [n] FP16
     {
@@ -1289,7 +1293,7 @@ void test_argmax() {
         expect_true("argmax_gemv_f16 (no base/bias, tail)", host(dout, 1)[0] == ref_gemv(0, ld, 200057, false, false));
         k::argmax_gemv_f16(dw + 1, ld, dx, dbase, dbias, R, 777, dout, 0);
         expect_true("argmax_gemv_f16 (unaligned, single)", host(dout, 1)[0] == ref_gemv(1, ld, 777, true, true));
-        cudaFree(dw), cudaFree(dbias), cudaFree(dx), cudaFree(dbase), cudaFree(dout);
+        release({dw, dbias, dx, dbase, dout});
     }
 }
 
@@ -1373,8 +1377,8 @@ void test_attn_f16() {
         expect("attn_multi_f16 ring 1056", got, want, 1e-4, 1e-6);
     }
 
-    for (uint16_t* p : {dk_lin, dv_lin, dk_ring, dv_ring}) cudaFree(p);
-    for (float* p : {dq, dr, ds, dp, scratch, out, one}) cudaFree(p);
+    for (uint16_t* p : {dk_lin, dv_lin, dk_ring, dv_ring}) release({p});
+    for (float* p : {dq, dr, ds, dp, scratch, out, one}) release({p});
 }
 
 // The resident token path's kernels: the planar Q8 product (with a short conv on some rows, with rows that take
@@ -1473,7 +1477,7 @@ void test_token_path() {
             std::vector<double> main_rows(N);
             for (int r = 0; r < N; ++r) main_rows[r] = dot(r, x);
             expect("attention main projection after side rows", host(dy, N), main_rows, 2e-4, 2e-3);
-            cudaFree(first); cudaFree(second); cudaFree(third);
+            release({first, second, third});
         }
 #endif
         // the sinks in the clips' launch: mv_f16's values to the bit
@@ -1488,11 +1492,11 @@ void test_token_path() {
                                  false, 0.1f, 128000.0f, 0, nullptr, 0, dwf, dx, K, dsk);
             const auto a = host(dsk, H), b = host(dyf, H);
             expect_true("prep_qkv_r_f16_at: the sinks are mv_f16's to the bit", !std::memcmp(a.data(), b.data(), H * 4));
-            for (float* p : {dqv, dkv, dvv, drv, dsk}) cudaFree(p);
-            cudaFree(dkc), cudaFree(dvc), cudaFree(dpos);
+            for (float* p : {dqv, dkv, dvv, drv, dsk}) release({p});
+            release({dkc, dvc, dpos});
         }
-        cudaFree(dq), cudaFree(dd), cudaFree(dwf);
-        for (float* p : {dx, dxa, dxb, dy, dh0, dw0, ddyn, dres, dh1, dw1, dy0, dy1, dyf}) cudaFree(p);
+        release({dq, dd, dwf});
+        for (float* p : {dx, dxa, dxb, dy, dh0, dw0, ddyn, dres, dh1, dw1, dy0, dy1, dyf}) release({p});
     }
     {   // rms_multi against rms; moe_combine_conv against moe_combine_f32 + conv4_res; attn_res_jobs against attn_res
         auto x3 = fvec((size_t) 3 * C, 3.0f), w3 = fvec((size_t) 3 * C);
@@ -1526,8 +1530,8 @@ void test_token_path() {
         k::attn_res_jobs(states, n, dqq, 2, 2, C, 1e-6f, rb4, 0);
         const auto a4 = host(ra4, (size_t) 4 * C), b4 = host(rb4, (size_t) 4 * C);
         expect_true("attn_res_jobs: two attn_res's values to the bit", !std::memcmp(a4.data(), b4.data(), a4.size() * 4));
-        for (float* p : {dx3, dw3, ya, yb, dyk, dwt, dha, dhb, dtw, dres, tmp, oa, ob, dst, dqq, ra4, rb4}) cudaFree(p);
-        cudaFree(dinv);
+        for (float* p : {dx3, dw3, ya, yb, dyk, dwt, dha, dhb, dtw, dres, tmp, oa, ob, dst, dqq, ra4, rb4}) release({p});
+        release({dinv});
     }
     {   // a looped layer's gate: y = (1 - tanh(F g)) x + tanh(G g) m, g = D [rms(x); rms(m)]
         const int T = 3, R = 64;
@@ -1577,7 +1581,7 @@ void test_token_path() {
         CU(cudaMemset(dy, 0, (size_t) T * C * sizeof(float)));
         k::loop_gate_blend(dx, dm, df, dgn, (size_t) T * C, dy, 0);
         expect("loop_gate_mix, loop_gate_blend (a chunk's)", host(dy, want.size()), want, 2e-4, 2e-4);
-        for (float* p : {dx, dm, dD, dF, dG, dy, dsc, da1, da2, dg, df, dgn}) cudaFree(p);
+        for (float* p : {dx, dm, dD, dF, dG, dy, dsc, da1, da2, dg, df, dgn}) release({p});
     }
 }
 
@@ -1599,7 +1603,7 @@ void test_cand_topk() {
         const int cnt = out[0];
         if (kind == 2) {
             expect_true("cand_topk: a flat row reports more values than the buffer holds", cnt == n);
-            cudaFree(dx);
+            release({dx});
             continue;
         }
         bool ok = cnt >= K && cnt <= cap;
@@ -1621,9 +1625,9 @@ void test_cand_topk() {
         std::snprintf(label, sizeof label, "cand_topk: the %d largest of %d are among its %d (%s)", K, n, cnt,
                       kind ? "ties" : "spread");
         expect_true(label, ok);
-        cudaFree(dx);
+        release({dx});
     }
-    cudaFree(dscr), cudaFree(dout);
+    release({dscr, dout});
 }
 
 float e4m3fn_to_f32_host(uint8_t q);
@@ -1680,6 +1684,45 @@ std::vector<uint8_t> page_cache(const std::vector<uint8_t>& linear, int heads, b
             for (int d = 0; d < 128; ++d)
                 pages[page_offset(t, h, d, heads, value)] = linear[((size_t)t * heads + h) * 128 + d];
     return pages;
+}
+
+// Two windows in non-adjacent slots, each rewound to a different accepted prefix.
+void test_window_rollback() {
+    constexpr int slots = 4, B = 5, T = 2 * B, C = 14, heads = 2, stride = 8, ld = C + 3;
+    auto input = fvec(T * ld), weights = fvec(4 * C), initial = fvec(slots * 3 * C);
+    auto residual = fvec(T * C), dynamic = fvec(T * heads * 4);
+    auto *x = dev(input), *w = dev(weights), *hist = dev(initial), *res = dev(residual), *dyn = dev(dynamic);
+    auto *old = dev_n<float>(slots * 3 * C), *record = dev_n<float>(slots * stride * C), *out = dev_n<float>(T * C);
+    std::vector<int> ids(T, 1);
+    std::fill_n(ids.begin(), B, 3);
+    auto* slots_d = dev(ids);
+    k::conv_windows(slots_d, T, B, stride, x, ld, {0, C, hist, w, dyn, heads, res, out}, old, record, 0);
+    std::vector<double> state(initial.begin(), initial.end()), kept(state), expected(T * C);
+    std::vector<k::ConvRec> recs;
+    for (int t = 0; t < T; ++t) {
+        const int slot = ids[t], offset = slot * 3 * C;
+        for (int c = 0; c < C; ++c) {
+            double* h = state.data() + offset + c;
+            const double taps[] = {h[0], h[C], h[2 * C], input[t * ld + c]};
+            double y = residual[t * C + c];
+            for (int j = 0; j < 4; ++j)
+                y += taps[j] * weights[4 * c + j] + taps[3 - j] * dynamic[(t * heads + c / (C / heads)) * 4 + j];
+            expected[t * C + c] = y;
+            h[0] = taps[1]; h[C] = taps[2]; h[2 * C] = taps[3];
+        }
+        if (t % B + 1 == (slot == 3 ? 1 : 4)) {
+            std::copy_n(state.begin() + offset, 3 * C, kept.begin() + offset);
+            recs.push_back({old + offset, record + slot * stride * C, hist + offset, C});
+        }
+    }
+    expect("multi-slot convolution", host(out, T * C), expected, 2e-5, 2e-5);
+    expect("multi-slot histories", host(hist, state.size()), state, 0, 0);
+    auto* records = dev(recs);
+    k::rollback_block(records, 1, 1, 0);
+    k::rollback_block(records + 1, 1, 4, 0);
+    expect("different accepted prefixes and untouched slots", host(hist, kept.size()), kept, 0, 0);
+    for (auto* ptr : {x, w, hist, res, dyn, old, record, out}) CU(cudaFree(ptr));
+    CU(cudaFree(records)); CU(cudaFree(slots_d));
 }
 
 void test_sequence_kernels() {
@@ -1997,10 +2040,10 @@ void test_attn_decode_mma() {
                     k::attn_multi_fp8(dq32, dr, ds, dk, dv, test_fp8_layout(fp8, 0), 1, H, KV, 0, n_pos, c.qpos,
                                       scale * k_inv, v_inv, dp, d_rel, c.extent, c.window, tmp, result, 0);
                     multi = host(result, (size_t)H * D);
-                    cudaFree(tmp), cudaFree(result);
+                    release({tmp, result});
                 }
                 CU(cudaDeviceSynchronize());
-                cudaFree(dk), cudaFree(dv);
+                release({dk, dv});
             } else {
                 uint16_t *dk = dev(k16), *dv = dev(v16);
                 k::attn_decode_mma_f16(dq, dr, ds, dk, dv, c.kv_cap, H, KV, nullptr, c.qpos, c.n_split, scale, dp, d_rel,
@@ -2008,7 +2051,7 @@ void test_attn_decode_mma() {
                 k::attn_decode_f16_at(dq32, dr, ds, dk, dv, c.kv_cap, H, KV, dpos, c.n_split, scale, dp,
                                       d_rel, c.extent, c.window, split_part, gated, 0);
                 CU(cudaDeviceSynchronize());
-                cudaFree(dk), cudaFree(dv);
+                release({dk, dv});
             }
             const int lo = std::max(0, c.qpos - (c.window < (1 << 30) ? c.window : c.qpos + 1) + 1);
             std::vector<double> want((size_t) H * D);
@@ -2051,7 +2094,7 @@ void test_attn_decode_mma() {
                 expect("paged scalar decode", scalar, ungated, 1e-3, 1e-5);
                 expect("paged multi-query decode", multi, ungated, 1e-3, 1e-5);
             }
-            cudaFree(dq32), cudaFree(gated), cudaFree(split_part);
+            release({dq32, gated, split_part});
             const auto got = host(dout, want.size());
             expect(label, got, want, 1e-2, std::max(1e-6, 1e-3 * mag));
             if (fp8) {   // the FP16 copy: the output's rounding
@@ -2060,8 +2103,8 @@ void test_attn_decode_mma() {
                 for (size_t i = 0; i < got.size(); ++i) same &= h16[i] == f2h_host(got[i]);
                 if (!same) expect_true("mma fp8: the FP16 copy is the output rounded", false);
             }
-            cudaFree(dq), cudaFree(dpos), cudaFree(dout16);
-            for (float* p : {dr, dp, ds, dout, dscr, dg}) cudaFree(p);
+            release({dq, dpos, dout16});
+            for (float* p : {dr, dp, ds, dout, dscr, dg}) release({p});
         }
 }
 
@@ -2147,32 +2190,32 @@ void test_attn_flash() {
                 k::attn_block_fp8(dq, rel, r_ld, ds, dk, dv, test_fp8_layout(fp8, c.kv_cap), H, KV, pos, c.Tq, c.n_split,
                                   scale, v_scale, pr, dr, c.extent, c.window, dscr, dout, g, gate_ld, out16, 0);
                 CU(cudaDeviceSynchronize());
-                cudaFree(dk), cudaFree(dv);
+                release({dk, dv});
             } else {
                 auto *dk = dev(kc), *dv = dev(vc);
                 k::attn_block_f16(dq, rel, r_ld, ds, dk, dv, c.kv_cap, H, KV, pos, c.Tq, c.n_split,
                                   scale, pr, dr, c.extent, c.window, dscr, dout, g, gate_ld, out16, 0);
                 CU(cudaDeviceSynchronize());
-                cudaFree(dk), cudaFree(dv);
+                release({dk, dv});
             }
             auto fp = host(dout, (size_t)c.Tq * o_ld);
             auto half = host(out16, fp.size());
             bool rounded = true;
             for (size_t k = 0; k < fp.size(); ++k) rounded &= half[k] == f2h_host(fp[k]);
             expect_true("verify attention returns rounded FP16 output", rounded);
-            cudaFree(pos), cudaFree(out16), cudaFree(rel), cudaFree(pr), cudaFree(g);
+            release({pos, out16, rel, pr, g});
         } else if (fp8) {
             uint8_t *dk = dev(fp8 == 2 ? page_cache(k8, KV, false) : k8), *dv = dev(fp8 == 2 ? page_cache(v8, KV, true) : v8);
             k::attn_flash_fp8(dq, q_ld, dk, dv, test_fp8_layout(fp8, c.kv_cap), H, KV, D, c.Tq, c.qpos0, scale, v_scale, db,
                               c.extent, c.window, ds, dout, o_ld, dscr, scr, c.n_split, 0);
             CU(cudaDeviceSynchronize());
-            cudaFree(dk), cudaFree(dv);
+            release({dk, dv});
         } else {
             uint16_t *dk = dev(kc), *dv = dev(vc);
             k::attn_flash_f16(dq, q_ld, dk, dv, c.kv_cap, H, KV, D, c.Tq, c.qpos0, scale, db, c.extent, c.window,
                               ds, dout, o_ld, dscr, scr, c.n_split, 0);
             CU(cudaDeviceSynchronize());
-            cudaFree(dk), cudaFree(dv);
+            release({dk, dv});
         }
         const auto out = host(dout, (size_t) c.Tq * o_ld);
         std::vector<float> got;
@@ -2208,8 +2251,8 @@ void test_attn_flash() {
         char name[96];
         std::snprintf(name, sizeof name, "%s %s", c.name, fp8 == 3 ? "block fp4" : fp8 == 2 ? "paged fp8" : fp8 ? "fp8" : "f16");
         expect(name, got, want, 1e-2, 2e-3);
-        cudaFree(dq);
-        for (float* p : {db, ds, dout, dscr}) cudaFree(p);
+        release({dq});
+        for (float* p : {db, ds, dout, dscr}) release({p});
     }
 }
 
@@ -2259,7 +2302,7 @@ void test_round2_fused() {
                 std::snprintf(nm, sizeof nm, "%s (f16)", cs.name);
                 expect(nm, got16, want, 2e-3, 1e-4);
             }
-            cudaFree(dx), cudaFree(dw), cudaFree(dy32), cudaFree(dy16);
+            release({dx, dw, dy32, dy16});
         }
     }
 
@@ -2291,7 +2334,7 @@ void test_round2_fused() {
             const auto got32 = host(do_, cs.n);
             expect(cs.write_f32 ? "gate_mul_f16 f32 updated" : "gate_mul_f16 f32 untouched", got32,
                    cs.write_f32 ? want : orig, 1e-5);
-            cudaFree(do_), cudaFree(dg), cudaFree(do16);
+            release({do_, dg, do16});
         }
     }
 
@@ -2367,8 +2410,8 @@ void test_round2_fused() {
             expect(full ? "prep_qkv_r_f16 full r" : "prep_qkv_r_f16 ring r", host(dr, wr.size()), wr, 2e-5);
             expect(full ? "prep_qkv_r_f16 full k" : "prep_qkv_r_f16 ring k", got_k, wk, 2e-3, 1e-4);
             expect(full ? "prep_qkv_r_f16 full v" : "prep_qkv_r_f16 ring v", got_v, wv, 2e-3, 1e-4);
-            for (float* p : {dq, dqc, dk, dv, dr, drc}) cudaFree(p);
-            cudaFree(dkc), cudaFree(dvc), cudaFree(dpos);
+            for (float* p : {dq, dqc, dk, dv, dr, drc}) release({p});
+            release({dkc, dvc, dpos});
         }
     }
 
@@ -2433,8 +2476,7 @@ void test_round2_fused() {
                 std::snprintf(nm, sizeof nm, "experts_gu_swiglu S=%d %s", S, cs.name);
                 expect(nm, got, want, 3e-3, 1e-2);
             }
-            cudaFree(dpool), cudaFree(dblob), cudaFree(dx), cudaFree(dgu), cudaFree(dsg), cudaFree(dsu), cudaFree(dones),
-                cudaFree(dtok), cudaFree(dh_ref), cudaFree(dh_got);
+            release({dpool, dblob, dx, dgu, dsg, dsu, dones, dtok, dh_ref, dh_got});
         }
     }
 
@@ -2516,7 +2558,7 @@ void test_round2_fused() {
             }
             for (void* p : {(void*) dpool, (void*) dgb, (void*) dgn, (void*) dgt, (void*) dgr, (void*) dx, (void*) dgu,
                             (void*) dsg, (void*) dsu, (void*) dones, (void*) dh_ref, (void*) dh_got})
-                cudaFree(p);
+                release({p});
         }
     }
 }
@@ -2530,7 +2572,6 @@ float e4m3fn_to_f32_host(uint8_t q) {
     return sgn * std::ldexp(1.0f + (float) m / 8.0f, (int) e - 7);
 }
 
-#ifdef STRATA_USE_HIP
 template<class Launch>
 float time_attention_graph(Launch launch, cudaStream_t stream) {
     cudaGraph_t graph;
@@ -2557,12 +2598,13 @@ float time_attention_graph(Launch launch, cudaStream_t stream) {
     return ms * 1000 / runs;
 }
 
-void test_fp4_sequence_attention(int depth, int rows_per_slot, bool time_graphs) {
-    constexpr int H = 24, KV = 8, D = 128, dr = 16, extent = 1024, window = 1 << 30;
+void test_sequence_attention(int depth, int rows_per_slot, bool time_graphs, bool ring = false) {
+    constexpr int H = 24, KV = 8, D = 128, dr = 16, extent = 1024;
+    const int window = ring ? 64 : 1 << 30;
     constexpr int KD = KV * D, HD = H * D, ld = 2 * HD + H * dr, slots = 3;
-    const int T = 2 * rows_per_slot, cap = depth + rows_per_slot + 8, splits = depth < 1024 ? 16 : 32;
-    const size_t stride = (size_t)cap * KD / 32 * sizeof(k::Fp4KvBlock);
-    const auto layout = k::Fp8KvLayout::global_fp4();
+    const int T = 2 * rows_per_slot, cap = ring ? 80 : depth + rows_per_slot + 8, splits = depth < 1024 ? 16 : 32;
+    const size_t stride = ring ? (size_t)cap * KD : (size_t)cap * KD / 32 * sizeof(k::Fp4KvBlock);
+    const auto layout = ring ? k::Fp8KvLayout(cap) : k::Fp8KvLayout::global_fp4();
     std::vector<int> slot_ids, positions;
     for (int t = 0; t < T; ++t) {
         slot_ids.push_back(t < rows_per_slot ? 2 : 0);
@@ -2572,8 +2614,13 @@ void test_fp4_sequence_attention(int depth, int rows_per_slot, bool time_graphs)
     auto* dp = dev(positions);
     std::vector<float> decoded((size_t)slots * cap * KD);
     std::vector<uint8_t> packed_k, packed_v;
-    fp4_fixture(packed_k, decoded);
-    fp4_fixture(packed_v, decoded);
+    if (ring) {
+        packed_k.assign(slots * stride, 0x30);
+        packed_v.assign(slots * stride, 0x38);
+    } else {
+        fp4_fixture(packed_k, decoded);
+        fp4_fixture(packed_v, decoded);
+    }
     auto *kc = dev(packed_k), *vc = dev(packed_v);
     auto *old_k = dev(packed_k), *old_v = dev(packed_v);
     auto qrg = fvec(T * ld);
@@ -2582,7 +2629,12 @@ void test_fp4_sequence_attention(int depth, int rows_per_slot, bool time_graphs)
     auto *sink = dev(fvec(T * H)), *rel = dev(fvec(extent * dr));
     auto *out = dev_n<float>(T * HD), *old_out = dev_n<float>(T * HD);
     auto* old_half = dev_n<uint16_t>(T * HD);
-    auto* scratch = dev_n<float>((size_t)T * H * splits * 130);
+    auto* scratch = dev_n<float>((size_t)T * k::attn_decode_mma_scratch(H, splits));
+#ifdef STRATA_USE_HIP
+    uint16_t* q16 = nullptr;
+#else
+    auto* q16 = dev_n<uint16_t>(T * HD);
+#endif
     cudaStream_t stream;
     CU(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     CU(cudaDeviceSynchronize());
@@ -2591,27 +2643,46 @@ void test_fp4_sequence_attention(int depth, int rows_per_slot, bool time_graphs)
             auto *krow = old_k + slot_ids[t] * stride, *vrow = old_v + slot_ids[t] * stride;
             auto *qr = old_q + t * ld, *r = qr + HD;
             k::prep_qkv_r_fp8_at(qr, nullptr, keys + t * KD, krow, values + t * KD, vrow, r, nullptr,
-                                 H, KV, D, dr, 22, 8, 1e-6f, dp + t, true, 0.2f, 64, layout,
-                                 16, 32, nullptr, stream);
+                                 H, KV, D, dr, 22, 8, 1e-6f, dp + t, !ring, 0.2f, 64, layout,
+                                 16, 32, q16, stream);
+#ifdef STRATA_USE_HIP
             k::attn_decode_fp8_at(qr, r, sink + t * H, krow, vrow, layout, H, KV, dp + t, splits,
                                   (1.f / std::sqrt((float)D)) / 16, 1.f / 32, rel, dr, extent, window,
                                   scratch, old_out + t * HD, stream, r + H * dr, old_half + t * HD);
+#else
+            k::attn_decode_mma_fp8(q16, r, sink + t * H, krow, vrow, layout, H, KV, dp + t, 0, splits,
+                                   (1.f / std::sqrt((float)D)) / 16, 1.f / 32, rel, dr, extent, window,
+                                   scratch, old_out + t * HD, r + H * dr, old_half + t * HD, stream);
+#endif
         }
     };
     auto batched = [&] {
         k::sequence_attention_quantized(q, q + HD, q + HD + H * dr, ld, nullptr, nullptr, keys, values,
                                         kc, vc, layout, stride, ds, dp, T, H, KV, dr, 22, 8, 1e-6f,
-                                        0.2f, 64, 16, 32, rel, extent, window, splits, sink, scratch, out, stream);
+                                        0.2f, 64, 16, 32, rel, extent, window, splits, sink, scratch, out, stream, q16);
     };
     per_row();
     batched();
     CU(cudaStreamSynchronize(stream));
-    expect_true("FP4 batch keys including untouched slots", host(kc, slots * stride) == host(old_k, slots * stride));
-    expect_true("FP4 batch values including untouched slots", host(vc, slots * stride) == host(old_v, slots * stride));
+    expect_true("batch keys including untouched slots", host(kc, slots * stride) == host(old_k, slots * stride));
+    expect_true("batch values including untouched slots", host(vc, slots * stride) == host(old_v, slots * stride));
     const auto actual = host(out, T * HD), expected = host(old_out, T * HD);
-    expect_true("FP4 batch attention equals per-row attention",
+    expect_true("batch attention equals per-row attention",
                 std::all_of(actual.begin(), actual.end(), [](float v) { return std::isfinite(v); }) &&
                 std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0);
+    if (rows_per_slot > 1) {
+        // Resume after different accepted prefixes and overwrite rejected KV with new rows.
+        auto replacement = fvec(T * KD, 3);
+        CU(cudaMemcpy(values, replacement.data(), replacement.size() * sizeof(float), cudaMemcpyHostToDevice));
+        for (int t = 0; t < T; ++t) positions[t] += slot_ids[t] == 2 ? 1 : rows_per_slot - 1;
+        CU(cudaMemcpy(dp, positions.data(), T * sizeof(int), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(old_q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice));
+        per_row();
+        batched();
+        CU(cudaStreamSynchronize(stream));
+        expect_true("causal attention after per-slot rollback", host(out, T * HD) == host(old_out, T * HD));
+    }
     if (time_graphs) {
         for (int pass = 0; pass < 2; ++pass) {
             CU(cudaMemcpy(old_q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice));
@@ -2628,11 +2699,10 @@ void test_fp4_sequence_attention(int depth, int rows_per_slot, bool time_graphs)
     for (auto* ptr : {q, old_q, keys, values, sink, rel, out, old_out, scratch}) CU(cudaFree(ptr));
     for (auto* ptr : {kc, vc, old_k, old_v}) CU(cudaFree(ptr));
     CU(cudaFree(old_half));
+    if (q16) CU(cudaFree(q16));
     CU(cudaFree(ds));
     CU(cudaFree(dp));
 }
-
-#endif
 
 void test_fp4_kv_write() {
     constexpr int D = 128, T = 3, KV = 2, P = 17, KD = D * KV;
@@ -2687,8 +2757,8 @@ void test_fp4_kv_write() {
         }
         expect_true(keys ? "FP4 clipped key CPU pack/unpack" : "FP4 normalized value CPU pack/unpack", mismatch==0);
     }
-    for (auto* ptr : {dk, dv, q, r}) cudaFree(ptr);
-    cudaFree(kc); cudaFree(vc); cudaFree(uk); cudaFree(uv);
+    for (auto* ptr : {dk, dv, q, r}) release({ptr});
+    release({kc, vc, uk, uv});
 }
 
 void test_fp8_kv() {
@@ -2716,7 +2786,7 @@ void test_fp8_kv() {
             expect_true("e4m3fn_to_f16: finite bytes bit-exact", finite_exact);
             expect_true("e4m3fn_to_f16: 0x7F/0xFF NaN", nan_ok);
         }
-        cudaFree(db), cudaFree(dk16), cudaFree(dv16);
+        release({db, dk16, dv16});
     }
 
     // 2. prep_qkv_r_fp8 + unpack_kv_fp8_to_f16 (ring wraparound, linear, and scalar KD=10 tail)
@@ -2810,8 +2880,8 @@ void test_fp8_kv() {
             // unpack_kv_fp8_to_f16 exact FP16 decode of stored FP8 bytes
             expect(full ? "unpack_kv_fp8 full k" : "unpack_kv_fp8 ring k", got_k, wk_exact, 1e-3, 1e-5);
             expect(full ? "unpack_kv_fp8 full v" : "unpack_kv_fp8 ring v", got_v, wv_exact, 1e-3, 1e-5);
-            for (float* p : {dq, dqc, dk, dv, dr, drc}) cudaFree(p);
-            cudaFree(dkc), cudaFree(dvc), cudaFree(dpos), cudaFree(uk16), cudaFree(uv16);
+            for (float* p : {dq, dqc, dk, dv, dr, drc}) release({p});
+            release({dkc, dvc, dpos, uk16, uv16});
         }
 
         // Scalar fallback for unpack_kv_fp8_to_f16 (KD=10, non-mult4, ring wraparound)
@@ -2841,7 +2911,7 @@ void test_fp8_kv() {
         }
         expect("unpack_kv_fp8 scalar k", gk, wk, 1e-3, 1e-5);
         expect("unpack_kv_fp8 scalar v", gv, wv, 1e-3, 1e-5);
-        cudaFree(dks), cudaFree(dvs), cudaFree(uk), cudaFree(uv);
+        release({dks, dvs, uk, uv});
     }
 
     // 3. attn_decode_fp8 & attn_multi_fp8 (linear & ring buffer) vs double reference
@@ -2932,8 +3002,8 @@ void test_fp8_kv() {
         }
         expect("attn_multi_fp8 ring 1056", got, want, 1e-4, 1e-6);
 
-        for (uint8_t* p : {dk_lin, dv_lin, dk_ring, dv_ring}) cudaFree(p);
-        for (float* p : {dq, dr, ds, dp, scratch, out, one}) cudaFree(p);
+        for (uint8_t* p : {dk_lin, dv_lin, dk_ring, dv_ring}) release({p});
+        for (float* p : {dq, dr, ds, dp, scratch, out, one}) release({p});
     }
 
     // 4. attn_decode_fp8 with nk > 16384 (exercises P = 128 splits and kv_cap = 0 full-layer path)
@@ -2997,10 +3067,10 @@ void test_fp8_kv() {
                               dp, d_rel, 1024, w, scratch, one, 0);
         expect(unit_kv ? "resident E4M3 attention, unit values" : "resident E4M3 attention, full range",
                host(one, want.size()), want, 2e-4, unit_kv ? 1e-6 : 5e-6);
-        cudaFree(position);
+        release({position});
 #endif
-        for (uint8_t* p : {dk, dv}) cudaFree(p);
-        for (float* p : {dq, dr, ds, dp, scratch, one}) cudaFree(p);
+        for (uint8_t* p : {dk, dv}) release({p});
+        for (float* p : {dq, dr, ds, dp, scratch, one}) release({p});
     }
 }
 
@@ -3075,9 +3145,9 @@ void test_round6() {
                     expect(label, host(dy32[qi], want_y.size()), want_y, 1e-4, 5e-6);
                 }
             }
-            for (auto* p : ds) cudaFree(p);
-            for (int qi = 0; qi < nq; ++qi) cudaFree(dw[qi]), cudaFree(dy16[qi]), cudaFree(dy32[qi]);
-            cudaFree(dq);
+            for (auto* p : ds) release({p});
+            for (int qi = 0; qi < nq; ++qi) release({dw[qi], dy16[qi], dy32[qi]});
+            release({dq});
         }
     }
 
@@ -3098,10 +3168,10 @@ void test_round6() {
                 std::snprintf(label, sizeof label, "conv4_res T=%d %s %s", T, with_dyn ? "dyn" : "static",
                               with_res ? "+res" : "no-res");
                 expect(label, host(dy, want.size()), want, 2e-5);
-                cudaFree(hist);
+                release({hist});
             }
         }
-        cudaFree(dx), cudaFree(dw), cudaFree(dd), cudaFree(dres), cudaFree(dy);
+        release({dx, dw, dd, dres, dy});
     }
 
     // 3. attn_decode_* & attn_multi_* across split boundaries nk = 10, 64, 65, 200, 1056, 2500, 16640 (F32, F16, FP8)
@@ -3218,8 +3288,8 @@ void test_round6() {
                 expect(label, got, want, 1e-4, 1e-6);
             }
         }
-        for (float* p : {dk32, dv32, dq, dr, ds, dp, scratch, one, multi}) cudaFree(p);
-        cudaFree(dk16), cudaFree(dv16), cudaFree(dk8), cudaFree(dv8);
+        for (float* p : {dk32, dv32, dq, dr, ds, dp, scratch, one, multi}) release({p});
+        release({dk16, dv16, dk8, dv8});
     }
 
     // 4. route: E=384 (route_warp_kernel) and E=600 (fallback route_kernel), with exact score ties
@@ -3264,7 +3334,7 @@ void test_round6() {
             std::snprintf(label, sizeof label, "route ties E=%d weights", E);
             expect(label, w, want_w, 2e-5);
         }
-        cudaFree(dl), cudaFree(db), cudaFree(dw), cudaFree(dt);
+        release({dl, db, dw, dt});
     }
 
     // 5. experts_gate_up_swiglu & experts_down (row_dot_2 + odd C=513 + launch thresholds S=1,3,5,8)
@@ -3339,7 +3409,7 @@ void test_round6() {
             }
             for (void* p : {(void*) dpool, (void*) dblob, (void*) dx, (void*) dgu, (void*) dsg, (void*) dsu,
                             (void*) dy, (void*) dtok, (void*) dh_in, (void*) dh_ref, (void*) dh_got})
-                cudaFree(p);
+                release({p});
         }
     }
 }
@@ -3371,7 +3441,7 @@ void test_rdna3_dense_output_prefill() {
             expected.push_back(dot);
         }
     expect("3072-wide prefill output projection vs FP64", actual, expected, 2e-4, 5e-4);
-    cudaFree(dw); cudaFree(dx); cudaFree(dy);
+    release({dw, dx, dy});
 }
 
 void test_rdna3_small_dense() {
@@ -3403,7 +3473,7 @@ void test_rdna3_small_dense() {
             expect_true("RDNA3 small dense matvec preserves per-lane FP32 sums", exact);
         }
     }
-    cudaFree(dy); cudaFree(dw); cudaFree(dx);
+    release({dy, dw, dx});
 }
 
 void test_rdna3_dense_gemm() {
@@ -3434,8 +3504,8 @@ void test_rdna3_dense_gemm() {
     auto *ds = dev(scales);
     k::rdna3_planar_gemm(dq, ds, N, K, dx, T, y, ld, 0);
     expect_true("planar Q8 WMMA equals CPU dequantization and dense WMMA", host(y, T * ld) == dequantized);
-    cudaFree(dq), cudaFree(ds);
-    cudaFree(dw), cudaFree(dx), cudaFree(y);
+    release({dq, ds});
+    release({dw, dx, y});
 }
 
 void test_rdna3_expert_groups() {
@@ -3485,10 +3555,10 @@ void test_rdna3_expert_groups() {
             }
             expect_true("RDNA3 expert tiles, row permutations, route scales and ordered reduction", correct);
         }
-        cudaFree(dt); cudaFree(tokens); cudaFree(inv); cudaFree(dw); cudaFree(gate);
-        cudaFree(up); cudaFree(weight); cudaFree(tiles);
+        release({dt, tokens, inv, dw, gate});
+        release({up, weight, tiles});
     }
-    cudaFree(dg); cudaFree(du); cudaFree(dd);
+    release({dg, du, dd});
 }
 
 // Three nonempty experts separated by an empty one, including a partial token tile and a partial output workgroup.
@@ -3529,7 +3599,7 @@ void test_rdna3_expert_gemm(int type, int K, const char* name) {
             auto* dt = dev(tiles);
             k::rdna3_expert_gemm(type, db, offset, {dt, (int)tiles.size(), tile_rows}, dx, K, N, dy, 0);
             expect(name, host(dy, T * N), expected, 1e-4, 1e-3);
-            cudaFree(dt);
+            release({dt});
         }
         products[matrix] = std::move(expected);
     }
@@ -3564,11 +3634,11 @@ void test_rdna3_expert_gemm(int type, int K, const char* name) {
     std::vector<float> floats(result.size());
     std::transform(result.begin(), result.end(), floats.begin(), h2f_host);
     expect("WMMA fused expert SwiGLU vs FP64", floats, expected, 5e-4, 2e-4);
-    cudaFree(dt); cudaFree(dsg); cudaFree(dsu); cudaFree(tmp); cudaFree(split); cudaFree(fused);
-    cudaFree(db);
-    cudaFree(weights);
-    cudaFree(dy);
-    cudaFree(dx);
+    release({dt, dsg, dsu, tmp, split, fused});
+    release({db});
+    release({weights});
+    release({dy});
+    release({dx});
 }
 #endif
 
@@ -3653,21 +3723,21 @@ void test_expert_limbs() {
             expected[j] = h2f_host(rh[j]);
         }
         expect(ty == k::kIQ4_NL ? "IQ4_NL grouped FP16 input" : q8 ? "Q8 grouped FP16 input" : "NVFP4 grouped FP16 input", actual, expected, 2e-3, 5e-3);
-        cudaFree(x16);
-        cudaFree(x32);
-        cudaFree(counts);
-        cudaFree(gt);
-        cudaFree(gr);
-        cudaFree(per_token);
-        cudaFree(per_blob);
-        cudaFree(scratch);
-        cudaFree(got);
-        cudaFree(ref);
-        cudaFree(output);
-        cudaFree(tokens);
-        cudaFree(input);
-        cudaFree(blobs);
-        cudaFree(device_pool);
+        release({x16});
+        release({x32});
+        release({counts});
+        release({gt});
+        release({gr});
+        release({per_token});
+        release({per_blob});
+        release({scratch});
+        release({got});
+        release({ref});
+        release({output});
+        release({tokens});
+        release({input});
+        release({blobs});
+        release({device_pool});
     }
 }
 
@@ -3761,11 +3831,11 @@ void test_q8_verify_tile() {
                     wanted[t * ld + r] += (double)w * h2f_host(x[t * K + k]);
                 }
         expect("short Q8 tensor-core tile", host(dy, T * ld), wanted, 6e-4, 5e-4);
-        cudaFree(dx);
-        cudaFree(dy);
+        release({dx});
+        release({dy});
     }
-    cudaFree(dw);
-    cudaFree(ds);
+    release({dw});
+    release({ds});
 }
 
 #ifndef STRATA_USE_HIP
@@ -3839,9 +3909,9 @@ void test_linear_block_verify(int type, int T) {
             for (int f = 0; f < F; ++f)
                 down[t * C + c] += double(actual[t * F + f]) * weights[2 * C * F + c * F + f];
     expect("block verify down vs FP64", host(dy, down.size()), down, 1e-4, 0.01);
-    cudaFree(sg); cudaFree(su);
-    cudaFree(w); cudaFree(blobs); cudaFree(counts); cudaFree(dt); cudaFree(dr);
-    cudaFree(dx); cudaFree(limbs); cudaFree(dh); cudaFree(dy);
+    release({sg, su});
+    release({w, blobs, counts, dt, dr});
+    release({dx, limbs, dh, dy});
 }
 #endif
 
@@ -3924,7 +3994,7 @@ void test_draft_attn_online() {
     CU(cudaGraphExecDestroy(exec));
     CU(cudaGraphDestroy(graph));
     CU(cudaStreamDestroy(stream));
-    cudaFree(dk16); cudaFree(dv16);
+    release({dk16, dv16});
     // Also verify vectorized multi-token mv_f16_rows (T=5, K=256)
     constexpr int N = 35, K = 256, T = 5;
     std::vector<uint16_t> W(N * K);
@@ -3940,7 +4010,7 @@ void test_draft_attn_online() {
     expect("mv_f16_rows vectorized (T=5)", host(dy, wy.size()), wy, 1e-4, 1e-4);
     for (void* p : {(void*) dq, (void*) dkc, (void*) dvc, (void*) dkb, (void*) dvb, (void*) dP, (void*) scratch,
                     (void*) out, (void*) dW, (void*) dx, (void*) dy})
-        cudaFree(p);
+        release({p});
 }
 
 #ifdef STRATA_USE_HIP
@@ -4004,7 +4074,7 @@ void test_rdna3_speculative_kernels() {
         for (void* p : {(void*) dpool, (void*) dblob, (void*) dgb, (void*) dtok, (void*) dgn, (void*) dgt, (void*) dgr,
                         (void*) dx, (void*) dsg, (void*) dsu, (void*) dx16, (void*) h_ref, (void*) h_got,
                         (void*) y_ref, (void*) y_got})
-            cudaFree(p);
+            release({p});
     }
     // 2. Small-T BF16 GEMM (T=5)
     {
@@ -4022,7 +4092,7 @@ void test_rdna3_speculative_kernels() {
             for (int r = 0; r < N; ++r)
                 for (int i = 0; i < K; ++i) want[t * ld + r] += (double) from_bf(W[r * K + i]) * from_bf(X[t * K + i]);
         expect("rdna3_bf16_gemm (T=5)", host(dY, want.size()), want, 1e-4, 1e-4);
-        cudaFree(dW); cudaFree(dX); cudaFree(dY);
+        release({dW, dX, dY});
     }
     // 3. Fused separate-input sliding QKV/R/G planar Q8 (T=5)
     {
@@ -4046,7 +4116,7 @@ void test_rdna3_speculative_kernels() {
                     want[t * N + r] += (double) ((float) q[r * K + i] * h2f_host(d[(r * K + i) / 32])) * h2f_host(xin[t * K + i]);
             }
         expect("rdna3_q8_tile_qkv_sep (T=5)", host(dy, want.size()), want, 2e-4, 2e-4);
-        cudaFree(dq); cudaFree(dd); cudaFree(dxq); cudaFree(dxk); cudaFree(dxv); cudaFree(dy);
+        release({dq, dd, dxq, dxk, dxv, dy});
     }
     (void) S;
 }
@@ -4083,7 +4153,13 @@ void test_batch_groups(int T, int ty) {
     auto* su = dev_n<float>(S);
     auto* wt = dev_n<float>(S);
     auto* inv = dev_n<int>(S);
-    auto* x = dev(fvec(T * C));
+    auto input = fvec(T * C);
+    const char* mma = getenv("IK2_GROUP_MMA");
+    if (ty == k::kNVFP4 && mma && (atoi(mma) & 1)) {
+        // The grouped MMA consumes FP16 input. Give the scalar reference those same values.
+        for (auto& value : input) value = h2f_host(f2h_host(value));
+    }
+    auto* x = dev(input);
     auto* x16 = dev_n<uint16_t>(T * C);
     k::to_f16(x, T * C, x16, 0);
     auto* h = dev_n<uint16_t>(S * F);
@@ -4153,12 +4229,12 @@ void test_batch_groups(int T, int ty) {
             expect(ty == k::kNVFP4 ? "wide NVFP4 grouped SwiGLU" : "wide Q8_0 grouped SwiGLU", hidden, reference, 2e-3, 5e-3);
             expect(ty == k::kNVFP4 ? "wide NVFP4 grouped down" : "wide Q8_0 grouped down", actual_y, std::vector<double>(ref_y.begin(), ref_y.end()), 2e-3, 5e-3);
         }
-        cudaFree(refs); cudaFree(rt);
+        release({refs, rt});
     }
     cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
-    cudaFree(pool); cudaFree(tab); cudaFree(scale); cudaFree(w); cudaFree(top); cudaFree(blobs); cudaFree(n);
-    cudaFree(tok); cudaFree(row); cudaFree(sg); cudaFree(su); cudaFree(wt); cudaFree(inv); cudaFree(x); cudaFree(x16);
-    cudaFree(h); cudaFree(y); cudaFree(href); cudaFree(yref);
+    release({pool, tab, scale, w, top, blobs, n});
+    release({tok, row, sg, su, wt, inv, x, x16});
+    release({h, y, href, yref});
 }
 
 // An expert spanning five tiles, two empty experts, and a different pick order on alternate tokens.
@@ -4336,7 +4412,7 @@ int main(int argc, char** argv) {
     std::printf("ik2_kernels_test on %s (%s)\n", p.name, p.gcnArchName);
     if (argc == 2 && !std::strcmp(argv[1], "--fp4-batch")) {
         for (int depth : {256, 2048})
-            for (int rows_per_slot : {1, 4}) test_fp4_sequence_attention(depth, rows_per_slot, true);
+            for (int rows_per_slot : {1, 4}) test_sequence_attention(depth, rows_per_slot, true);
         test_fp4_kv_write();
         test_attn_decode_mma();
         test_attn_multi();
@@ -4423,15 +4499,19 @@ int main(int argc, char** argv) {
 #ifdef STRATA_USE_HIP
     test_experts_mma(2304, 1152, 1);
     test_rdna3_speculative_kernels();
-    test_fp4_sequence_attention(256, 1, false);
-    test_fp4_sequence_attention(256, 4, false);
+#endif
+    test_sequence_attention(256, 1, false);
+    test_sequence_attention(256, 4, false);
+#ifndef STRATA_USE_HIP
+    test_sequence_attention(238, 8, false, true);
 #endif
     test_deep_attention();
     test_fp4_sequence_replay();
     test_sequence_kernels();
+    test_window_rollback();
     test_sparse_decode();
 #ifndef STRATA_USE_HIP
-    for (int T : {16, 32})
+    for (int T : {16, 32, 64})
         for (int ty : {k::kIQ4_NL, k::kQ8_0, k::kNVFP4}) test_batch_groups(T, ty);
 #endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);

@@ -9,6 +9,85 @@ constexpr int width = 2304, groups = width / 16, dyn_width = 4 * groups;
 constexpr int vocab = 200058, codebook_rows = 201024, rank = 256, top = 16, chunk = 4096;
 constexpr int parts = (vocab + chunk - 1) / chunk;
 
+#ifndef STRATA_USE_HIP
+// Store one m16k16 weight fragment in the order consumed by the 32 MMA lanes.
+static __global__ void pack_projection(const uint16_t* w, int k, uint4* packed) {
+    const int lane = threadIdx.x % 32, r = blockIdx.x * 16 + lane / 4;
+    const int tile = blockIdx.y * (blockDim.x / 32) + threadIdx.x / 32;
+    if (tile >= k / 16) return;
+    const uint16_t* p = w + size_t(r) * k + 16 * tile + 2 * (lane % 4);
+    const auto word = [](const uint16_t* v) { return *reinterpret_cast<const unsigned*>(v); };
+    packed[(size_t(blockIdx.x) * (k / 16) + tile) * 32 + lane] =
+        make_uint4(word(p), word(p + 8*k), word(p + 8), word(p + 8*k + 8));
+}
+
+// Each output uses four K partitions and the same ordered MMA reductions for every batch size.
+// A warp keeps its weight fragment in registers across all of the tile's 8-row input panels.
+template <int Panels, bool Half = false>
+static __global__ void project(const uint16_t* weight, const uint16_t* x, int n, int k, int rows,
+                               float* y, int ld) {
+    const int lane = threadIdx.x % 32, split = threadIdx.x / 32;
+    const int g = lane / 4, pair = 2 * (lane % 4), col = blockIdx.x * 16 + g;
+    const int first = blockIdx.y * Panels * 8;
+    float acc[Panels][4]{};
+    for (int i = 16 * split; i < k; i += 64) {
+        uint4 a;
+        if constexpr (Half) {
+            const uint16_t* w0 = weight + size_t(min(col, n - 1)) * k + i + pair;
+            const uint16_t* w1 = weight + size_t(min(col + 8, n - 1)) * k + i + pair;
+            a = make_uint4(*reinterpret_cast<const unsigned*>(w0), *reinterpret_cast<const unsigned*>(w1),
+                           *reinterpret_cast<const unsigned*>(w0 + 8), *reinterpret_cast<const unsigned*>(w1 + 8));
+        } else {
+            a = reinterpret_cast<const uint4*>(weight)[(size_t(blockIdx.x) * k / 16 + i / 16) * 32 + lane];
+        }
+#pragma unroll
+        for (int p = 0; p < Panels; ++p) {
+            const uint16_t* v = x + size_t(min(first + 8*p + g, rows-1)) * k + i + pair;
+            const unsigned b0 = *reinterpret_cast<const unsigned*>(v);
+            const unsigned b1 = *reinterpret_cast<const unsigned*>(v + 8);
+#define IK2_DRAFT_MMA(dtype) asm volatile( \
+    "mma.sync.aligned.m16n8k16.row.col.f32." dtype "." dtype ".f32 " \
+    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" \
+    : "+f"(acc[p][0]), "+f"(acc[p][1]), "+f"(acc[p][2]), "+f"(acc[p][3]) \
+    : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1))
+            if constexpr (Half) { IK2_DRAFT_MMA("f16"); }
+            else { IK2_DRAFT_MMA("bf16"); }
+#undef IK2_DRAFT_MMA
+        }
+    }
+    __shared__ float4 partial[4][32];
+#pragma unroll
+    for (int p = 0; p < Panels; ++p) {
+        partial[split][lane] = make_float4(acc[p][0], acc[p][1], acc[p][2], acc[p][3]);
+        __syncthreads();
+        if (split == 0) {
+            float4 v = partial[0][lane];
+#pragma unroll
+            for (int j = 1; j < 4; ++j) {
+                const float4 a = partial[j][lane];
+                v.x += a.x; v.y += a.y; v.z += a.z; v.w += a.w;
+            }
+            const int t = first + 8*p + pair;
+            if (t < rows && col < n) y[size_t(t) * ld + col] = v.x;
+            if (t+1 < rows && col < n) y[size_t(t+1) * ld + col] = v.y;
+            if (t < rows && col+8 < n) y[size_t(t) * ld + col+8] = v.z;
+            if (t+1 < rows && col+8 < n) y[size_t(t+1) * ld + col+8] = v.w;
+        }
+        __syncthreads();
+    }
+}
+
+template <bool Half = false>
+static void project_rows(const uint16_t* weight, const uint16_t* x, int n, int k, int rows, float* y,
+                         int ld, cudaStream_t stream) {
+    const int blocks = (n + 15) / 16;
+    if (rows <= 8) project<1, Half><<<blocks, 128, 0, stream>>>(weight, x, n, k, rows, y, ld);
+    else if (rows <= 16) project<2, Half><<<blocks, 128, 0, stream>>>(weight, x, n, k, rows, y, ld);
+    else if (rows <= 32) project<4, Half><<<blocks, 128, 0, stream>>>(weight, x, n, k, rows, y, ld);
+    else project<8, Half><<<dim3(blocks, (rows+63)/64), 128, 0, stream>>>(weight, x, n, k, rows, y, ld);
+}
+#endif
+
 __device__ inline uint16_t bits(float x) {
     const uint32_t u = __float_as_uint(x);
     return (u + 0x7fff + ((u >> 16) & 1)) >> 16;
@@ -21,6 +100,24 @@ static __global__ void gather(const float* taps, int ld, int first, uint16_t* pa
     if (col < width)
         packed[(blockIdx.y * 4 + blockIdx.z) * width + col] =
             bits(taps[(size_t(blockIdx.z) * ld + first + blockIdx.y) * width + col]);
+}
+
+struct ContextRows {
+    int tap[64], position[64], slot[64];
+};
+
+static __global__ void gather_context(const float* taps, int ld, ContextRows rows, uint16_t* packed, int* pos) {
+    const int t = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    packed[(t * 4 + blockIdx.z) * width + c] = bits(taps[(blockIdx.z * ld + rows.tap[t]) * width + c]);
+    if (!c && !blockIdx.z) pos[t] = rows.position[t];
+}
+
+static __global__ void scatter_context(const float* keys, const float* values, ContextRows rows, int cap,
+                                       int cols, float* kc, float* vc) {
+    const int t = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t dest = (size_t(rows.slot[t]) * cap + rows.position[t] % cap) * cols + c;
+    kc[dest] = keys[t * cols + c];
+    vc[dest] = rounded(values[t * cols + c]);
 }
 
 // For residual updates vLLM normalizes with the unrounded sum of two BF16 operands,
@@ -58,7 +155,7 @@ static __global__ void conv(const float* x, const float* dynamic, const uint16_t
     base += side * 2 * width + c;
     x += row * width + c;
     float y = (expand(base[0]) + rounded(d[0])) * rounded(x[0]);
-    if (row) y += (expand(base[width]) + rounded(d[groups])) * rounded(x[-width]);
+    if (row % 8) y += (expand(base[width]) + rounded(d[groups])) * rounded(x[-width]);
     out[row * width + c] = rounded(y);
 }
 
@@ -135,6 +232,10 @@ static __global__ void merge_parts(const float* logits, int stride, const int* p
 // One warp per candidate, with the winning token fed into the next row.
 static __global__ void walk(const float* logits, int stride, const int* ids, const float* hidden,
                             const uint16_t* pred, const uint16_t* succ, int rows, int* tokens) {
+    logits += size_t(blockIdx.x) * rows * stride;
+    ids += blockIdx.x * rows * top;
+    hidden += blockIdx.x * rows * rank;
+    tokens += blockIdx.x * (rows + 1);
     __shared__ float scores[top];
     const int lane = threadIdx.x & 31, candidate = threadIdx.x >> 5;
     for (int r = 0; r < rows; ++r) {
