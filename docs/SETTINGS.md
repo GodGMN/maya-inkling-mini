@@ -36,6 +36,13 @@ Two config settings shape the thinking, and only one of them counts tokens:
 | `"thinking_budget"` | the cap on the thinking, in tokens (32768 by default; 8192 for GLM-5.3-Flash Maya-XS; 0 = none). Past it the server closes the thinking at the next sentence or line end and the answer starts. Settings > Chat defaults > Thinking budget changes it without a restart. GLM-5.3 (744B): a request that asks for Max itself gets up to 65536, as far as its room keeps 32768 for the answer, while the budget is the default (none set, or 32768); another value, or any value saved on the dashboard, applies at every level |
 | `"reasoning_effort"` | the thinking level a request gets when it names none: a word (`none`, `auto`, `low`, `medium`, `high`, `xhigh`, `max`). DeepSeek-V4.1 also takes a number from 1 to 100 (`42` or `"42"`), its own effort level: it is written into the prompt as a hint to the model, not a token cap |
 
+Inkling-2-Mini has no thinking cap by default. Set `thinking_budget` in the preset, on the dashboard,
+or in the request body (including SDK `extra_body`). Chat Completions, Responses and Messages accept
+a per-request override. Zero disables the cap for that request. Inkling counts reasoning tokens
+and opens an answer segment at the cap. If the output limit binds first, the server reserves
+a quarter of it (up to 1024 tokens) for the answer. Inkling reads the cap from the top-level JSON setting, outside `env`.
+Anthropic's `thinking.budget_tokens` selects an effort level. The hard cap uses `thinking_budget`.
+
 A `reasoning_effort` the model does not take (a number above 100 for DeepSeek, any number for the other models) stops
 the start before the model loads, with a message that points to `thinking_budget`.
 
