@@ -1,0 +1,33 @@
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake ninja-build g++ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY CMakeLists.txt ./
+COPY src/ src/
+COPY include/ include/
+COPY third_party/ third_party/
+RUN cmake -S . -B /build -G Ninja -DSTRATA_BUILD_TESTS=OFF \
+      -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90a;120a;121a" && \
+    cmake --build /build --target tintero --parallel 2
+
+FROM scratch AS bundle
+COPY --from=build /build/tintero /build/tintero
+COPY VERSION LICENSE* maya.py setup.py maya.sh /
+COPY third_party/ggml/LICENSE /LICENSE.ggml
+COPY serve/ /serve/
+COPY tools/ /tools/
+COPY ref/ /ref/
+COPY tests/ /tests/
+COPY data/ /data/
+COPY docs/inkling2-mini/ /docs/inkling2-mini/
+COPY docs/PRESETS.md /docs/
+COPY docker/requirements.txt docker/entrypoint.sh /
+
+FROM nvidia/cuda:13.1.0-runtime-ubuntu24.04
+RUN apt-get update && apt-get install -y --no-install-recommends python3-venv libgomp1 && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/tintero
+COPY --from=bundle / ./
+ENV PATH="/opt/venv/bin:$PATH" \
+    TINTERO_CONFIG=docs/inkling2-mini/cuda-24gb-fp4.json
+RUN python3 -m venv /opt/venv && pip install --no-cache-dir -r requirements.txt && python3 serve/server.py --help >/dev/null
+EXPOSE 8080
+ENTRYPOINT ["/opt/tintero/entrypoint.sh"]
