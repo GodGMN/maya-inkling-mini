@@ -86,6 +86,8 @@ The `env` block in the configs:
 | `IK2_BATCH_PREFILL=1` | Experts of a prompt chunk handled in batches: about 6% faster prefill |
 | `IK2_DRAFT_CTX=65536` | The drafter's global layer sees the last 65,536 positions (default: the whole context, which needs 1 GiB more at 262K) |
 
+For DFlash2, pass `--draft path/to/Inkling-2-Mini-DFlash2` or its `model.safetensors` file. The engine identifies the drafter from its tensor names. All five DFlash2 layers use a 2,048-position window. `IK2_DRAFT_GRAPH=0` runs proposals without graph capture.
+
 With `--draft` the engine decides every step whether to draft. A window of B tokens is worth (1 - a^B) / (1 - a) tokens, where a is how often recent drafts were accepted; it drafts when that, over the window's measured time, beats a plain token's time, and after 8 plain tokens it drafts once to look again. `IK2_DRAFT_WIDTH` (default 5) sets the widest window, `IK2_DRAFT_ADAPT=0` always drafts at that width.
 
 The tensor core expert kernels are on by default; `IK2_EXPERT_MMA=0` in `env` switches back to the scalar ones, which give the same logits bit for bit as the older builds. Every setting is listed in [SETTINGS.md](SETTINGS.md).

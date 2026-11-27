@@ -5496,26 +5496,30 @@ int main(int argc, char** argv) {
     // the drafter (before the expert cache takes what VRAM is left)
     ik2::draft::Drafter* drafter = nullptr;
     uint16_t* draft_head = M.out_w.f16;
+    float* draft_mask = nullptr;
     if (!draft_path.empty()) {
         if (n_gpu != 1) die("--draft: one GPU only so far");
-        if (!draft_head && M.out_w.q8) {   // (a Q8_0 head: an FP16 copy for the drafter's base logits and its fold)
-            const size_t n = (size_t) c.n_rows * c.C;
-            draft_head = dalloc<uint16_t>(n);
-            k::decode_q8p_f16(M.out_w.q8, M.out_w.q8d, n, draft_head, g_s);
-        }
-        if (!draft_head) die("--draft: the output head is neither FP16 nor planar Q8_0");
         g_final_tap = c.n_pass == 1 ? 7 : 3;
         const double t0 = now();
         try {
             drafter = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s);
+            draft_mask = ik2::draft::dflash2_mask(drafter);
+            if (draft_mask && (g_final_tap != 3 || c.n_vocab != 200058))
+                die("DFlash2 requires the Inkling-2-Mini target");
+            if (!draft_head && M.out_w.q8 && !draft_mask) {
+                const size_t n = (size_t) c.n_rows * c.C;
+                draft_head = dalloc<uint16_t>(n);
+                k::decode_q8p_f16(M.out_w.q8, M.out_w.q8d, n, draft_head, g_s);
+            }
+            if (!draft_head && !M.out_w.q8) die("--draft: the output head is neither FP16 nor planar Q8_0");
             ik2::draft::fold(drafter, draft_head, c.n_rows);
         } catch (const std::exception& e) {
             die(e.what());
         }
-        if (M.out_w.q8 && draft_head != M.out_w.f16) {   // (the FP16 copy was the fold's: the base logits from the blocks)
+        if (M.out_w.q8 && !M.out_w.f16) {   // (the FP16 copy was the fold's: the base logits from the blocks)
             ik2::draft::set_head_q8(drafter, M.out_w.q8, M.out_w.q8d);
             CU(cudaStreamSynchronize(g_s));
-            CU(cudaFree(draft_head));
+            if (draft_head) CU(cudaFree(draft_head));
             draft_head = nullptr;
         }
         g_taps_ld = std::max(chunk, ik2::draft::kBlock);
@@ -5669,6 +5673,10 @@ int main(int argc, char** argv) {
     }
     CU(cudaHostAlloc(&W.x_h, (size_t) 8 * C * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.emb_h, Tm * C * 4, cudaHostAllocPortable));
+    if (draft_mask) {
+        embed_row(M, ik2::draft::kDFlash2MaskToken, W.tmp, draft_mask);
+        CU(cudaStreamSynchronize(g_s));
+    }
     CU(cudaEventCreateWithFlags(&W.prefill_inputs_copied, cudaEventDisableTiming));
     CU(cudaHostAlloc(&W.pos_h, (size_t) W.T_host * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.route_h, S_host * 8, cudaHostAllocPortable));

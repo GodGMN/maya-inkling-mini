@@ -4591,7 +4591,7 @@ __global__ void rope_neox_kernel(float* x, int heads, const int* pos, float thet
 constexpr int kDraftQ = 8;
 __device__ __forceinline__ float ld_f(const float* p) { return *p; }
 __device__ __forceinline__ float ld_f(const uint16_t* p) { return h2f(*p); }
-template <class KVT>
+template <class KVT, bool row_window>
 __global__ void draft_attn_online_part_kernel(const float* __restrict__ q, const KVT* __restrict__ kc,
                                               const KVT* __restrict__ vc, const int* __restrict__ d_P, int k_lo_arg,
                                               int k_hi_arg, int window, const float* __restrict__ kb,
@@ -4636,6 +4636,7 @@ __global__ void draft_attn_online_part_kernel(const float* __restrict__ q, const
 #pragma unroll
         for (int qi = 0; qi < kDraftQ; ++qi) {
             if (qi >= nq) break;
+            if (row_window && j < nc && k_lo + j < k_hi + qi - window) continue;
             float a = qs[qi][lane] * k0 + qs[qi][lane + 32] * k1 + qs[qi][lane + 64] * k2 + qs[qi][lane + 96] * k3;
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
@@ -6341,7 +6342,7 @@ void rope_neox(float* x, int rows, int heads, const int* pos, float theta, cudaS
     rope_neox_kernel<<<dim3(rows, heads), 64, 0, s>>>(x, heads, pos, theta);
     check("rope_neox");
 }
-template <class KVT>
+template <class KVT, bool row_window = false>
 static void draft_attn_online_impl(const float* q, const KVT* kc, const KVT* vc, const int* d_P, int k_lo, int k_hi,
                                    int window, const float* kb, const float* vb, int nq, int H, int Hkv, float scale,
                                    int S, float* scratch, float* out, cudaStream_t s, int cap) {
@@ -6351,7 +6352,7 @@ static void draft_attn_online_impl(const float* q, const KVT* kc, const KVT* vc,
     }
     float* part_o = scratch;
     float2* part_ml = (float2*) (part_o + (size_t) S * H * kDraftQ * 128);
-    draft_attn_online_part_kernel<KVT><<<dim3((unsigned) H, (unsigned) S), 128, 0, s>>>(
+    draft_attn_online_part_kernel<KVT, row_window><<<dim3((unsigned) H, (unsigned) S), 128, 0, s>>>(
         q, kc, vc, d_P, k_lo, k_hi, window, kb, vb, nq, H, Hkv, scale, part_o, part_ml, cap > 0 ? cap : (1 << 30));
     check("draft_attn_online (chunks)");
     draft_attn_merge_kernel<<<dim3((unsigned) H, (unsigned) nq), 128, 0, s>>>(part_o, part_ml, S, H, out);
@@ -6374,6 +6375,11 @@ void draft_attn_graph(const float* q, const float* kc, const float* vc, const in
                       const float* vb, int nq, int H, int Hkv, float scale, int S, float* scratch, float* out,
                       cudaStream_t s, int cap) {
     draft_attn_online_impl<float>(q, kc, vc, d_P, 0, 0, window, kb, vb, nq, H, Hkv, scale, S, scratch, out, s, cap);
+}
+void dflash2_attn(const float* q, const float* kc, const float* vc, const int* d_P, int window, const float* kb,
+                      const float* vb, int nq, int H, int Hkv, float scale, int S, float* scratch, float* out,
+                      cudaStream_t s, int cap) {
+    draft_attn_online_impl<float, true>(q, kc, vc, d_P, 0, 0, window, kb, vb, nq, H, Hkv, scale, S, scratch, out, s, cap);
 }
 void draft_attn_f16_graph(const float* q, const uint16_t* kc, const uint16_t* vc, const int* d_P, int window,
                           const float* kb, const float* vb, int nq, int H, int Hkv, float scale, int S, float* scratch,

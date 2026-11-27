@@ -444,6 +444,9 @@ void draft_attn_f16(const float* q, const uint16_t* kc, const uint16_t* vc, int 
 void draft_attn_graph(const float* q, const float* kc, const float* vc, const int* d_P, int window, const float* kb,
                       const float* vb, int nq, int H, int Hkv, float scale, int S, float* scratch, float* out,
                       cudaStream_t s, int cap);
+void dflash2_attn(const float* q, const float* kc, const float* vc, const int* d_P, int window, const float* kb,
+                      const float* vb, int nq, int H, int Hkv, float scale, int S, float* scratch, float* out,
+                      cudaStream_t s, int cap);
 void draft_attn_f16_graph(const float* q, const uint16_t* kc, const uint16_t* vc, const int* d_P, int window,
                           const float* kb, const float* vb, int nq, int H, int Hkv, float scale, int S, float* scratch,
                           float* out, cudaStream_t s, int cap);
