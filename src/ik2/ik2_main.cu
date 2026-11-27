@@ -21,6 +21,7 @@
 // STOP); --serve-ik2 the older @-line one.  --dump: each layer's output (blk.L.out) and the log-probabilities of every
 // prompt position, F32 raw files ([T][C], [T][n_vocab]) - what tools/ik2_compare.py holds against ref/inkling2.py's
 // seams.  Settings (IK2_*): docs/SETTINGS.md.
+#include "ik2_usage.hpp"
 #include "ik2_cpu.hpp"
 #include "ik2_cpu_deep.hpp"
 #include "ik2_draft_sampling.hpp"
@@ -317,19 +318,18 @@ bool g_mv = true;   // IK2_MV=0: a few tokens' experts through the FP16 GEMMs to
 // experts at load, so the first requests do not start from an empty cache.
 std::vector<uint64_t> g_pop;
 int g_pop_E = 0;
+std::filesystem::path g_profile_out;
 void pop_count(int l, const int* top, int S) {
     if (g_pop.empty()) return;
-    for (int i = 0; i < S; ++i) ++g_pop[(size_t) l * g_pop_E + top[i]];
+    for (int i = 0; i < S; ++i) {
+        auto& count = g_pop[(size_t) l * g_pop_E + top[i]];
+        if (count == UINT64_MAX)
+            for (auto& value : g_pop) value >>= 1;
+        ++count;
+    }
 }
 void pop_dump() {
-    const char* f = getenv("IK2_POP_OUT");
-    if (!f || g_pop.empty()) return;
-    FILE* o = std::fopen(f, "wb");
-    if (!o) return;
-    const int32_t hdr[2] = {(int32_t) (g_pop.size() / g_pop_E), (int32_t) g_pop_E};
-    std::fwrite(hdr, 4, 2, o);
-    std::fwrite(g_pop.data(), 8, g_pop.size(), o);
-    std::fclose(o);
+    ik2::usage::write(g_profile_out, g_pop_E, g_pop);
 }
 int g_pop_E_ep = 0;
 // IK2_EP=1 with --gpus 2: expert parallel. Every layer's attention and dense weights (and the KV cache) on GPU 0;
@@ -370,9 +370,11 @@ struct Prof {
     }
 } g_pf;
 
+size_t device_allocated = 0;  // Single-GPU allocations charged against an explicit VRAM budget.
 template <class T>
 T* dalloc(size_t n) {
     T* p = nullptr;
+    device_allocated += std::max<size_t>(1, n) * sizeof(T);
     CU(cudaMalloc(&p, std::max<size_t>(1, n) * sizeof(T)));
     return p;
 }
@@ -572,7 +574,8 @@ Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
     }
     if (nb > g_stage_bytes) {
         if (g_stage) CU(cudaFree(g_stage));
-        g_stage = dalloc<uint8_t>(g_stage_bytes = nb);
+        g_stage_bytes = nb;
+        CU(cudaMalloc(&g_stage, nb));
     }
     CU(cudaMemcpy(g_stage, S.data(n), nb, cudaMemcpyHostToDevice));
     m.f16 = dalloc<uint16_t>((size_t) N * Kd);
@@ -656,7 +659,8 @@ struct MatPart {
 void ensure_stage(size_t nb) {
     if (nb > g_stage_bytes) {
         if (g_stage) CU(cudaFree(g_stage));
-        g_stage = dalloc<uint8_t>(g_stage_bytes = nb);
+        g_stage_bytes = nb;
+        CU(cudaMalloc(&g_stage, nb));
     }
 }
 
@@ -4780,7 +4784,18 @@ int main(int argc, char** argv) {
     int cache_slots = getenv("IK2_CACHE_SLOTS") ? std::atoi(getenv("IK2_CACHE_SLOTS")) : 1;
     bool serve = false, serve_maya = true;   // (--serve: Maya's engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (Maya's protocol)
-    double cache_gb = 60;
+    size_t cache_limit = SIZE_MAX, vram_limit = SIZE_MAX;
+    auto free_for_budget = [&](size_t actual_free) {
+        if (vram_limit == SIZE_MAX) return actual_free;
+        const size_t charged = std::min(device_allocated, vram_limit);
+        return std::min(actual_free, vram_limit - charged);
+    };
+    auto gib = [](const std::string& value) {
+        char* end = nullptr;
+        const double bytes = std::strtod(value.c_str(), &end) * 1073741824.0;
+        if (*end || !(bytes >= 1 && bytes < double(SIZE_MAX))) die("invalid GiB budget: " + value);
+        return size_t(bytes);
+    };
     int image_token = 200054;   // --image-token: Inkling 2's <|unused_200054|>, the template's placeholder of a picture
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -4801,7 +4816,8 @@ int main(int argc, char** argv) {
         else if (a == "--chunk") chunk = std::atoi(next().c_str());
         else if (a == "--ctx" || a == "--max-context") ctx = std::atoi(next().c_str());   // (--max-context: serve/server.py's name)
         else if (a == "--cache-slots") cache_slots = std::atoi(next().c_str());
-        else if (a == "--cache-gb") cache_gb = std::atof(next().c_str());
+        else if (a == "--cache-gb") cache_limit = gib(next());
+        else if (a == "--vram-gb") vram_limit = gib(next());
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--gpus") n_gpu = std::atoi(next().c_str());
         else if (a == "--draft") draft_path = next();
@@ -4820,6 +4836,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump") dump = next();
         else die("unknown argument " + a);
     }
+    if (vram_limit != SIZE_MAX && n_gpu != 1) die("--vram-gb requires one GPU");
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
 #ifdef STRATA_USE_HIP
     for (const char* flag : {"IK2_GROUP_MMA", "IK2_WGMMA"}) {
@@ -4961,22 +4978,18 @@ int main(int argc, char** argv) {
         // if (n_gpu != 1) die("a looped model: one GPU so far (--gpus 1)");
         if (!draft_path.empty() && (c.C != 2304 || c.n_visit != 48)) die("--draft: a looped model other than Inkling-2-Mini");
     }
-    if (getenv("IK2_POP_OUT")) g_pop.assign((size_t) c.n_layer * c.E, 0), g_pop_E = c.E;
+    const auto default_profile = ik2::usage::profile_path(model);
+    const char* warm = getenv("IK2_WARM");
+    const char* output = getenv("IK2_POP_OUT");
+    g_profile_out = output ? std::filesystem::path(output) : default_profile;
+    g_pop_E = c.E;
+    auto counts = ik2::usage::read(warm ? std::filesystem::path(warm) : default_profile, c.n_layer, c.E);
     g_tp_F = c.F, g_tp_C = c.C;
     if (n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"))) {
         const double share = getenv("IK2_EP_SPLIT") ? std::atof(getenv("IK2_EP_SPLIT")) : 0.5;
         g_pop_E_ep = c.E;
         g_ep_own.assign((size_t) c.n_layer * c.E, 0);
-        std::vector<uint64_t> cnt;
-        if (const char* wf = getenv("IK2_WARM"); wf && *wf) {
-            FILE* in = std::fopen(wf, "rb");
-            int32_t hdr[2] = {0, 0};
-            if (in && std::fread(hdr, 4, 2, in) == 2 && hdr[0] == c.n_layer && hdr[1] == c.E) {
-                cnt.resize((size_t) c.n_layer * c.E);
-                if (std::fread(cnt.data(), 8, cnt.size(), in) != cnt.size()) cnt.clear();
-            }
-            if (in) std::fclose(in);
-        }
+        const auto& cnt = counts;
         for (int l = 0; l < c.n_layer; ++l) {
             if (cnt.empty()) {
                 for (int e = 0; e < c.E; ++e)
@@ -5030,6 +5043,7 @@ int main(int argc, char** argv) {
         if (!(g_abl_s >= 0.0f) || !std::isfinite(g_abl_s)) die("IK2_ABLATE_SCALE: 0 or a positive number");
         g_abl_r.resize(1);
         CU(cudaSetDevice(0));
+        device_allocated += r.size() * sizeof(float);
         CU(cudaMalloc(&g_abl_r[0], r.size() * sizeof(float)));
         CU(cudaMemcpy(g_abl_r[0], r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice));
         g_abl_decode = !(getenv("IK2_ABLATE_PREFILL_ONLY") && std::atoi(getenv("IK2_ABLATE_PREFILL_ONLY")));
@@ -5062,6 +5076,7 @@ int main(int argc, char** argv) {
             std::fclose(fm);
             if (gm != g_abl_c.size()) die("IK2_ABLATE_MEAN: not 1 + 2 n_visit floats");
         }
+        device_allocated += kAblRows * sizeof(float);
         CU(cudaMalloc(&g_abl_srow, kAblRows * sizeof(float)));
         CU(cudaMallocHost(&g_abl_srow_h, kAblRows * sizeof(float)));
         for (int i = 0; i < kAblRows; ++i) g_abl_srow_h[i] = 1.0f;   // (until a scheduler says otherwise: all)
@@ -5142,9 +5157,10 @@ int main(int argc, char** argv) {
         kv_b *= (size_t)cache_slots;
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
+        fr0 = std::min(fr0, vram_limit);
         // With resident-only loading the actual post-workspace budget decides how many experts fit.
         const size_t reserve = resident_only ? size_t{256} << 20 : size_t{3} << 29;
-        const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= (size_t) (cache_gb * 1073741824.0);
+        const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= cache_limit;
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
         if (resident_only && !g_fast_want) die("resident-only loading: the model, KV cache and requested expert budget must fit on the GPU with planar dense weights");
@@ -5647,7 +5663,14 @@ int main(int argc, char** argv) {
         g_final_tap = c.n_pass == 1 ? 7 : 3;
         const double t0 = now();
         try {
+            size_t free_before = 0, total = 0;
+            if (vram_limit != SIZE_MAX) CU(cudaMemGetInfo(&free_before, &total));
             drafter = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s, batch_width);
+            if (vram_limit != SIZE_MAX) {
+                size_t free_after = 0;
+                CU(cudaMemGetInfo(&free_after, &total));
+                device_allocated += free_before - std::min(free_before, free_after);
+            }
             draft_mask = ik2::draft::dflash2_mask(drafter);
 #ifdef STRATA_USE_HIP
             if (batch_draft && !draft_mask) die("batched HIP drafting requires DFlash2");
@@ -5667,7 +5690,10 @@ int main(int argc, char** argv) {
         if (M.out_w.q8 && (draft_mask || !M.out_w.f16)) {
             ik2::draft::set_head_q8(drafter, M.out_w.q8, M.out_w.q8d);
             CU(cudaStreamSynchronize(g_s));
-            if (draft_head && draft_head != M.out_w.f16) CU(cudaFree(draft_head));
+            if (draft_head && draft_head != M.out_w.f16) {
+                CU(cudaFree(draft_head));
+                device_allocated -= size_t(c.n_rows) * c.C * sizeof(uint16_t);
+            }
             draft_head = nullptr;
         }
         g_taps_ld = std::max({chunk, ik2::draft::kBlock, batch_rows});
@@ -5721,6 +5747,7 @@ int main(int argc, char** argv) {
     for (int d = 0; d < n_gpu; ++d) {
     use_dev(d);
     CU(cudaMemGetInfo(&fr, &tot));
+    fr = free_for_budget(fr);
     Work& W = g_dev[d].W;
     W.Tm = std::max(batch_rows, drafter ? std::max(chunk, kBlockMax) : chunk);
     W.ctx = ctx;
@@ -5885,10 +5912,11 @@ int main(int argc, char** argv) {
     }
     ExpertCache& EC = g_dev[d].EC;
     CU(cudaMemGetInfo(&fr, &tot));
+    fr = free_for_budget(fr);
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
     //  stays in VRAM - nothing more is allocated but a token's graph)
     const size_t room = g_fast_want ? (size_t) 256 << 20 : (size_t) 2 << 30;
-    const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
+    const size_t budget = std::min(cache_limit, fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
     EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
     if (resident_only && EC.total_slots() != c.n_layer * c.E)
@@ -5899,57 +5927,49 @@ int main(int argc, char** argv) {
         std::printf("  pool %zu: %d slots of %.1f MiB (%.1f GiB, %d layers)\n", p, EC.pools[p].n_slots,
                     EC.pools[p].slot_bytes / 1048576.0,
                     (double) EC.pools[p].n_slots * EC.pools[p].slot_bytes / 1073741824.0, EC.pools[p].n_layers);
-    const char* wf = getenv("IK2_WARM");
-    if ((wf && *wf) || g_ep) {   // the cache filled with the most picked experts (IK2_POP_OUT's file or all owned for EP)
-        FILE* in = (wf && *wf) ? std::fopen(wf, "rb") : nullptr;
-        int32_t hdr[2] = {0, 0};
-        std::vector<uint64_t> cnt;
-        if (in && std::fread(hdr, 4, 2, in) == 2 && hdr[0] == c.n_layer && hdr[1] == c.E) {
-            cnt.resize((size_t) c.n_layer * c.E);
-            if (std::fread(cnt.data(), 8, cnt.size(), in) != cnt.size()) cnt.clear();
-        }
-        if (in) std::fclose(in);
-        if (cnt.empty() && g_ep) cnt.assign((size_t) c.n_layer * c.E, 1);
-        if (cnt.empty()) {
-            std::printf("warm: the cache starts empty\n");
-        } else {
-            const double tw = now();
-            const uint64_t m0 = EC.misses, b0 = EC.bytes_up;
-            int n = 0;
-            for (size_t p = 0; p < EC.pools.size(); ++p) {
-                std::vector<int> idx;
-                for (int l = 0; l < c.n_layer; ++l)
-                    if (EC.layer_pool[l] == (int) p)
-                        for (int e = 0; e < c.E; ++e)
-                            if (!g_ep || ep_owner(l, e) == d) idx.push_back(l * c.E + e);
-                // the most picked first; the chosen ones then go in least picked first, so that the evictions that
-                // start from the oldest take the least picked
-                std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
-                const int k = std::min((int) idx.size(), EC.pools[p].n_active);
-                for (int i = k - 1; i >= 0; --i) {
-                    const int l = idx[i] / c.E, e = idx[i] % c.E;
-                    EC.get(M.L[l], l, e, EC.tick, g_cs, nullptr, true, true);
-                    ++n;
-                }
+    if ((!counts.empty() && (!g_fast_want || warm)) || g_ep) {
+        // Expert-parallel prefetch starts with uniform popularity on a cold run.
+        std::vector<uint64_t> uniform;
+        if (counts.empty()) uniform.assign(size_t(c.n_layer) * c.E, 1);
+        const auto& cnt = counts.empty() ? uniform : counts;
+        const double tw = now();
+        const uint64_t m0 = EC.misses, b0 = EC.bytes_up;
+        int n = 0;
+        for (size_t p = 0; p < EC.pools.size(); ++p) {
+            std::vector<int> idx;
+            for (int l = 0; l < c.n_layer; ++l)
+                if (EC.layer_pool[l] == (int) p)
+                    for (int e = 0; e < c.E; ++e)
+                        if (g_ep ? ep_owner(l, e) == d : cnt[l * c.E + e] > 0) idx.push_back(l * c.E + e);
+            // the most picked first; the chosen ones then go in least picked first, so that the evictions that
+            // start from the oldest take the least picked
+            std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
+            const int k = std::min((int) idx.size(), EC.pools[p].n_active);
+            for (int i = k - 1; i >= 0; --i) {
+                const int l = idx[i] / c.E, e = idx[i] % c.E;
+                EC.get(M.L[l], l, e, EC.tick, g_cs, nullptr, true, true);
+                if (!counts.empty())
+                    EC.pools[p].freq[EC.loc[idx[i]]] = std::min<uint64_t>(2, cnt[idx[i]]);
+                ++n;
             }
-            CU(cudaStreamSynchronize(g_cs));
-            ++EC.tick;   // (taken in the tick the first prefetch uses, they would all count as in use: none evictable)
-            // the profile also seeds the prefetch's picture of which experts a pass uses (W.use, as 100k picks a
-            // layer): without it the first long-enough request prefetches all 18k experts
-            W.use.assign((size_t) c.n_layer * c.E, 0), W.use_tot.assign(c.n_layer, 0);
-            for (int l = 0; l < c.n_layer; ++l) {
-                long double sum = 0;
-                for (int e = 0; e < c.E; ++e) sum += cnt[(size_t) l * c.E + e];
-                if (sum <= 0) continue;
-                for (int e = 0; e < c.E; ++e) {
-                    W.use[(size_t) l * c.E + e] = (uint64_t) (100000.0L * cnt[(size_t) l * c.E + e] / sum + 0.5L);
-                    W.use_tot[l] += W.use[(size_t) l * c.E + e];
-                }
-            }
-            std::printf("warm: %d experts (%.1f GiB) copied in %.1f s\n", n, (EC.bytes_up - b0) / 1073741824.0,
-                        now() - tw);
-            EC.misses = m0, EC.bytes_up = b0;
         }
+        CU(cudaStreamSynchronize(g_cs));
+        ++EC.tick;   // (taken in the tick the first prefetch uses, they would all count as in use: none evictable)
+        // the profile also seeds the prefetch's picture of which experts a pass uses (W.use, as 100k picks a
+        // layer): without it the first long-enough request prefetches all 18k experts
+        W.use.assign((size_t) c.n_layer * c.E, 0), W.use_tot.assign(c.n_layer, 0);
+        for (int l = 0; l < c.n_layer; ++l) {
+            long double sum = 0;
+            for (int e = 0; e < c.E; ++e) sum += cnt[(size_t) l * c.E + e];
+            if (sum <= 0) continue;
+            for (int e = 0; e < c.E; ++e) {
+                W.use[(size_t) l * c.E + e] = (uint64_t) (100000.0L * cnt[(size_t) l * c.E + e] / sum + 0.5L);
+                W.use_tot[l] += W.use[(size_t) l * c.E + e];
+            }
+        }
+        std::printf("warm: %d experts (%.1f GiB) copied in %.1f s\n", n, (EC.bytes_up - b0) / 1073741824.0,
+                    now() - tw);
+        EC.misses = m0, EC.bytes_up = b0;
     }
     if (g_fast_want && d == 0) {   // the resident path: every expert in now, and where each is on the device
         auto blocks = [](const Mat& m) { return m.raw || m.q8; };   // (kept as the GGUF's blocks, whole or planar)
@@ -6080,6 +6100,10 @@ int main(int argc, char** argv) {
         }
     }
     std::fflush(stdout);
+    }
+    if ((!g_fast || output) && !g_profile_out.empty()) {
+        g_pop = std::move(counts);
+        if (g_pop.empty()) g_pop.resize(size_t(c.n_layer) * c.E);
     }
     if (g_sparse_decode) {
         if (!g_fast || g_prof || g_rec || g_trace || !g_pop.empty() || !dump.empty())
@@ -6333,7 +6357,6 @@ int main(int argc, char** argv) {
             long long seed = -1;
             in >> cmd;
             if (cmd == "QUIT") {
-                pop_dump();
                 break;
             }
             // GENI: GEN with the request's pictures - "GENI <max_new> [key=value ...] <pictures file> <ids>", the file
@@ -6732,6 +6755,7 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             busy = false;
         }
+        pop_dump();
         return 0;
     }
     if ((int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");

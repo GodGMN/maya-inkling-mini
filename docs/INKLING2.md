@@ -211,6 +211,10 @@ model with a loop in it: 24 layers of weights, of which layers 6..17 run three t
 Width 2304, 24 heads on 8 K / V heads (D 128), 128 experts a layer (8 a token, F 1152), a window of 1024 keys in all
 layers but 5, 11, 17 and 23, the same relative bias, sinks, clips, short convs and attention residuals (block 6).
 
+When Mini exceeds VRAM, the engine sizes its expert cache after allocating the requested context and
+reloads expert usage from the previous session. Use `--vram-gb 12` to exercise this path on a larger GPU.
+The fully resident decoder keeps its CUDA graph. See [engine settings](SETTINGS.md) for profile paths and overrides.
+
 **The loop** (transformers PR #51050, llama.cpp PR #32695). Each pass of the core starts again from the stream and
 the block states the core was first given. A pass after the first reads the pass before it through four messages a
 layer - for q, k, v and the MoE - each an attention residual over the earlier pass's block states and its final
