@@ -1,0 +1,10 @@
+numpy
+jinja2
+regex
+pyyaml
+requests
+pillow
+psutil
+jsonschema>=4.18,<5
+gguf
+tqdm
