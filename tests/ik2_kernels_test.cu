@@ -2530,6 +2530,110 @@ float e4m3fn_to_f32_host(uint8_t q) {
     return sgn * std::ldexp(1.0f + (float) m / 8.0f, (int) e - 7);
 }
 
+#ifdef STRATA_USE_HIP
+template<class Launch>
+float time_attention_graph(Launch launch, cudaStream_t stream) {
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    CU(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    launch();
+    CU(cudaStreamEndCapture(stream, &graph));
+    CU(cudaGraphInstantiate(&exec, graph, 0));
+    cudaEvent_t start, end;
+    CU(cudaEventCreate(&start));
+    CU(cudaEventCreate(&end));
+    for (int i = 0; i < 5; ++i) CU(cudaGraphLaunch(exec, stream));
+    CU(cudaEventRecord(start, stream));
+    constexpr int runs = 32;
+    for (int i = 0; i < runs; ++i) CU(cudaGraphLaunch(exec, stream));
+    CU(cudaEventRecord(end, stream));
+    CU(cudaEventSynchronize(end));
+    float ms;
+    CU(cudaEventElapsedTime(&ms, start, end));
+    CU(cudaEventDestroy(start));
+    CU(cudaEventDestroy(end));
+    CU(cudaGraphExecDestroy(exec));
+    CU(cudaGraphDestroy(graph));
+    return ms * 1000 / runs;
+}
+
+void test_fp4_sequence_attention(int depth, int rows_per_slot, bool time_graphs) {
+    constexpr int H = 24, KV = 8, D = 128, dr = 16, extent = 1024, window = 1 << 30;
+    constexpr int KD = KV * D, HD = H * D, ld = 2 * HD + H * dr, slots = 3;
+    const int T = 2 * rows_per_slot, cap = depth + rows_per_slot + 8, splits = depth < 1024 ? 16 : 32;
+    const size_t stride = (size_t)cap * KD / 32 * sizeof(k::Fp4KvBlock);
+    const auto layout = k::Fp8KvLayout::global_fp4();
+    std::vector<int> slot_ids, positions;
+    for (int t = 0; t < T; ++t) {
+        slot_ids.push_back(t < rows_per_slot ? 2 : 0);
+        positions.push_back((t < rows_per_slot ? depth : depth - 19) + t % rows_per_slot);
+    }
+    auto* ds = dev(slot_ids);
+    auto* dp = dev(positions);
+    std::vector<float> decoded((size_t)slots * cap * KD);
+    std::vector<uint8_t> packed_k, packed_v;
+    fp4_fixture(packed_k, decoded);
+    fp4_fixture(packed_v, decoded);
+    auto *kc = dev(packed_k), *vc = dev(packed_v);
+    auto *old_k = dev(packed_k), *old_v = dev(packed_v);
+    auto qrg = fvec(T * ld);
+    auto *q = dev(qrg), *old_q = dev(qrg);
+    auto *keys = dev(fvec(T * KD, 3)), *values = dev(fvec(T * KD, 3));
+    auto *sink = dev(fvec(T * H)), *rel = dev(fvec(extent * dr));
+    auto *out = dev_n<float>(T * HD), *old_out = dev_n<float>(T * HD);
+    auto* old_half = dev_n<uint16_t>(T * HD);
+    auto* scratch = dev_n<float>((size_t)T * H * splits * 130);
+    cudaStream_t stream;
+    CU(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CU(cudaDeviceSynchronize());
+    auto per_row = [&] {
+        for (int t = 0; t < T; ++t) {
+            auto *krow = old_k + slot_ids[t] * stride, *vrow = old_v + slot_ids[t] * stride;
+            auto *qr = old_q + t * ld, *r = qr + HD;
+            k::prep_qkv_r_fp8_at(qr, nullptr, keys + t * KD, krow, values + t * KD, vrow, r, nullptr,
+                                 H, KV, D, dr, 22, 8, 1e-6f, dp + t, true, 0.2f, 64, layout,
+                                 16, 32, nullptr, stream);
+            k::attn_decode_fp8_at(qr, r, sink + t * H, krow, vrow, layout, H, KV, dp + t, splits,
+                                  (1.f / std::sqrt((float)D)) / 16, 1.f / 32, rel, dr, extent, window,
+                                  scratch, old_out + t * HD, stream, r + H * dr, old_half + t * HD);
+        }
+    };
+    auto batched = [&] {
+        k::sequence_attention_quantized(q, q + HD, q + HD + H * dr, ld, nullptr, nullptr, keys, values,
+                                        kc, vc, layout, stride, ds, dp, T, H, KV, dr, 22, 8, 1e-6f,
+                                        0.2f, 64, 16, 32, rel, extent, window, splits, sink, scratch, out, stream);
+    };
+    per_row();
+    batched();
+    CU(cudaStreamSynchronize(stream));
+    expect_true("FP4 batch keys including untouched slots", host(kc, slots * stride) == host(old_k, slots * stride));
+    expect_true("FP4 batch values including untouched slots", host(vc, slots * stride) == host(old_v, slots * stride));
+    const auto actual = host(out, T * HD), expected = host(old_out, T * HD);
+    expect_true("FP4 batch attention equals per-row attention",
+                std::all_of(actual.begin(), actual.end(), [](float v) { return std::isfinite(v); }) &&
+                std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0);
+    if (time_graphs) {
+        for (int pass = 0; pass < 2; ++pass) {
+            CU(cudaMemcpy(old_q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice));
+            CU(cudaMemcpy(q, qrg.data(), qrg.size() * sizeof(float), cudaMemcpyHostToDevice));
+            float old_us, new_us;
+            if (pass == 0) old_us = time_attention_graph(per_row, stream);
+            new_us = time_attention_graph(batched, stream);
+            if (pass == 1) old_us = time_attention_graph(per_row, stream);
+            std::printf("FP4 attention rows=%d depth=%d pass=%d per_row_us=%.2f batched_us=%.2f\n",
+                        T, depth, pass + 1, old_us, new_us);
+        }
+    }
+    CU(cudaStreamDestroy(stream));
+    for (auto* ptr : {q, old_q, keys, values, sink, rel, out, old_out, scratch}) CU(cudaFree(ptr));
+    for (auto* ptr : {kc, vc, old_k, old_v}) CU(cudaFree(ptr));
+    CU(cudaFree(old_half));
+    CU(cudaFree(ds));
+    CU(cudaFree(dp));
+}
+
+#endif
+
 void test_fp4_kv_write() {
     constexpr int D = 128, T = 3, KV = 2, P = 17, KD = D * KV;
     const auto layout = k::Fp8KvLayout::global_fp4();
@@ -4115,6 +4219,14 @@ int main(int argc, char** argv) {
     CU(cudaGetDeviceProperties(&p, 0));
 #ifdef STRATA_USE_HIP
     std::printf("ik2_kernels_test on %s (%s)\n", p.name, p.gcnArchName);
+    if (argc == 2 && !std::strcmp(argv[1], "--fp4-batch")) {
+        for (int depth : {256, 2048})
+            for (int rows_per_slot : {1, 4}) test_fp4_sequence_attention(depth, rows_per_slot, true);
+        test_fp4_kv_write();
+        test_attn_decode_mma();
+        test_attn_multi();
+        return g_fail ? 1 : 0;
+    }
 #else
     std::printf("ik2_kernels_test on %s (sm_%d%d)\n", p.name, p.major, p.minor);
 #endif
@@ -4190,6 +4302,8 @@ int main(int argc, char** argv) {
 #ifdef STRATA_USE_HIP
     test_experts_mma(2304, 1152, 1);
     test_rdna3_speculative_kernels();
+    test_fp4_sequence_attention(256, 1, false);
+    test_fp4_sequence_attention(256, 4, false);
 #endif
     test_deep_attention();
     test_fp4_sequence_replay();

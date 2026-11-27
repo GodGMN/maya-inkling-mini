@@ -137,6 +137,19 @@ python3 src/tests/ik2_chat_growth.py http://127.0.0.1:18085 --server-pid "$pid" 
 
 `IK2_KV=fp4-global` stores 32 consecutive channels as sixteen E2M1 bytes and one FP16 scale. It applies to keys and values of the eight full-attention visits. The 40 sliding-window visits keep E4M3. The text weights are the same stock IQ4_NL GGUF. At 393,216 tokens the global KV payload is 3.375 GiB per conversation, including scales. Conversation state and windowed KV require additional memory.
 
+With the gfx1100 preset, the concurrent decoder batches FP4 global attention when the rows share a scalar attention bucket below position 8,192 and enough scratch space is available. Three kernel launches append the keys and values, compute attention and combine the partial results for the whole batch. Each row reads its own cache slot through its own position, including when several rows share a slot.
+
+Run `IK2_DECODE_SUBWAVE=1 IK2_SHARED_COMBINE=1 ./build-ik2/ik2_kernels_test --fp4-batch` to compare with per-row execution on deterministic synthetic caches. The test checks the complete packed K and V buffers, including an unused slot, and compares the FP32 attention outputs bit for bit. Its GPU-event timings cover a single layer's cache append, attention and gated output. Each measurement averages 32 graph replays after five warm-ups and repeats with the order reversed.
+
+The table gives the median of six measurements per path on an RX 7900 XTX with shared combine enabled (three runs in both orders). Both configurations use two cache slots. The two-row case advances each slot by one position. The eight-row case tests four consecutive positions in each slot. The second slot starts 19 positions earlier than the first.
+
+| First request position | Rows | Per-row execution (µs) | Batched execution (µs) |
+| ---: | ---: | ---: | ---: |
+| 256 | 2 | 55.4 | 38.9 |
+| 256 | 8 | 200.0 | 95.6 |
+| 2,048 | 2 | 214.3 | 161.5 |
+| 2,048 | 8 | 819.5 | 575.8 |
+
 Build and check the FP4 kernels with the existing Prometheus build containers:
 
 ```sh
