@@ -106,6 +106,9 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND CMAKE_CXX_COMPILE
 endif()
 
 if(STRATA_BUILD_TESTS)
+  add_executable(ik2_served_policy_test tests/ik2_served_policy_test.cpp)
+  target_include_directories(ik2_served_policy_test PRIVATE src/ik2)
+  add_test(NAME ik2_served_policy_test COMMAND ik2_served_policy_test)
   enable_testing()
   add_executable(ik2_host_ref_test tests/ik2_host_ref_test.cpp src/ik2/ik2_cpu.cpp)
   target_link_libraries(ik2_host_ref_test PRIVATE ik2_kernels Threads::Threads)

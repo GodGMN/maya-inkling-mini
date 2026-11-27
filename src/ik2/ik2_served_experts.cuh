@@ -11,15 +11,11 @@ struct ServedExperts {
     const uint8_t **device, **host;
     int *records, *published;
     int entries = 0;
-    uint64_t misses = 0, copies = 0, refills = 0;
+    uint64_t misses = 0, copies = 0, refills = 0, loop_reuses = 0;
 
     void build_table(Layer& ly, ServedLayer& s, int E) {
         auto tab = host + s.offset;
-        for (int e = 0; e < E; ++e) tab[e] = s.cold + e * s.bytes;
-        for (int i = 0; i < int(s.slots.owner.size()); ++i)
-            if (s.slots.owner[i] >= 0) tab[s.slots.owner[i]] = s.cache + i * s.bytes;
-        for (int i = 0; i < int(s.slots.reserve.size()); ++i)
-            tab[E + i] = s.cache + s.slots.reserve[i] * s.bytes;
+        s.slots.write_table(tab, E, s.cold, s.cache, s.bytes);
         ly.tab_h.assign(tab, tab + E);
     }
 
@@ -68,6 +64,8 @@ struct ServedExperts {
                 int record = published[v * c.K + k];
                 int e = record < 0 ? ~record : record;
                 ++w.use[l * c.E + e];
+                if (record >= 0 && m.L[l].tab_h[e] == layers[l].cold + e * layers[l].bytes)
+                    ++loop_reuses;
                 if (record < 0) {
                     ++misses;
                     ++copies;
@@ -90,21 +88,21 @@ struct ServedExperts {
 } served;
 
 __global__ void copy_served_experts(const int* picks, const uint8_t* const* table, const uint8_t* cold,
-                                    const uint8_t* const* reserve, size_t bytes) {
+                                    const uint8_t* const* reserve, size_t bytes, int* records) {
     int k = blockIdx.y, e = picks[k];
-    if (table[e] != cold + e * bytes) return;
+    bool miss = table[e] == cold + e * bytes;
+    if (!blockIdx.x && !threadIdx.x) records[k] = miss ? ~e : e;
+    if (!miss) return;
     auto src = reinterpret_cast<const uint4*>(table[e]);
     auto dst = reinterpret_cast<uint4*>(const_cast<uint8_t*>(reserve[k]));
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < bytes / 16; i += gridDim.x * blockDim.x)
         dst[i] = src[i];
 }
 
-__global__ void publish_served_experts(const int* picks, int K, const uint8_t** table, const uint8_t* cold,
-                                      const uint8_t* const* reserve, size_t bytes, const uint8_t** selected, int* records) {
+__global__ void publish_served_experts(const int* records, int K, const uint8_t** table,
+                                      const uint8_t* const* reserve, const uint8_t** selected) {
     int k = threadIdx.x;
     if (k >= K) return;
-    int e = picks[k];
-    bool miss = table[e] == cold + e * bytes;
-    if (miss) selected[k] = table[e] = reserve[k];
-    records[k] = miss ? ~e : e;
+    int record = records[k];
+    if (record < 0) selected[k] = table[~record] = reserve[k];
 }

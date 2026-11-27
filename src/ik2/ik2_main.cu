@@ -2715,9 +2715,9 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
         if (gpu_served) {
             const auto& layer = served.layers[l];
             auto reserve = Ly.tab_blob + c.E + M.V[vis].pass * c.K;
-            copy_served_experts<<<dim3(64, c.K), 256, 0, g_s>>>(rtop, Ly.tab_blob, layer.cold, reserve, layer.bytes);
-            publish_served_experts<<<1, c.K, 0, g_s>>>(rtop, c.K, Ly.tab_blob, layer.cold, reserve, layer.bytes,
-                                                       W.blob, served.records + vis * c.K);
+            int* records = served.records + vis * c.K;
+            copy_served_experts<<<dim3(64, c.K), 256, 0, g_s>>>(rtop, Ly.tab_blob, layer.cold, reserve, layer.bytes, records);
+            publish_served_experts<<<1, c.K, 0, g_s>>>(records, c.K, Ly.tab_blob, reserve, W.blob);
         }
 
 #ifdef IK2_HOST_AVX2
@@ -7113,8 +7113,9 @@ int main(int argc, char** argv) {
                     (int) out.size() - 1, gen_s, (out.size() - 1) / gen_s, (unsigned long long) (ec_sum([](ExpertCache& e) { return e.hits; }) - h0),
                     (unsigned long long) (ec_sum([](ExpertCache& e) { return e.misses; }) - m0));
     if (gpu_served)
-        std::printf("GPU-served expert misses=%llu copies=%llu reserve_refills=%llu\n",
-                    (unsigned long long)served.misses, (unsigned long long)served.copies, (unsigned long long)served.refills);
+        std::printf("GPU-served expert misses=%llu copies=%llu reserve_refills=%llu loop_reuses=%llu\n",
+                    (unsigned long long)served.misses, (unsigned long long)served.copies, (unsigned long long)served.refills,
+                    (unsigned long long)served.loop_reuses);
     std::printf("generated:");
     for (int t : out) std::printf(" %d", t);
     std::printf("\n");
