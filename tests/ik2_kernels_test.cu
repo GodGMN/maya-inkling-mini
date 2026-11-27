@@ -4161,15 +4161,97 @@ void test_batch_groups(int T, int ty) {
     cudaFree(h); cudaFree(y); cudaFree(href); cudaFree(yref);
 }
 
+// An expert spanning five tiles, two empty experts, and a different pick order on alternate tokens.
+void test_blackwell_prefill_routes() {
+    constexpr int T = 129, K = 2, S = T*K, E = 5, C = 64;
+    std::vector<int> picks(S);
+    std::vector<float> weights(S), scales{1, 2, 3, 4, 5};
+    std::vector<uint16_t> input(T*C);
+    for (int t = 0; t < T; ++t) {
+        picks[2*t + (t&1)] = 3;
+        picks[2*t + 1 - (t&1)] = t % 3 ? 0 : 2;
+    }
+    for (int i = 0; i < S; ++i) weights[i] = (1 + i % 4) * .125f;
+    for (int t = 0; t < T; ++t)
+        for (int j = 0; j < C; ++j)
+            input[t*C+j] = f2h_host(j % 16 == t % 16 ? std::ldexp(6.f, t % 5 - 3) : 0.f);
+    const size_t matrix = C * 36;
+    std::vector<uint8_t> matrices(E*matrix, 0);
+    for (int e = 0; e < E; ++e)
+        for (int r = 0; r < C; ++r) {
+            auto* block = matrices.data() + e*matrix + r*36;
+            std::fill_n(block, 4, uint8_t(0x38));
+            block[4 + r/16*8 + r%8] = uint8_t((e+1) << ((r & 8) ? 4 : 0));
+        }
+    auto *pool = dev(matrices);
+    std::vector<const uint8_t*> blobs(E);
+    for (int e = 0; e < E; ++e) blobs[e] = pool + e*matrix;
+    auto **table = dev(blobs);
+    auto *p = dev(picks), *inv = dev_n<int>(S);
+    auto *w = dev(weights), *sc = dev(scales), *sg = dev_n<float>(S), *su = dev_n<float>(S), *wt = dev_n<float>(S);
+    auto* plan = dev_n<uint8_t>(k::blackwell_group_bytes(k::blackwell_group_capacity(S, E)));
+    auto batch = k::blackwell_prefill_groups(p, w, S, K, E, table, sc, nullptr, sc, plan, sg, su, wt, inv, 0);
+    std::vector<int> tile_sizes;
+    for (int e = 0; e < E; ++e) {
+        const int count = std::count(picks.begin(), picks.end(), e);
+        for (int first = 0; first < count; first += 32)
+            tile_sizes.push_back(std::min(32, count - first));
+    }
+    tile_sizes.resize(batch.size, 0);
+    expect_true("resident prefill groups contain 32 picks before the tail", host(batch.counts, batch.size) == tile_sizes);
+    auto* x = dev(input);
+    auto* packed = dev_n<k::BlackwellActivation>(S);
+    auto* y = dev_n<float>(S*C);
+    auto* hidden = dev_n<uint16_t>(S*C);
+    auto* packed_h = dev_n<k::BlackwellActivation>(S);
+    k::blackwell_pack_rows(x, T, C, packed, 0);
+    // Reuse each expert's diagonal matrix for all three projections.
+    k::blackwell_expert_product(true, batch, 0, C, C, x, packed, sg, su, 20, 16, hidden, nullptr, 0, packed_h);
+    k::blackwell_expert_product(false, batch, 0, C, C, hidden, packed_h, nullptr, nullptr, 0, 0, nullptr, y, 0);
+    std::vector<double> expected(S*C);
+    const auto order = host(inv, S);
+    const auto gate = host(sg, S), up = host(su, S), down = host(wt, S);
+    bool maps = true;
+    for (int i = 0; i < S; ++i) {
+        const int e = picks[i], rank = picks[i^1] < e;
+        maps &= order[(i/2)*2 + rank] == i && gate[i] == scales[e] && up[i] == 1 && down[i] == weights[i]*scales[e];
+        for (int r = 0; r < C; ++r) {
+            const double diagonal = nvfp4_def(matrices.data()+e*matrix, r*C+r);
+            const double u = diagonal * h2f_host(input[(i/K)*C+r]);
+            if (u == 0) continue;
+            const double g = scales[e] * u;
+            const double h = h2f_host(f2h_host(20 * std::tanh(g/20) / (1 + std::exp(-g)) * 16 * std::tanh(u/16)));
+            // The single nonzero per block-16 always rounds to E2M1 six.
+            const double outer = std::ldexp(0.25, std::ilogb(h));
+            const double target = h / (6 * outer);
+            int best = 1;
+            for (int code = 2; code < 127; ++code) {
+                const double err = std::abs(e4m3fn_to_f32_host(code) - target);
+                const double prev = std::abs(e4m3fn_to_f32_host(best) - target);
+                if (err < prev || (err == prev && !(code & 1))) best = code;
+            }
+            expected[i*C+r] = diagonal * 6 * outer * e4m3fn_to_f32_host(best);
+        }
+    }
+    expect_true("Blackwell resident expert order and router scales", maps);
+    expect("Blackwell routed SwiGLU, hidden quantization and down vs FP64", host(y, S*C), expected, 0, 0);
+    CU(cudaFree(hidden)); CU(cudaFree(packed_h));
+    CU(cudaFree(y)); CU(cudaFree(packed)); CU(cudaFree(x)); CU(cudaFree(plan)); CU(cudaFree(wt)); CU(cudaFree(su));
+    CU(cudaFree(sg)); CU(cudaFree(sc)); CU(cudaFree(w)); CU(cudaFree(inv)); CU(cudaFree(p)); CU(cudaFree(table)); CU(cudaFree(pool));
+}
+
 // A forced peak of six fixes each vector's UE4M3 scale. Off-grid inputs
 // distinguish native quantization from the FP16 fallback.
-void test_blackwell_group(int members, int K, int N, bool gate) {
+enum class BlackwellPath { Inline, Verify, Prefill };
+
+void test_blackwell_group(int members, int K, int N, bool gate, BlackwellPath path) {
     const int blocks = K / 64;
     const size_t matrix = (size_t)N * blocks * 36;
     auto weights = rand_blocks(k::kNVFP4, (size_t)2 * N * K);
     for (size_t i = 0; i < weights.size(); i += 36)
         for (int j = 0; j < 4; ++j)
             weights[i+j] = (i / 36 + j) % 11 == 0 ? 0x7f : uint8_t(rng() % 30);
+    if (members == 1) weights[0] = weights[matrix] = 255;  // legacy scale, exactly representable input
     const float levels[] = {0, .5f, 1.125f, 1.5f, 1.875f, 3, 4, 6};
     const double rounded[] = {0, .5, 1, 1.5, 2, 3, 4, 6};
     std::vector<uint16_t> x(members * K);
@@ -4183,21 +4265,46 @@ void test_blackwell_group(int members, int K, int N, bool gate) {
             quant[m*K+k] = scale * rounded[code];
         }
     }
-    std::vector<int> order(k::kGroupMax), token(k::kGroupMax);
-    for (int i = 0; i < members; ++i) order[i] = members - 1 - i, token[i] = i;
+    const bool prefill = path == BlackwellPath::Prefill;
+    std::vector<int> order(std::max(members, k::kGroupMax)), token(order.size());
+    for (int i = 0; i < members; ++i) {
+        order[i] = prefill ? i : members - 1 - i;
+        token[i] = prefill ? members - 1 - i : i;
+    }
     auto *dx = dev(x), *dh = dev_n<uint16_t>(members*N);
     auto* dy = dev_n<float>(members*N);
     auto* dw = dev(weights);
     auto** blob = dev(std::vector<const uint8_t*>{dw});
     auto* count = dev(std::vector<int>{members});
     auto *row = dev(order), *tok = dev(token);
-    std::vector<float> actual;
-    if (gate) {
+    if (path != BlackwellPath::Inline) {
+        auto* packed = dev_n<k::BlackwellActivation>(members * blocks);
+        k::blackwell_pack_rows(dx, members, K, packed, 0);
+        k::BlackwellExpertBatch batch = prefill ? k::BlackwellExpertBatch{dw, nullptr, nullptr, tok, nullptr, members, true}
+                                                : k::BlackwellExpertBatch{nullptr, blob, count, tok, row, 1, false};
+        const int hidden_blocks = prefill && gate && N % 64 == 0 ? members * (N / 64) : 0;
+        auto* fused = hidden_blocks ? dev_n<k::BlackwellActivation>(hidden_blocks) : nullptr;
+        k::blackwell_expert_product(gate, batch, matrix, gate ? K : N, gate ? N : K, dx, packed,
+                                    nullptr, nullptr, 20, 20, dh, dy, 0, fused);
+        if (fused) {
+            auto* separate = dev_n<k::BlackwellActivation>(hidden_blocks);
+            k::blackwell_pack_rows(dh, members, N, separate, 0);
+            const auto a = host(fused, hidden_blocks), b = host(separate, hidden_blocks);
+            expect_true("fused SwiGLU NVFP4 codes and scales", !std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])));
+            CU(cudaFree(separate));
+            CU(cudaFree(fused));
+        }
+        CU(cudaFree(packed));
+    } else if (gate) {
         k::experts_gate_up_swiglu_g(blob, count, tok, row, 1, k::kNVFP4, k::kNVFP4, matrix, nullptr,
                                     K, N, nullptr, nullptr, 20, 20, dh, 0, dx);
-        for (uint16_t h : host(dh, members*N)) actual.push_back(h2f_host(h));
     } else {
         k::experts_down_g(blob, count, row, 1, k::kNVFP4, matrix, dx, N, K, dy, 0);
+    }
+    std::vector<float> actual;
+    if (gate) {
+        for (uint16_t h : host(dh, members*N)) actual.push_back(h2f_host(h));
+    } else {
         actual = host(dy, members*N);
     }
     std::vector<double> expected(actual.size());
@@ -4205,7 +4312,7 @@ void test_blackwell_group(int members, int K, int N, bool gate) {
         for (int r = 0; r < N; ++r) {
             double a = 0, b = 0;
             for (int k = 0; k < K; ++k) {
-                const double v = quant[m*K+k];
+                const double v = quant[(gate ? token[m] : m)*K+k];
                 a += v * nvfp4_def(weights.data(), r*K+k);
                 b += v * nvfp4_def(weights.data()+matrix, r*K+k);
             }
@@ -4250,10 +4357,16 @@ int main(int argc, char** argv) {
     if (argc == 2 && !std::strcmp(argv[1], "--blackwell")) {
         if (p.major != 12 || p.minor > 1) return 77;
         setenv("IK2_BLACKWELL_NVFP4", "1", 1);
+        expect_true("native Blackwell NVFP4 dispatch", k::use_blackwell_nvfp4());
         for (bool gate : {false, true}) {
-            test_blackwell_group(1, 64, gate ? 8 : 16, gate);
-            test_blackwell_group(7, 320, gate ? 24 : 48, gate);
+            test_blackwell_group(1, 64, gate ? 8 : 16, gate, BlackwellPath::Inline);
+            test_blackwell_group(7, 320, gate ? 24 : 48, gate, BlackwellPath::Inline);
+            for (int n = 1; n <= 8; ++n)
+                test_blackwell_group(n, 320, gate ? 24 : 48, gate, BlackwellPath::Verify);
+            for (int n : {1, 7, 19, 33, 64, 129})
+                test_blackwell_group(n, 320, gate ? 128 : 144, gate, BlackwellPath::Prefill);
         }
+        test_blackwell_prefill_routes();
         return g_fail ? 1 : 0;
     }
 #endif

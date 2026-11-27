@@ -3026,6 +3026,85 @@ __device__ __forceinline__ uint32_t q8_h2(uint32_t w, uint32_t scale) {
 #endif
 #endif
 
+// counts[e] becomes a cursor in the padded member table after the prefix sum.
+__global__ void bw_prefill_groups(const int* top, const float* weights, int slots, int K, int experts,
+                                  const uint8_t* const* table, const float* gs, const float* us, const float* ds,
+                                  int capacity, const uint8_t** blobs, int* sizes, int* tokens, int* rows,
+                                  float* gate, float* up, float* weight, int* inv) {
+    extern __shared__ int counts[];
+    int* starts = counts + experts;
+    const int tid = threadIdx.x;
+    for (int e = tid; e < experts; e += blockDim.x) counts[e] = 0;
+    for (int g = tid; g < capacity; g += blockDim.x) sizes[g] = 0;
+    __syncthreads();
+    for (int i = tid; i < slots; i += blockDim.x) atomicAdd(counts + top[i], 1);
+    __syncthreads();
+    if (!tid) {
+        int next = 0;
+        for (int e = 0; e < experts; ++e) {
+            starts[e] = next;
+            next += (counts[e] + kBlackwellPrefillRows - 1) / kBlackwellPrefillRows;
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e < experts; e += blockDim.x) {
+        for (int m = 0; m < counts[e]; m += kBlackwellPrefillRows) {
+            const int g = starts[e] + m / kBlackwellPrefillRows;
+            blobs[g] = table[e];
+            sizes[g] = min(kBlackwellPrefillRows, counts[e] - m);
+        }
+        counts[e] = starts[e] * kBlackwellPrefillRows;
+    }
+    __syncthreads();
+    for (int i = tid; i < slots; i += blockDim.x) {
+        const int e = top[i], t = i / K;
+        const int member = atomicAdd(counts + e, 1);
+        tokens[member] = t;
+        rows[member] = i;
+        gate[i] = gs ? gs[e] : 1.f;
+        up[i] = us ? us[e] : 1.f;
+        weight[i] = weights[i] * (ds ? ds[e] : 1.f);
+        int rank = 0;
+        for (int j = 0; j < K; ++j) rank += top[t*K+j] < e;
+        inv[t*K + rank] = i;
+    }
+}
+
+__global__ void bw_pack_rows_kernel(const uint16_t* x, size_t blocks, BlackwellActivation* packed) {
+#ifdef IK2_HAS_NATIVE_NVFP4
+    const size_t i = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) / 4;
+    // All lanes execute the shuffles, including a final partial warp.
+    const auto frag = bw_quantize(x + (i < blocks ? i : 0) * 64);
+    if (i >= blocks) return;
+    bw_store(packed[i], frag);
+#endif
+}
+
+__device__ __forceinline__ void bw_fp16_block(float (&v)[4], const uint8_t* ap, const uint8_t* bp,
+                                               const uint16_t* input) {
+    const int sub = threadIdx.x & 3;
+    uint32_t sa = f2h(ue4m3(ap[sub])), sb = f2h(ue4m3(bp[sub]));
+    sa |= sa << 16;
+    sb |= sb << 16;
+    uint32_t xx[8];
+
+    const uint32_t* xp = (const uint32_t*)(input + sub * 16);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) xx[i] = xp[i];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const uint32_t wa = ((const uint32_t*)(ap + 4))[sub * 2 + j];
+        const uint32_t wb = ((const uint32_t*)(bp + 4))[sub * 2 + j];
+#pragma unroll
+        for (int m = 0; m < 2; ++m) {
+            const uint32_t ra = wa >> (16 * m), rb = wb >> (16 * m);
+            const uint32_t af[4] = {ik2_fp4pair(ra, sa), ik2_fp4pair(rb, sb), ik2_fp4pair(ra >> 4, sa),
+                                    ik2_fp4pair(rb >> 4, sb)};
+            mma16816(v, af, xx[2 * j + m], xx[4 + 2 * j + m]);
+        }
+    }
+}
+
 template <bool Gate, int Splits, bool Q8 = false>
 __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, size_t offset, int C, int F,
                                    const uint16_t* h, uint16_t* hidden, float* out, const float* sg, const float* su,
@@ -3076,31 +3155,11 @@ __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, 
             // 0xff is outside the serialized UE4M3 range, but the reference
             // decoder accepts it. Preserve its legacy value on that block.
             if (native_fp4 && __all_sync(0xffffffff, ap[sub] != 255 && bp[sub] != 255)) {
-                bw_nvfp4_dot(v, ap, bp, (Gate ? input16 : h) + (size_t)input_row * K + k * 64);
+                bw_nvfp4_dot(v, bw_weights(ap, bp), bw_quantize((Gate ? input16 : h) + (size_t)input_row * K + k * 64));
                 continue;
             }
 #endif
-            uint32_t sa = f2h(ue4m3(ap[sub])), sb = f2h(ue4m3(bp[sub]));
-            sa |= sa << 16;
-            sb |= sb << 16;
-            uint32_t xx[8];
-            const int off = k * 64 + sub * 16;
-                const uint32_t* xp = (const uint32_t*)((Gate ? input16 : h) + (size_t)input_row * K + off);
-#pragma unroll
-                for (int i = 0; i < 8; ++i)
-                    xx[i] = xp[i];
-#pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                const uint32_t wa = ((const uint32_t*)(ap + 4))[sub * 2 + j];
-                const uint32_t wb = ((const uint32_t*)(bp + 4))[sub * 2 + j];
-#pragma unroll
-                for (int m = 0; m < 2; ++m) {
-                    const uint32_t ra = wa >> (16 * m), rb = wb >> (16 * m);
-                    const uint32_t af[4] = {ik2_fp4pair(ra, sa), ik2_fp4pair(rb, sb), ik2_fp4pair(ra >> 4, sa),
-                                            ik2_fp4pair(rb >> 4, sb)};
-                    mma16816(v, af, xx[2 * j + m], xx[4 + 2 * j + m]);
-                }
-            }
+            bw_fp16_block(v, ap, bp, (Gate ? input16 : h) + (size_t)input_row * K + k * 64);
         }
     __shared__ float4 partial[Splits][32];
     partial[split][lane] = make_float4(v[0], v[1], v[2], v[3]);
@@ -3130,6 +3189,88 @@ __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, 
             out[(size_t)dst * C + r + 8] = a1;
         }
     }
+}
+
+// Each warp owns separate output channels. Its weight registers feed all M/8 MMA
+// fragments before advancing K. Only the final scatter depends on the destination order.
+template <bool Gate, int M, int Warps>
+__global__ void __launch_bounds__(Warps * 32, M == kGroupMax ? (Gate ? 12 : 10) : 3) bw_tiled_product(
+    BlackwellExpertBatch batch, size_t offset, int C, int F, const uint16_t* input,
+    const BlackwellActivation* packed, const float* sg, const float* su, float gcap, float ucap,
+    uint16_t* hidden, float* y, BlackwellActivation* packed_hidden) {
+#ifdef IK2_HAS_NATIVE_NVFP4
+    constexpr bool pack_tile = Gate && M == kBlackwellPrefillRows;
+    __shared__ uint16_t tile[pack_tile ? M : 1][pack_tile ? 64 : 1];
+    constexpr int channels = Gate ? 8 : 16;
+    const int lane = threadIdx.x % 32, quad = lane / 4;
+    const int r0 = (blockIdx.x * Warps + threadIdx.x / 32) * channels;
+    const int group = blockIdx.y, first = group * M;
+    const bool contiguous = M != kGroupMax && batch.expert;
+    const int count = contiguous ? min(M, batch.size - first) : batch.counts[group];
+    if (!count || r0 >= (Gate ? F : C)) return;
+    const int blocks = (Gate ? C : F) / 64, r = r0 + quad;
+    const auto* expert = contiguous ? batch.expert : batch.groups[group];
+    const auto* a = expert + (Gate ? 0 : offset) + size_t(r) * blocks * 36;
+    const auto* b = a + (Gate ? offset : size_t(8) * blocks * 36);
+    size_t xblock[M / 8];
+#pragma unroll
+    for (int m = 0; m < M / 8; ++m) {
+        const int i = first + min(8 * m + quad, count - 1);
+        const int row = Gate ? batch.tokens[i] : contiguous ? i : batch.rows[i];
+        xblock[m] = size_t(row) * blocks;
+    }
+    float v[M / 8][4]{};
+    for (int k = 0; k < blocks; ++k) {
+        const auto* ap = a + k * 36;
+        const auto* bp = b + k * 36;
+        auto w = bw_weights(ap, bp);
+        if (__any_sync(0xffffffff, w.legacy)) {
+#pragma unroll
+            for (int m = 0; m < M / 8; ++m)
+                bw_fp16_block(v[m], ap, bp, input + 64 * (xblock[m] + k));
+        } else {
+#pragma unroll
+            for (int m = 0; m < M / 8; ++m)
+                bw_nvfp4_dot(v[m], w, bw_load(packed[xblock[m] + k]));
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < M / 8; ++m) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int member = 8 * m + 2 * (lane % 4) + j;
+            if (member >= count) continue;
+            const int dst = contiguous ? first + member : batch.rows[first + member];
+            if constexpr (Gate) {
+                const float g = v[m][j] * (sg ? sg[dst] : 1.f);
+                const float u = v[m][j+2] * (su ? su[dst] : 1.f);
+                const uint16_t h =
+                    f2h(gcap * tanhf(g / gcap) * (1.f / (1.f + expf(-g))) * ucap * tanhf(u / ucap));
+                hidden[size_t(dst) * F + r] = h;
+                if constexpr (pack_tile)
+                    if (packed_hidden) tile[member][r % 64] = h;
+            } else {
+                y[size_t(dst) * C + r] = v[m][j];
+                y[size_t(dst) * C + r + 8] = v[m][j+2];
+            }
+        }
+    }
+    if constexpr (pack_tile) {
+        // Packed output is requested only for full 64-channel CTAs. Four lanes
+        // quantize one row, including its scales, directly from the SwiGLU tile.
+        if (packed_hidden) {
+            __syncthreads();
+            const int member = threadIdx.x / 4;
+            if (member < M) {
+                const auto frag = bw_quantize(tile[min(member, count - 1)]);
+                if (member < count) {
+                    const int dst = contiguous ? first + member : batch.rows[first + member];
+                    bw_store(packed_hidden[size_t(dst) * (F / 64) + blockIdx.x], frag);
+                }
+            }
+        }
+    }
+#endif
 }
 
 // ---- one token's NVFP4 experts through the tensor cores, straight from their blocks into the registers.
@@ -6572,19 +6713,84 @@ void experts_gate_up_g(const uint8_t* const* blob, const int* n, const int* tok,
 // the grouped tensor-core path only in a window whose tokens are being verified.
 thread_local bool grouped_tensor_products = true;
 #ifndef STRATA_USE_HIP
-static bool use_blackwell_nvfp4() {
+bool use_blackwell_nvfp4() {
     static const bool enabled = getenv("IK2_BLACKWELL_NVFP4") && atoi(getenv("IK2_BLACKWELL_NVFP4"));
     if (!enabled) return false;
     int dev, major, minor;
-    if (cudaGetDevice(&dev) != cudaSuccess ||
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    static thread_local int last_device = -1;
+    static thread_local bool available = false;
+    if (dev == last_device) return available;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) return false;
-    return major == 12 && minor <= 1;
+    last_device = dev;
+    // A binary built with older virtual PTX can run on Blackwell via JIT,
+    // but its device pass omitted the architecture-specific MMA instructions.
+    cudaFuncAttributes attr{};
+    available = major == 12 && minor <= 1 &&
+                cudaFuncGetAttributes(&attr, bw_pack_rows_kernel) == cudaSuccess &&
+                attr.ptxVersion == 10 * major + minor;
+    return available;
+}
+int blackwell_group_capacity(int slots, int experts) {
+    const int distinct = std::min(slots, experts);
+    return distinct + (slots - distinct) / kBlackwellPrefillRows;
+}
+
+size_t blackwell_group_bytes(int groups) {
+    return size_t(groups) * (sizeof(const uint8_t*) + (1 + 2 * kBlackwellPrefillRows) * sizeof(int));
+}
+
+BlackwellExpertBatch blackwell_prefill_groups(const int* top, const float* weights, int slots, int K, int experts,
+                                              const uint8_t* const* table, const float* gs, const float* us,
+                                              const float* ds, void* scratch, float* gate, float* up, float* weight,
+                                              int* inv, cudaStream_t s) {
+    const int groups = blackwell_group_capacity(slots, experts);
+    auto** blobs = static_cast<const uint8_t**>(scratch);
+    int* counts = reinterpret_cast<int*>(blobs + groups);
+    int* tokens = counts + groups;
+    int* rows = tokens + groups * kBlackwellPrefillRows;
+    bw_prefill_groups<<<1, 256, 2 * experts * sizeof(int), s>>>(top, weights, slots, K, experts,
+        table, gs, us, ds, groups, blobs, counts, tokens, rows, gate, up, weight, inv);
+    check("bw_prefill_groups");
+    return {nullptr, blobs, counts, tokens, rows, groups, true};
+}
+
+void blackwell_pack_rows(const uint16_t* x, int rows, int K, BlackwellActivation* packed, cudaStream_t s) {
+    const size_t blocks = size_t(rows) * (K / 64);
+    bw_pack_rows_kernel<<<(blocks + 31) / 32, 128, 0, s>>>(x, blocks, packed);
+    check("bw_pack_rows");
+}
+
+template <bool Gate, int M>
+static void launch_bw_product(BlackwellExpertBatch batch, size_t offset, int C, int F,
+                              const uint16_t* input, const BlackwellActivation* packed,
+                              const float* sg, const float* su, float gcap, float ucap,
+                              uint16_t* hidden, float* y, cudaStream_t s, BlackwellActivation* packed_hidden) {
+    constexpr int warps = M == kGroupMax ? 4 : 8;
+    constexpr int N = warps * (Gate ? 8 : 16);
+    const int width = Gate ? F : C;
+    const int groups = batch.expert ? (batch.size + M - 1) / M : batch.size;
+    bw_tiled_product<Gate, M, warps><<<dim3((width + N - 1) / N, groups), warps * 32, 0, s>>>(
+        batch, offset, C, F, input, packed, sg, su, gcap, ucap, hidden, y, packed_hidden);
+    check("bw_tiled_product");
+}
+
+void blackwell_expert_product(bool gate, BlackwellExpertBatch batch, size_t offset, int C, int F,
+                              const uint16_t* input, const BlackwellActivation* packed,
+                              const float* sg, const float* su, float gcap, float ucap,
+                              uint16_t* hidden, float* y, cudaStream_t s, BlackwellActivation* packed_hidden) {
+    const auto launch = batch.prefill
+        ? (gate ? launch_bw_product<true, kBlackwellPrefillRows> : launch_bw_product<false, kBlackwellPrefillRows>)
+        : (gate ? launch_bw_product<true, kGroupMax> : launch_bw_product<false, kGroupMax>);
+    launch(batch, offset, C, F, input, packed, sg, su, gcap, ucap, hidden, y, s, packed_hidden);
 }
 int block_nvfp4_mma_mask() {
     static const int mask = getenv("IK2_GROUP_MMA") ? atoi(getenv("IK2_GROUP_MMA")) : 0;
     if (!grouped_tensor_products) return 0;
-    return use_blackwell_nvfp4() ? 3 : mask & 3;
+    // Small speculative-verify blocks (T <= 8) stay memory-bandwidth bound on GB10 and
+    // run faster with higher acceptance on the FP16 block path unless explicitly opted in.
+    return mask & 3;
 }
 #endif
 void enable_grouped_tensor_products(bool enabled) { grouped_tensor_products = enabled; }

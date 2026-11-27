@@ -588,6 +588,35 @@ void prep_qkv_r_f16_block(float* q, int q_ld, const float* q_clip, const float* 
 void route_rows(const float* logits, const float* bias, int T, int E, int K, float scale, int* top, float* w,
                 cudaStream_t s);
 #ifndef STRATA_USE_HIP
+// Packed activation for one 64-element K block, shared across output tiles.
+struct BlackwellActivation {
+    uint32_t q[8], scales;
+    float outer;
+};
+constexpr int kBlackwellPrefillRows = 32;
+bool use_blackwell_nvfp4();
+void blackwell_pack_rows(const uint16_t* x, int rows, int K, BlackwellActivation* packed, cudaStream_t s);
+// A single expert writes contiguous rows. Grouped batches gather and scatter via
+// the member table, with stride 32 for prefill and 8 for verification.
+struct BlackwellExpertBatch {
+    const uint8_t* expert;
+    const uint8_t* const* groups;
+    const int *counts, *tokens, *rows;
+    int size;  // rows for a single expert, groups otherwise
+    bool prefill;
+};
+// Build prefill tiles of up to kBlackwellPrefillRows picks per expert. inv lists each token's slots in expert order.
+int blackwell_group_capacity(int slots, int experts);
+size_t blackwell_group_bytes(int groups);
+BlackwellExpertBatch blackwell_prefill_groups(const int* top, const float* weights, int slots, int K, int experts,
+                                              const uint8_t* const* table, const float* gs, const float* us,
+                                              const float* ds, void* scratch, float* gate, float* up, float* weight,
+                                              int* inv, cudaStream_t s);
+void blackwell_expert_product(bool gate, BlackwellExpertBatch batch, size_t offset, int C, int F,
+                              const uint16_t* input, const BlackwellActivation* packed,
+                              const float* sg, const float* su, float gcap, float ucap,
+                              uint16_t* hidden, float* y, cudaStream_t s,
+                              BlackwellActivation* packed_hidden = nullptr);  // prefill gate/up, F divisible by 64
 /// Selected NVFP4 grouped MMA products for verification (bit 0 gate/up, bit 1 down).
 int block_nvfp4_mma_mask();
 #endif

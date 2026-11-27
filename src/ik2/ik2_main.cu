@@ -1983,6 +1983,17 @@ __global__ void combine_prefill_groups(const float* y, const int* rows, const fl
     }
 }
 
+#ifndef STRATA_USE_HIP
+bool blackwell_prefill_enabled() {
+    static const bool enabled = !getenv("IK2_BLACKWELL_PREFILL") || atoi(getenv("IK2_BLACKWELL_PREFILL"));
+    return enabled && allow_short_batch_products() && k::use_blackwell_nvfp4();
+}
+bool blackwell_verify_enabled() {
+    static const bool enabled = getenv("IK2_BLACKWELL_VERIFY") && atoi(getenv("IK2_BLACKWELL_VERIFY"));
+    return enabled && k::use_blackwell_nvfp4();
+}
+#endif
+
 void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq16, const int* top, const float* w,
                      const float* r_in, float* h_out, Work& W, ExpertCache& EC, double& t_exp) {
     const Config& c = M.c;
@@ -2062,8 +2073,17 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         XC.t_up += now() - tu;
         g_pf.lap(g_pf.upload);
 
+#ifndef STRATA_USE_HIP
+        const bool blackwell = k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, F) &&
+                               blackwell_prefill_enabled();
+        auto* packed_x = reinterpret_cast<k::BlackwellActivation*>(X.ex16);
+        auto* packed_h = reinterpret_cast<k::BlackwellActivation*>(X.gu32);
+        if (blackwell) k::blackwell_pack_rows(xin, T, C, packed_x, g_s);
+#else
+        constexpr bool blackwell = false;
+#endif
         static const bool batch_prefill = getenv("IK2_BATCH_PREFILL") && atoi(getenv("IK2_BATCH_PREFILL"));
-        const bool batch = batch_prefill && d == -1 && !Ly.tab_h.empty() && n_miss == 0 && T >= 64 && C % 8 == 0 &&
+        const bool batch = !blackwell && batch_prefill && d == -1 && !Ly.tab_h.empty() && n_miss == 0 && T >= 64 && C % 8 == 0 &&
                            (size_t)S * (2 * std::max(C, F) + 4 * C) <= X.lg_cap * 4 &&
                            (size_t)S * 2 * F * sizeof(float) <= X.gu32_bytes;
         if (batch) {
@@ -2115,10 +2135,21 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         // depend on the cache. Only [T][C] of scratch: no [T * K][C] copies of the inputs or the outputs.
         auto run_exp = [&](int e) {
             const int cnt_e = W.cnt[e], st_e = W.start[e];
-            gather_f16_16_kernel<<<cnt_e, 256, 0, g_s>>>(xin, X.gidx + st_e, cnt_e, C, X.ex16);
-            gate_up_product(e, X.ex16, X.gu32);
-            k::swiglu_cap_f32(X.gu32, cnt_e, F, X.sg + st_e, X.su + st_e, c.gate_cap, c.up_cap, X.h16, g_s);
-            down_product(e, X.h16, X.y32);
+#ifndef STRATA_USE_HIP
+            if (blackwell) {
+                k::BlackwellExpertBatch batch{X.slot_ptrs[e], nullptr, nullptr, X.gidx + st_e, nullptr, cnt_e, true};
+                k::blackwell_expert_product(true, batch, Ly.eb[0], C, F, xin, packed_x, X.sg + st_e, X.su + st_e,
+                                            c.gate_cap, c.up_cap, X.h16, nullptr, g_s, packed_h);
+                k::blackwell_expert_product(false, batch, Ly.eb[0] + Ly.eb[1], C, F, X.h16, packed_h,
+                                            nullptr, nullptr, 0, 0, nullptr, X.y32, g_s);
+            } else
+#endif
+            {
+                gather_f16_16_kernel<<<cnt_e, 256, 0, g_s>>>(xin, X.gidx + st_e, cnt_e, C, X.ex16);
+                gate_up_product(e, X.ex16, X.gu32);
+                k::swiglu_cap_f32(X.gu32, cnt_e, F, X.sg + st_e, X.su + st_e, c.gate_cap, c.up_cap, X.h16, g_s);
+                down_product(e, X.h16, X.y32);
+            }
             scatter_add_rows_kernel<<<cnt_e, 256, 0, g_s>>>(X.y32, X.gidx + st_e, X.wtr + st_e, C, X.tmp, C);
         };
         const bool pf = X.pf_layers[l % Work::kPfRing] == l;
@@ -3176,6 +3207,16 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
                                            buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
                 k::experts_block_down_linear(Ly.ty[2], buf.blob, buf.n, buf.row, groups, Ly.eb[0] + Ly.eb[1], C, c.F,
                                              W.h16, W.y32, g_s);
+            } else if (!rows && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F) &&
+                       blackwell_verify_enabled()) {
+                k::BlackwellExpertBatch batch{nullptr, buf.blob, buf.n, buf.tok, buf.row, groups, false};
+                auto* packed = reinterpret_cast<k::BlackwellActivation*>(W.gu32);
+                k::blackwell_pack_rows(W.x16, T, C, packed, g_s);
+                k::blackwell_expert_product(true, batch, Ly.eb[0], C, c.F, W.x16, packed, buf.sg, buf.su,
+                                            c.gate_cap, c.up_cap, W.h16, nullptr, g_s);
+                k::blackwell_pack_rows(W.h16, S, c.F, packed, g_s);
+                k::blackwell_expert_product(false, batch, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, packed,
+                                            nullptr, nullptr, 0, 0, nullptr, W.y32, g_s);
             } else if (!rows && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
                 const int mask = k::block_nvfp4_mma_mask();
                 if (mask & 1) {
@@ -3468,8 +3509,38 @@ void spec_step(Model& M, ik2::draft::Drafter* drafter, int anchor, int P, int B,
     ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, m - 1);
 }
 
-#ifdef STRATA_USE_HIP
-bool resident_wmma_prefill(const Config& c, const Layer& ly, int T, Work& w) {
+#ifndef STRATA_USE_HIP
+bool resident_expert_prefill(const Config& c, const Layer& ly, int T, Work& w, double& t_exp) {
+    const int C = c.C, F = c.F, S = T * c.K;
+    if (!g_fast || T < 2 || !ly.tab_blob || c.E > 1024 ||
+        !k::experts_mma_fits(ly.ty[0], ly.ty[1], ly.ty[2], C, F) ||
+        !blackwell_prefill_enabled()) return false;
+    const int groups = k::blackwell_group_capacity(S, c.E);
+    const size_t hidden_values = size_t(S) * F;
+    if (groups > 65535 || k::blackwell_group_bytes(groups) > size_t(2) * F * C * sizeof(uint16_t) ||
+        size_t(S) * C > w.lg_cap ||
+        hidden_values * sizeof(uint16_t) + hidden_values / 64 * sizeof(k::BlackwellActivation) > w.gu32_bytes) return false;
+
+    auto batch = k::blackwell_prefill_groups(w.route_d, (const float*)(w.route_d + S), S, c.K, c.E, ly.tab_blob,
+                                             ly.tab_sc[0], ly.tab_sc[1], ly.tab_sc[2], w.w16,
+                                             w.sg, w.su, w.wtr, w.inv, g_s);
+    g_pf.lap(g_pf.route);
+    const double te0 = now();
+    auto* packed_x = reinterpret_cast<k::BlackwellActivation*>(w.ex16);
+    auto* hidden = reinterpret_cast<uint16_t*>(w.gu32);
+    auto* packed_h = reinterpret_cast<k::BlackwellActivation*>(hidden + hidden_values);
+    k::blackwell_pack_rows(w.x16, T, C, packed_x, g_s);
+    k::blackwell_expert_product(true, batch, ly.eb[0], C, F, w.x16, packed_x, w.sg, w.su,
+                                c.gate_cap, c.up_cap, hidden, nullptr, g_s, packed_h);
+    k::blackwell_expert_product(false, batch, ly.eb[0] + ly.eb[1], C, F, hidden, packed_h,
+                                nullptr, nullptr, 0, 0, nullptr, w.lg, g_s);
+    combine_prefill_groups<<<T, 256, 0, g_s>>>(w.lg, w.inv, w.wtr, C, c.K, w.tmp);
+    g_pf.lap(g_pf.experts);
+    t_exp += now() - te0;
+    return true;
+}
+#else
+bool resident_expert_prefill(const Config& c, const Layer& ly, int T, Work& w, double&) {
     static const bool enabled = getenv("IK2_PREFILL_WMMA") && atoi(getenv("IK2_PREFILL_WMMA"));
     const int S = T * c.K, C = c.C, F = c.F;
     static const int fixed_rows = [] {
@@ -3483,7 +3554,7 @@ bool resident_wmma_prefill(const Config& c, const Layer& ly, int T, Work& w) {
     const int tile_rows = fixed_rows ? fixed_rows : S <= 8 * c.E ? 16 : S <= 16 * c.E ? 32 : 64;
     const int capacity = k::expert_tile_capacity(S, c.E, tile_rows);
     const int block = ly.ty[0] == k::kNVFP4 ? 64 : 32;
-    if (!enabled || !g_fast || T < 2 || !ly.tab_blob || c.E > 1024 ||
+    if (g_prof || !enabled || !g_fast || T < 2 || !ly.tab_blob || c.E > 1024 ||
         ly.ty[0] != ly.ty[1] || ly.ty[0] != ly.ty[2] || (ly.ty[0] != k::kIQ4_NL && ly.ty[0] != k::kQ8_0 && ly.ty[0] != k::kNVFP4) ||
         C % block || F % block || (size_t)capacity * sizeof(k::ExpertTile) > (size_t)T * F * sizeof(uint16_t) ||
         (size_t)S * std::max(C, F) * sizeof(uint16_t) > w.lg_cap * sizeof(float) ||
@@ -3664,14 +3735,13 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
-#ifdef STRATA_USE_HIP
-        if (dump.empty() && !g_prof && !g_trace && g_pop.empty() && resident_wmma_prefill(c, Ly, T, W)) {
+        if (dump.empty() && !g_trace && g_pop.empty() && resident_expert_prefill(c, Ly, T, W, t_exp)) {
             conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
             k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
             abl(W.h, T, C, 2);
+            g_pf.lap(g_pf.rest);
             continue;
         }
-#endif
         CU(cudaMemcpyAsync(W.route_h, W.route_d, (size_t) S * 8, cudaMemcpyDeviceToHost, g_s));
         const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && Ly.ty[0] == k::kNVFP4 &&
                               Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
