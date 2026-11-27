@@ -1,0 +1,25 @@
+{
+  "backend": "cuda",
+  "exe": "build/tintero",
+  "args": [
+    "--model",
+    "models/Inkling-2-Mini-UD-Q4_K_XL.gguf",
+    "--draft",
+    "models/dflash2/model.safetensors",
+    "--max-context",
+    "262144",
+    "--chunk",
+    "2048"
+  ],
+  "env": {
+    "IK2_KV": "fp8",
+    "IK2_FAST_LOAD": "1",
+    "IK2_BATCH": "8",
+    "IK2_BATCH_PREFILL": "1",
+    "IK2_BLACKWELL_NVFP4": "1",
+    "IK2_DFLASH2_QUANT": "q8",
+    "IK2_DFLASH2_SAMPLE": "prob"
+  },
+  "tokenizer": "ik2/tokenizer",
+  "model_name": "inkling-2-mini"
+}
