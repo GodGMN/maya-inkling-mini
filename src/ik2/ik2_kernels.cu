@@ -6788,7 +6788,9 @@ void blackwell_expert_product(bool gate, BlackwellExpertBatch batch, size_t offs
 int block_nvfp4_mma_mask() {
     static const int mask = getenv("IK2_GROUP_MMA") ? atoi(getenv("IK2_GROUP_MMA")) : 0;
     if (!grouped_tensor_products) return 0;
-    return use_blackwell_nvfp4() ? 3 : mask & 3;
+    // Small speculative-verify blocks (T <= 8) stay memory-bandwidth bound on GB10 and
+    // run faster with higher acceptance on the FP16 block path unless explicitly opted in.
+    return mask & 3;
 }
 #endif
 void enable_grouped_tensor_products(bool enabled) { grouped_tensor_products = enabled; }

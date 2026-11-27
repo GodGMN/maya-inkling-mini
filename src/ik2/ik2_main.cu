@@ -1988,6 +1988,10 @@ bool blackwell_prefill_enabled() {
     static const bool enabled = !getenv("IK2_BLACKWELL_PREFILL") || atoi(getenv("IK2_BLACKWELL_PREFILL"));
     return enabled && allow_short_batch_products() && k::use_blackwell_nvfp4();
 }
+bool blackwell_verify_enabled() {
+    static const bool enabled = getenv("IK2_BLACKWELL_VERIFY") && atoi(getenv("IK2_BLACKWELL_VERIFY"));
+    return enabled && k::use_blackwell_nvfp4();
+}
 #endif
 
 void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq16, const int* top, const float* w,
@@ -3204,7 +3208,7 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
                 k::experts_block_down_linear(Ly.ty[2], buf.blob, buf.n, buf.row, groups, Ly.eb[0] + Ly.eb[1], C, c.F,
                                              W.h16, W.y32, g_s);
             } else if (!rows && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F) &&
-                       k::use_blackwell_nvfp4()) {
+                       blackwell_verify_enabled()) {
                 k::BlackwellExpertBatch batch{nullptr, buf.blob, buf.n, buf.tok, buf.row, groups, false};
                 auto* packed = reinterpret_cast<k::BlackwellActivation*>(W.gu32);
                 k::blackwell_pack_rows(W.x16, T, C, packed, g_s);
