@@ -16,6 +16,7 @@ import hashlib
 import json
 import threading
 import unittest
+import urllib.request
 from pathlib import Path
 
 from serve import server
@@ -81,8 +82,9 @@ def service(*scripts, model_name="inkling-2-small"):
 
 def answer(svc, req):
     msgs, tools, kw = openai_to_messages(req)
-    ids, thinking, max_new = svc.prepare(msgs, tools, kw, 500)
-    sampling = {k: kw.get(k) for k in ("_prefill", "_blocked", "_think_resume")}
+    ids, thinking, max_new = svc.prepare(msgs, tools, kw, req.get("max_tokens", 500))
+    sampling = {"thinking_budget": req.get("thinking_budget")}
+    sampling.update({k: kw.get(k) for k in ("_prefill", "_blocked", "_think_resume")})
     events, done = [], None
     for kind, x in svc.run(ids, thinking, tools, max_new, sampling, threading.Event()):
         if kind == "event":
@@ -191,6 +193,77 @@ class Parser(unittest.TestCase):
 
 
 class Serving(unittest.TestCase):
+    def test_budget_counts_payload_across_segments(self):
+        head = MODEL + THINK + "a" + END + MODEL + THINK + "bc"
+        for guard in (True, False):
+            with self.subTest(guard=guard):
+                svc, eng, tok = service(head + "def", "OK" + END, model_name="inkling-2-mini")
+                svc.loop_guard = guard
+                svc.think_budget = 3
+                self.assertTrue(svc.think_budget_info()["supported"])
+                got = answer(svc, {"messages": ASK})
+                self.assertEqual((got["reasoning"], got["content"]), ("abc", "OK"))
+                self.assertEqual(eng.prompts[1], eng.prompts[0] + tok.encode(head + END + MODEL + TEXT,
+                                                                            parse_special=True))
+
+    def test_budget_preserves_natural_transition_and_disabled_requests(self):
+        script = MODEL + THINK + "why" + END + MODEL + TEXT + "OK" + END
+        for fields, default in (({}, 0), ({"thinking_budget": None}, 0), ({"thinking_budget": 4}, 1),
+                                ({"thinking_budget": 0}, 1)):
+            with self.subTest(fields=fields):
+                svc, eng, _ = service(script)
+                svc.think_budget = default
+                got = answer(svc, {"messages": ASK, **fields})
+                self.assertEqual((got["reasoning"], got["content"]), ("why", "OK"))
+                self.assertEqual(len(eng.prompts), 1)
+        svc, eng, _ = service("OK" + END)
+        svc.think_budget = 1
+        got = answer(svc, {"messages": ASK, "reasoning_effort": "none"})
+        self.assertEqual((got["reasoning"], got["content"], len(eng.prompts)), ("", "OK", 1))
+
+    def test_budget_reserves_room_for_answer(self):
+        svc, eng, _ = service(MODEL + THINK + "abcdefghijklmnopqrstuvwxyz", "OK" + END)
+        got = answer(svc, {"messages": ASK, "thinking_budget": 1000, "max_tokens": 20})
+        self.assertEqual((got["reasoning"], got["content"]), ("abcdefghij", "OK"))
+        self.assertEqual(got["done"]["reasoning_tokens"], 10)
+        self.assertLessEqual(got["done"]["completion_tokens"], 20)
+        self.assertEqual(len(eng.prompts), 2)
+
+    def test_budget_over_http(self):
+        for path in ("chat/completions", "messages", "responses"):
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    svc, eng, _ = service(MODEL + THINK + "abcdef", "OK" + END, model_name="inkling-2-mini")
+                    httpd = server.serve(svc, port=0)
+                    try:
+                        body = {"input": "Hi", "max_output_tokens": 20} if path == "responses" else {
+                            "messages": ASK, "max_tokens": 20}
+                        body.update(thinking_budget=3, stream=stream)
+                        req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_port}/v1/{path}",
+                                                     json.dumps(body).encode(), {"Content-Type": "application/json"})
+                        with urllib.request.urlopen(req, timeout=10) as response:
+                            wire = response.read().decode()
+                        if stream:
+                            frames = [json.loads(line[6:]) for line in wire.splitlines()
+                                      if line.startswith("data: ") and line != "data: [DONE]"]
+                        if path == "chat/completions":
+                            parts = [f["choices"][0]["delta"] for f in frames if f["choices"]] if stream else [
+                                json.loads(wire)["choices"][0]["message"]]
+                            reasoning, content = ("".join(p.get(key) or "" for p in parts)
+                                                  for key in ("reasoning_content", "content"))
+                        elif path == "messages":
+                            parts = [f["delta"] for f in frames if f["type"] == "content_block_delta"] if stream else (
+                                json.loads(wire)["content"])
+                            reasoning, content = ("".join(p.get(key, "") for p in parts) for key in ("thinking", "text"))
+                        else:
+                            result = frames[-1]["response"] if stream else json.loads(wire)
+                            reasoning, content = [item["content"][0]["text"] for item in result["output"]]
+                        self.assertEqual((reasoning, content), ("abc", "OK"))
+                        self.assertEqual(len(eng.prompts), 2)
+                    finally:
+                        httpd.shutdown()
+                        httpd.server_close()
+
     def test_repeated_reasoning_can_finish_with_its_own_answer(self):
         draft = "Check hours at the end of each month. " * 3
         svc, eng, _ = service(MODEL + THINK + draft + END + MODEL + TEXT + "July." + END)

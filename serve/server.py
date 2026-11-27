@@ -2572,6 +2572,26 @@ class RequestStat:
         return (n1 - start[1] + 1) / max(RATE_MIN_SPAN_S, now - start[0])
 
 
+class InklingThinkingBudget:
+    """Count reasoning payload IDs across all decode slices of one request."""
+
+    def __init__(self, marks: dict[str, int], limit: int, max_new: int):
+        self.think = marks[INK_THINK]
+        self.markers = frozenset(marks.values())
+        self.close = (marks[INK_END], marks[INK_MODEL], marks[INK_TEXT])
+        self.answer_reserve = max(1, min(1024, max_new // 4))
+        self.remaining = limit
+        self.active = False
+
+    def reached(self, token: int, room: int) -> bool:
+        if token in self.markers:
+            self.active = token == self.think
+        elif self.active:
+            self.remaining -= 1
+        # Leave room for the complete header and answer text when max_tokens binds first.
+        return self.active and (self.remaining <= 0 or room <= len(self.close) + self.answer_reserve)
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -2670,7 +2690,7 @@ class Service:
         end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else \
             (_special_ids("</think%s>" % template.hy4_tag) or _special_ids("</think>")) \
             if getattr(template, "hy4", False) else _special_ids("</think>")
-        self.think_end_id = end[0] if end else None
+        self.think_end_id = end[0] if end and not getattr(template, "inkling", False) else None
         self.inkling_marks = {}
         self.native_inkling_guard = False
         if getattr(template, "inkling", False):
@@ -2702,6 +2722,9 @@ class Service:
         line takes, before anything is sent.  A logit_bias needs an engine that applies it (INFO logit_bias=1): an
         older one would answer as if it had none."""
         check_request_sampling(req)
+        budget = req.get("thinking_budget")
+        if budget is not None and (type(budget) is not int or budget < 0):
+            raise ValueError("thinking_budget must be a non-negative integer")
         bias = logit_bias_of(req.get("logit_bias"), len(getattr(self.tok, "tokens", None) or ()) or None)
         if bias and (getattr(self.engine, "info", None) or {}).get("logit_bias") != 1:
             raise ValueError("logit_bias: this engine does not apply token biases - update Maya (./maya.sh --setup)")
@@ -3052,12 +3075,15 @@ class Service:
             return glm_dsa_product.LABEL
         return None
 
+    def supports_thinking_budget(self) -> bool:
+        return self.think_end_id is not None or getattr(self, "native_inkling_guard", False)
+
     def think_budget_info(self) -> dict:
         """The dashboard's Thinking budget: tokens (0 = no limit), whether this model has a think block at all; and
         GLM-5.3's for a request that asks for Max itself while the budget is the default ("max_level":
         think_budget_max, the most it gets - absent for every other model)."""
         top = getattr(self, "think_budget_max", 0)
-        return {"budget": int(self.think_budget or 0), "supported": self.think_end_id is not None,
+        return {"budget": int(self.think_budget or 0), "supported": self.supports_thinking_budget(),
                 "saved": bool(self.config_path), **({"max_level": top} if top else {})}
 
     @staticmethod
@@ -3072,7 +3098,7 @@ class Service:
         """The dashboard's Thinking budget: 0 or 256..262144 tokens.  It applies from the next request (think_budget is
         read per request, no restart) and is saved into the run config - marked as the user's own, so a setup or a
         switch keeps it."""
-        if self.think_end_id is None:
+        if not self.supports_thinking_budget():
             raise ValueError("this model has no thinking budget")
         n = maya_quants.check_thinking_budget(value)
         self.think_budget = n
@@ -4367,7 +4393,8 @@ class Service:
             c[{loop_guard.PENALTY: "penalised", loop_guard.CLOSE_THINKING: "thinking_closed",
                loop_guard.STOP: "stopped"}[act.kind]] += 1
 
-    def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat, calls, guard=None) -> Iterator[int | None]:
+    def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat, calls, guard=None,
+                ink_budget: InklingThinkingBudget | None = None) -> Iterator[int | None]:
         """engine.generate(), in fair slices (MAYA_FAIR_SLICE_S): once this answer has been decoding that long and
         another request waits for the engine, the engine stops here, the FIFO goes to the next request and this one
         queues behind it.  Back in turn, it goes on with prompt + what it already wrote as the new prompt: the
@@ -4409,6 +4436,8 @@ class Service:
                     if t is None:
                         continue
                     produced.append(t)
+                    if ink_budget is not None:
+                        closed = ink_budget.reached(t, max_new - len(produced))
                     if soft_text is not None:
                         if t == think_end:
                             soft_text = None            # (closed: by the model, or the engine's budget)
@@ -4450,6 +4479,20 @@ class Service:
                 fresh = getattr(self.engine, "last", None)
                 if fresh is not None and fresh is not last0:
                     calls.append(fresh)
+            if closed and ink_budget is not None:
+                if max_new - len(produced) < len(ink_budget.close):
+                    break
+                produced.extend(ink_budget.close)
+                ink_budget.active = False
+                sent = len(produced)
+                yield from ink_budget.close
+                if guard is not None:
+                    guard.thinking_closed(produced)
+                left = max_new - len(produced)
+                if left <= 0 or cancel.is_set() or self.stopping:
+                    break
+                cur = list(ids) + produced
+                continue
             if closed:                                  # the budget, at a sentence's or line's end: the thinking ends
                 later = len(produced) - soft
                 canon = self._closed_as_rendered(ids, produced, think_end)
@@ -4473,6 +4516,8 @@ class Service:
                 del produced[max(sent, len(produced) - act.drop):]   # (what was sent stays sent: only the held tail goes)
                 if act.kind == loop_guard.CLOSE_THINKING:
                     produced.extend(guard.close_tokens[:max_new - len(produced)])
+                    if ink_budget is not None:
+                        ink_budget.active = False
                 guard.resume(produced, act)
                 self._loop_noted(act, len(produced))
                 if act.kind == loop_guard.STOP or len(produced) >= max_new or cancel.is_set() or self.stopping:
@@ -4647,7 +4692,11 @@ class Service:
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
                 in_think = bool(thinking) and self.think_end_id is not None   # (tracked with no budget too, #786)
-                budgeted = in_think and self.think_budget > 0   # (0 = no budget: the end token is still tracked)
+                requested_budget = (sampling or {}).get("thinking_budget")
+                think_budget = self.think_budget if requested_budget is None else requested_budget
+                ink_budget = InklingThinkingBudget(self.inkling_marks, think_budget, max_new) if (
+                    self.native_inkling_guard and thinking and think_budget > 0) else None
+                budgeted = in_think and think_budget > 0   # (0 = no budget: the end token is still tracked)
                 # The thinking budget is the config's ("thinking_budget"); a request's max_tokens (or the context
                 # left) lowers it only when that output limit is tiny, THINK_TINY_LIMIT (1024) tokens or fewer - a
                 # side request such as a title, which must still get an answer: a reserve is kept for it (a quarter,
@@ -4655,13 +4704,12 @@ class Service:
                 # limit is the client's cap on the whole output and leaves the budget alone: a chat client's
                 # max_tokens=4096 used to cut the thinking to ~3K tokens and close it while the model was still
                 # reasoning. The forced </think> also consumes one token of max_new, so account for it.
-                think_budget = self.think_budget
                 # GLM-5.3, a request that asks for Max itself (asked_max) while the budget is the default: the long
                 # budget (think_budget_max, 65536; the owner, 2026-11-07) as far as its room allows - max_new (its
                 # max_tokens, or the context left) keeps THINK_LONG_RESERVE for the answer - and never below the
                 # budget every level gets; the limits below apply to it alike
                 top = getattr(self, "think_budget_max", 0)
-                if top > think_budget > 0 and max_new and self.asked_max(sampling):
+                if requested_budget is None and top > think_budget > 0 and max_new and self.asked_max(sampling):
                     think_budget = min(top, max(think_budget, int(max_new) - THINK_LONG_RESERVE))
                 soft = None                             # (the budget closed at a sentence's or line's end: _sliced)
                 if budgeted and max_new and int(max_new) <= THINK_TINY_LIMIT:
@@ -4714,7 +4762,8 @@ class Service:
                                                                  piece=self._guard_piece())
                         guards[:] = [guard] if guard is not None else []
                         first_call = len(calls)
-                        sliced, got = self._sliced(prompt, left, sampling, cancel, emb, hold, stat, calls, guard), 0
+                        sliced = self._sliced(prompt, left, sampling, cancel, emb, hold, stat, calls, guard, ink_budget)
+                        got = 0
                         try:
                             for t in sliced:
                                 got += t is not None
@@ -4863,7 +4912,9 @@ class Service:
                             in_think = bool(thinking) and self.think_end_id is not None
                             continue
                         seg["ids"].append(t)
-                        if parser.state == "reasoning":
+                        if ink_budget is not None:
+                            reasoning_tokens += parser.dsml.mode == "think" and t not in ink_budget.markers
+                        elif parser.state == "reasoning":
                             reasoning_tokens += 1
                         if n_top is not None:
                             e = logprob_entry(self.tok, t, n_top)
@@ -7670,8 +7721,11 @@ def main() -> int:
         print(f"[maya] thinking level when a request names none: {level}"
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
               flush=True)
-    svc.think_budget = int(cfg["thinking_budget"] if cfg.get("thinking_budget") is not None else
-                           maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else 32768)         if svc.think_end_id is not None else 0
+    if svc.native_inkling_guard:
+        svc.think_budget = int(cfg.get("thinking_budget") or 0)
+    elif svc.think_end_id is not None:
+        default_budget = maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else 32768
+        svc.think_budget = int(cfg["thinking_budget"] if cfg.get("thinking_budget") is not None else default_budget)
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
     # GLM-5.3 (glm-dsa): a request that asks for Max itself may think up to 65536 tokens while the budget is the
     # default (the owner, 2026-11-07); a budget the user set applies at every level (Service.think_budget_max)
