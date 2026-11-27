@@ -6,7 +6,7 @@ COPY src/ src/
 COPY include/ include/
 COPY third_party/ third_party/
 RUN cmake -S . -B /build -G Ninja -DSTRATA_BUILD_TESTS=OFF \
-      -DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1100 -DGPU_TARGETS=gfx1100 \
+      -DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES="gfx1100;gfx1151" -DGPU_TARGETS="gfx1100;gfx1151" \
       -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=/opt/rocm && \
     cmake --build /build --target tintero --parallel 2
 
@@ -14,6 +14,8 @@ FROM scratch AS bundle
 COPY --from=build /build/tintero /build-ik2/tintero
 COPY VERSION LICENSE* maya.py setup.py maya.sh /
 COPY third_party/ggml/LICENSE /LICENSE.ggml
+COPY third_party/ciru/LICENSE /LICENSE.ciru
+COPY third_party/ciru/NOTICE /NOTICE.ciru
 COPY serve/ /serve/
 COPY tools/ /tools/
 COPY ref/ /ref/

@@ -2,7 +2,7 @@
 
 `tintero` runs [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) with every weight in the VRAM of one 24 GB card. This page is how to build and run it, what speed to expect, and how it works. The engine's design notes, with the model's exact arithmetic, are in [INKLING2.md](INKLING2.md) (section 8 is Mini).
 
-For the experimental RX 7900 XTX build, see the [gfx1100 port notes](HIP-PORT.md).
+The HIP build targets RX 7900 XTX (`gfx1100`) and Strix Halo (`gfx1151`). To build both code objects, configure with `-DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES="gfx1100;gfx1151"`. Run with `IK2_KV=fp4` to pack both global and sliding-window KV into 4-bit E2M1. Use `IK2_KV=fp4-global` to keep sliding attention in FP8. Add `IK2_PAGED_KV=1` for 16-token pages. The Radeon preset enables resident WMMA expert prefill. See the [gfx1100 measurements and settings](HIP-PORT.md).
 
 ## Quick start
 

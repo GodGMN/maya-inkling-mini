@@ -30,12 +30,16 @@ using Half2 = _Float16 __attribute__((ext_vector_type(2)));
 using HalfWords = uint32_t __attribute__((ext_vector_type(8)));
 
 // FP16 encodes 1024..1279 at unit spacing. Bias two signed bytes into this range, subtract 1152 exactly,
-// then multiply by the block's FP16 scale. Each packed multiply rounds once, as in dequantize-to-half.
+// yielding the two integer weights exactly.
+template <bool Upper>
+__device__ __forceinline__ Half2 unscaled_byte_pair(uint32_t bytes) {
+    const uint32_t biased = __builtin_amdgcn_perm(0x64646464u, bytes ^ 0x80808080u, Upper ? 0x04030402u : 0x04010400u);
+    return __builtin_bit_cast(Half2, biased) - (_Float16)1152;
+}
+
 template <bool Upper>
 __device__ __forceinline__ uint32_t scaled_byte_pair(uint32_t bytes, _Float16 scale) {
-    const uint32_t biased = __builtin_amdgcn_perm(0x64646464u, bytes ^ 0x80808080u, Upper ? 0x04030402u : 0x04010400u);
-    const Half2 values = __builtin_bit_cast(Half2, biased) - (_Float16)1152;
-    return __builtin_bit_cast(uint32_t, values * scale);
+    return __builtin_bit_cast(uint32_t, unscaled_byte_pair<Upper>(bytes) * scale);
 }
 
 __device__ __forceinline__ Half16 planar_fragment(const int8_t* weights, _Float16 scale) {
@@ -125,12 +129,25 @@ __global__ void nv_token_wmma(const uint8_t* const* experts, size_t offset, cons
     const uint8_t* w = experts[slot] + expert_byte_offset<kNVFP4>((size_t)row * K) + (Gate ? 0 : offset);
     const uint16_t* x = input + (Gate ? (lane & 1) * K : (size_t)slot * K);
     Float8 first = {}, second = {};
+    // Pipeline the next weight fragments as in CIRU hip_moe_decode.hip
+    // (Copyright 2026 Ciru, Apache-2.0). The last iteration has no lookahead load.
+    Half16 gate{}, up{};
+    if (split * 16 < K) {
+        gate = expert_fragment<kNVFP4>(w, split * 16);
+        if constexpr (Gate) up = expert_fragment<kNVFP4>(w + offset, split * 16);
+    }
     for (int k = split * 16; k < K; k += splits * 16) {
+        const Half16 g = gate, u = up;
+        const int next = k + splits * 16;
+        if (next < K) {
+            gate = expert_fragment<kNVFP4>(w, next);
+            if constexpr (Gate) up = expert_fragment<kNVFP4>(w + offset, next);
+        }
         Half16 a;
         __builtin_memcpy(&a, x + k, sizeof(a));
-        first = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, expert_fragment<kNVFP4>(w, k), first);
+        first = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, g, first);
         if constexpr (Gate)
-            second = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, expert_fragment<kNVFP4>(w + offset, k), second);
+            second = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, u, second);
     }
     if constexpr (Gate) {
         const float g = first[0] + __shfl_xor(first[0], 16);
@@ -241,6 +258,7 @@ struct ExpertActivation {
     const float *gate_scale, *up_scale;
     float gate_cap, up_cap;
     uint16_t* hidden;
+    const int* tokens;
 };
 
 template <int Type, int Depth, bool Activate = false>
@@ -261,6 +279,17 @@ __global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts,
     }
     const int col0 = blockIdx.x * (Activate ? 32 : 64);
     const int m0 = (wave / 2) * 32, n0 = (wave % 2) * 32;
+    // CIRU hip_moe_prefill.hip (Copyright 2026 Ciru, Apache-2.0) resolves sorted
+    // token rows before the K loop. Load the gate/up input directly from its source token.
+    constexpr int loads = 64 * vectors / 128;
+    int token_rows[Activate ? loads : 1];
+    if constexpr (Activate) {
+#pragma unroll
+        for (int load = 0; load < loads; ++load) {
+            const int row = row0 + (tid + load * 128) / vectors;
+            token_rows[load] = row < T ? activation.tokens[row] : 0;
+        }
+    }
     Float8 accum[2][2] = {};
     for (int k0 = 0; k0 < K; k0 += Depth) {
 #pragma unroll
@@ -268,7 +297,10 @@ __global__ void tiled_gemm(const uint16_t* dense, const uint8_t* const* experts,
             const int f = tid + load * 128, row = f / vectors, vec = f % vectors;
             const int k = k0 + vec * 8;
             uint4 av = {};
-            if (row0 + row < T) __builtin_memcpy(&av, input + (size_t)(row0 + row) * K + k, sizeof(av));
+            if (row0 + row < T) {
+                const int token = Activate ? token_rows[load] : row0 + row;
+                __builtin_memcpy(&av, input + (size_t)token * K + k, sizeof(av));
+            }
             a[row][vec] = av;
             if constexpr (Type == kDenseF16) {
                 uint4 bv = {};
@@ -770,7 +802,26 @@ __global__ void rdna3_block_down_nvfp4_kernel(const uint8_t* const* __restrict__
     }
 }
 
-// Grouped block-verify 32-weight block (Q8_0 / IQ4_NL) gate/up + SwiGLU: scaled_byte_pair + v_dot2_f32_f16.
+// Each lane owns four low and four high weights of a 32-weight GGUF block.
+struct BlockDot8 {
+    uint32_t w0, w1, w2, w3;
+
+    __device__ BlockDot8(uint32_t lo, uint32_t hi)
+        : w0(__builtin_bit_cast(uint32_t, unscaled_byte_pair<false>(lo))),
+          w1(__builtin_bit_cast(uint32_t, unscaled_byte_pair<true>(lo))),
+          w2(__builtin_bit_cast(uint32_t, unscaled_byte_pair<false>(hi))),
+          w3(__builtin_bit_cast(uint32_t, unscaled_byte_pair<true>(hi))) {}
+
+    __device__ float dot(const uint16_t* x) const {
+        const uint2 lo = *(const uint2*)x, hi = *(const uint2*)(x + 16);
+        float sum = fdot2_u32(w0, lo.x, 0.f);
+        sum = fdot2_u32(w1, lo.y, sum);
+        sum = fdot2_u32(w2, hi.x, sum);
+        return fdot2_u32(w3, hi.y, sum);
+    }
+};
+
+// Grouped block-verify 32-weight block (Q8_0 / IQ4_NL) gate/up + SwiGLU.
 template <int Type, int MaxT>
 __global__ void rdna3_block_gu_32_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n,
                                          const int* __restrict__ tok, const int* __restrict__ row, size_t off_up,
@@ -807,19 +858,13 @@ __global__ void rdna3_block_gu_32_kernel(const uint8_t* const* __restrict__ blob
                 __builtin_memcpy(&gl, bg + 2 + word * 4, 4);
                 __builtin_memcpy(&gh, bg + 18 + word * 4, 4);
             }
-            const _Float16 dg = __builtin_bit_cast(_Float16, dg16);
-            const uint32_t w0 = scaled_byte_pair<false>(gl, dg), w1 = scaled_byte_pair<true>(gl, dg);
-            const uint32_t w2 = scaled_byte_pair<false>(gh, dg), w3 = scaled_byte_pair<true>(gh, dg);
+            const float dg = __builtin_bit_cast(_Float16, dg16);
+            const BlockDot8 weights(gl, gh);
 #pragma unroll
             for (int t = 0; t < MaxT; ++t) {
                 if (t >= ng) break;
                 const uint16_t* xp = x16 + (size_t)tok_g[t] * C + koff;
-                const uint2 xl = *(const uint2*)(xp);
-                const uint2 xh = *(const uint2*)(xp + 16);
-                float a = ag[t];
-                a = fdot2_u32(w0, xl.x, a); a = fdot2_u32(w1, xl.y, a);
-                a = fdot2_u32(w2, xh.x, a); a = fdot2_u32(w3, xh.y, a);
-                ag[t] = a;
+                ag[t] = fmaf(dg, weights.dot(xp), ag[t]);
             }
         }
         {
@@ -835,19 +880,13 @@ __global__ void rdna3_block_gu_32_kernel(const uint8_t* const* __restrict__ blob
                 __builtin_memcpy(&ul, bu + 2 + word * 4, 4);
                 __builtin_memcpy(&uh, bu + 18 + word * 4, 4);
             }
-            const _Float16 du = __builtin_bit_cast(_Float16, du16);
-            const uint32_t w0 = scaled_byte_pair<false>(ul, du), w1 = scaled_byte_pair<true>(ul, du);
-            const uint32_t w2 = scaled_byte_pair<false>(uh, du), w3 = scaled_byte_pair<true>(uh, du);
+            const float du = __builtin_bit_cast(_Float16, du16);
+            const BlockDot8 weights(ul, uh);
 #pragma unroll
             for (int t = 0; t < MaxT; ++t) {
                 if (t >= ng) break;
                 const uint16_t* xp = x16 + (size_t)tok_g[t] * C + koff;
-                const uint2 xl = *(const uint2*)(xp);
-                const uint2 xh = *(const uint2*)(xp + 16);
-                float a = au[t];
-                a = fdot2_u32(w0, xl.x, a); a = fdot2_u32(w1, xl.y, a);
-                a = fdot2_u32(w2, xh.x, a); a = fdot2_u32(w3, xh.y, a);
-                au[t] = a;
+                au[t] = fmaf(du, weights.dot(xp), au[t]);
             }
         }
     }
@@ -866,7 +905,7 @@ __global__ void rdna3_block_gu_32_kernel(const uint8_t* const* __restrict__ blob
     }
 }
 
-// Grouped block-verify 32-weight block (Q8_0 / IQ4_NL) down projection: scaled_byte_pair + v_dot2_f32_f16.
+// Grouped block-verify 32-weight block (Q8_0 / IQ4_NL) down projection.
 template <int Type, int MaxT>
 __global__ void rdna3_block_down_32_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n,
                                            const int* __restrict__ row, size_t off_down, int C, int F,
@@ -897,20 +936,14 @@ __global__ void rdna3_block_down_32_kernel(const uint8_t* const* __restrict__ bl
             __builtin_memcpy(&wl, blk + 2 + word * 4, 4);
             __builtin_memcpy(&wh, blk + 18 + word * 4, 4);
         }
-        const _Float16 d = __builtin_bit_cast(_Float16, d16);
-        const uint32_t w0 = scaled_byte_pair<false>(wl, d), w1 = scaled_byte_pair<true>(wl, d);
-        const uint32_t w2 = scaled_byte_pair<false>(wh, d), w3 = scaled_byte_pair<true>(wh, d);
+        const float d = __builtin_bit_cast(_Float16, d16);
+        const BlockDot8 weights(wl, wh);
         const int koff = b * 32 + word * 4;
 #pragma unroll
         for (int t = 0; t < MaxT; ++t) {
             if (t >= ng) break;
             const uint16_t* hp = h + (size_t)row_g[t] * F + koff;
-            const uint2 hl = *(const uint2*)(hp);
-            const uint2 hh = *(const uint2*)(hp + 16);
-            float a = acc[t];
-            a = fdot2_u32(w0, hl.x, a); a = fdot2_u32(w1, hl.y, a);
-            a = fdot2_u32(w2, hh.x, a); a = fdot2_u32(w3, hh.y, a);
-            acc[t] = a;
+            acc[t] = fmaf(d, weights.dot(hp), acc[t]);
         }
     }
 #pragma unroll
@@ -1146,9 +1179,9 @@ void rdna3_expert_gemm(int type, const uint8_t* const* experts, size_t offset, E
 }
 void rdna3_expert_swiglu(int type, const uint8_t* const* experts, ExpertTiles tiles, const uint16_t* input,
                          int K, int F, const float* sg, const float* su, float gate_cap, float up_cap,
-                         uint16_t* hidden, cudaStream_t stream) {
+                         uint16_t* hidden, const int* tokens, cudaStream_t stream) {
     const dim3 grid((F + 31) / 32, tiles.capacity);
-    const ExpertActivation act{sg, su, gate_cap, up_cap, hidden};
+    const ExpertActivation act{sg, su, gate_cap, up_cap, hidden, tokens};
     if (type == kIQ4_NL)
         launch_tiled<kIQ4_NL, true>(grid, nullptr, experts, 0, tiles.data, input, F, K, 0, nullptr, 0, stream, nullptr, nullptr, act);
     else if (type == kNVFP4)
