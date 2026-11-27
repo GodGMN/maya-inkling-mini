@@ -4123,17 +4123,68 @@ void test_rdna3_speculative_kernels() {
 #endif
 
 #ifndef STRATA_USE_HIP
+void set_test_env(const char* name, const char* value) {
+#ifdef _WIN32
+    const int rc = _putenv_s(name, value);
+#else
+    const int rc = setenv(name, value, 1);
+#endif
+    if (rc) {
+        std::fprintf(stderr, "cannot set %s\n", name);
+        std::exit(1);
+    }
+}
+
+void check_q8_down(int C, int F, size_t matrix, const std::vector<int>& picks,
+                   const std::vector<uint8_t>& weights, const std::vector<float>& hidden,
+                   const std::vector<double>& reference, const std::vector<float>& direct,
+                   const std::vector<float>& ref_y, const std::vector<float>& actual_y) {
+    std::vector<float> decoded(C * F), direct_error(direct.size()), pipeline_error(direct.size());
+    for (size_t slot = 0; slot < picks.size(); ++slot) {
+        const auto* down = weights.data() + (3 * picks[slot] + 2) * matrix;
+        k::decode_host(k::kQ8_0, down, decoded.size(), decoded.data());
+        for (int c = 0; c < C; ++c) {
+            double sum = 0, propagation = 0, magnitude = 0;
+            for (int i = 0; i < F; ++i) {
+                const double weight = decoded[c * F + i];
+                const size_t hi = slot * F + i;
+                sum += weight * reference[hi];
+                propagation += weight * (hidden[hi] - reference[hi]);
+                magnitude += std::fabs(weight) * std::max(std::fabs(double(hidden[hi])), std::fabs(reference[hi]));
+            }
+            // Cancellation can make y tiny. Normalize by sum |w*h| for the
+            // FP32 dot error, and account for the actual FP16 SwiGLU steps.
+            const size_t j = slot * C + c;
+            const double norm = std::max(magnitude, 1e-30);
+            direct_error[j] = std::max(std::fabs(direct[j] - sum), std::fabs(ref_y[j] - sum)) / norm;
+            pipeline_error[j] = ((double(actual_y[j]) - ref_y[j]) - propagation) / norm;
+        }
+    }
+    const std::vector<double> zero(direct.size(), 0);
+    // F binary32 rounding steps per dot, with two dots in the pipeline comparison.
+    expect("wide Q8_0 grouped down (same hidden)", direct_error, zero, 0, F * 0x1p-23);
+    expect("wide Q8_0 grouped down (end to end)", pipeline_error, zero, 0, 2 * F * 0x1p-23);
+}
+
 // Replay the same graph with fully distinct picks, then with hot experts. This also
 // checks that a smaller group count clears the unused groups from the previous replay.
 void test_batch_groups(int T, int ty) {
     constexpr int K = 8, C = 320, F = 64;
     const int S = T * K, E = S + 3;
     const size_t matrix = C * F / k::block_values(ty) * k::block_bytes(ty);
-    auto weights = rand_blocks(ty, size_t(E) * 3 * C * F);
+    // This seed crosses an FP16 SwiGLU rounding boundary in the T=16 hot Q8 group.
+    std::mt19937 gen(20261168);
+    auto samples = [&](size_t count) {
+        std::vector<float> values(count);
+        for (auto& v : values) v = float(int(gen() >> 8) - (1 << 23)) * 0x1p-23f;
+        return values;
+    };
+    std::vector<uint8_t> weights(E * 3 * matrix);
+    for (auto& byte : weights) byte = uint8_t(gen());
     for (size_t off = 0; off < weights.size(); off += k::block_bytes(ty)) {
         if (ty == k::kNVFP4) std::fill_n(weights.data() + off, 4, uint8_t(0x18));
         else {
-            const uint16_t scale = f2h_host(1.f / 256);
+            const uint16_t scale = ty == k::kQ8_0 ? f2h_host((128 + (gen() & 255)) * 0x1p-16f) : f2h_host(1.f / 256);
             std::memcpy(weights.data() + off, &scale, 2);
         }
     }
@@ -4141,7 +4192,7 @@ void test_batch_groups(int T, int ty) {
     std::vector<const uint8_t*> table(E);
     for (int e = 0; e < E; ++e) table[e] = pool + e * 3 * matrix;
     auto** tab = dev(table);
-    auto scales = fvec(E), weights_in = fvec(S);
+    auto scales = samples(E), weights_in = samples(S);
     auto* scale = dev(scales);
     auto* w = dev(weights_in);
     auto* top = dev_n<int>(S);
@@ -4153,12 +4204,11 @@ void test_batch_groups(int T, int ty) {
     auto* su = dev_n<float>(S);
     auto* wt = dev_n<float>(S);
     auto* inv = dev_n<int>(S);
-    auto input = fvec(T * C);
-    const char* mma = getenv("IK2_GROUP_MMA");
-    if (ty == k::kNVFP4 && mma && (atoi(mma) & 1)) {
-        // The grouped MMA consumes FP16 input. Give the scalar reference those same values.
-        for (auto& value : input) value = h2f_host(f2h_host(value));
-    }
+    auto input = samples(T * C);
+    // MMA consumes x16. Compare projections of the same numbers in both paths.
+    const char* mma = std::getenv("IK2_GROUP_MMA");
+    if (mma && (std::atoi(mma) & 1))
+        for (auto& v : input) v = h2f_host(f2h_host(v));
     auto* x = dev(input);
     auto* x16 = dev_n<uint16_t>(T * C);
     k::to_f16(x, T * C, x16, 0);
@@ -4226,8 +4276,16 @@ void test_batch_groups(int T, int ty) {
             std::vector<double> reference(ref_h.size());
             std::transform(actual_h.begin(), actual_h.end(), hidden.begin(), h2f_host);
             std::transform(ref_h.begin(), ref_h.end(), reference.begin(), h2f_host);
-            expect(ty == k::kNVFP4 ? "wide NVFP4 grouped SwiGLU" : "wide Q8_0 grouped SwiGLU", hidden, reference, 2e-3, 5e-3);
-            expect(ty == k::kNVFP4 ? "wide NVFP4 grouped down" : "wide Q8_0 grouped down", actual_y, std::vector<double>(ref_y.begin(), ref_y.end()), 2e-3, 5e-3);
+            if (ty == k::kQ8_0) {
+                // Allow one normal FP16 step or a small FP32 dot error near cancellation.
+                expect("wide Q8_0 grouped SwiGLU", hidden, reference, 0x1p-10, 3e-5);
+                k::experts_down_g(blobs, n, row, S, ty, 2 * matrix, href, C, F, y, 0);
+                const auto direct = host(y, S * C);
+                check_q8_down(C, F, matrix, picks, weights, hidden, reference, direct, ref_y, actual_y);
+            } else {
+                expect("wide NVFP4 grouped SwiGLU", hidden, reference, 2e-3, 5e-3);
+                expect("wide NVFP4 grouped down", actual_y, std::vector<double>(ref_y.begin(), ref_y.end()), 2e-3, 5e-3);
+            }
         }
         release({refs, rt});
     }
@@ -4423,16 +4481,17 @@ int main(int argc, char** argv) {
 #endif
 #ifndef STRATA_USE_HIP
     if (argc == 2 && !std::strcmp(argv[1], "--batch-mma")) {
-        setenv("IK2_GROUP_MMA", "3", 1);
+        set_test_env("IK2_GROUP_MMA", "3");
         for (int T : {16, 32}) {
             test_batch_groups(T, k::kNVFP4);
+            test_batch_groups(T, k::kQ8_0);
             for (int type : {k::kIQ4_NL, k::kQ8_0}) test_linear_block_verify(type, T);
         }
         return g_fail ? 1 : 0;
     }
     if (argc == 2 && !std::strcmp(argv[1], "--blackwell")) {
         if (p.major != 12 || p.minor > 1) return 77;
-        setenv("IK2_BLACKWELL_NVFP4", "1", 1);
+        set_test_env("IK2_BLACKWELL_NVFP4", "1");
         expect_true("native Blackwell NVFP4 dispatch", k::use_blackwell_nvfp4());
         for (bool gate : {false, true}) {
             test_blackwell_group(1, 64, gate ? 8 : 16, gate, BlackwellPath::Inline);

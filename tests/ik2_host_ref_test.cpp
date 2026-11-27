@@ -8,6 +8,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 template <class T>
 std::vector<T> read_values(size_t count) {
@@ -20,6 +24,12 @@ std::vector<T> read_values(size_t count) {
 }
 
 int main() {
+#ifdef _WIN32
+    if (_setmode(_fileno(stdin), _O_BINARY) == -1) {
+        std::perror("binary fixture input");
+        return 1;
+    }
+#endif
     constexpr int C = 128, F = 64;
     std::array<std::vector<uint8_t>, 3> weights;
     for (auto& matrix : weights) {

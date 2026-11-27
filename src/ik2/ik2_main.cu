@@ -30,30 +30,8 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#ifndef _WIN32
 #include <fcntl.h>
-
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#include <io.h>
-#define O_RDONLY (_O_RDONLY | _O_BINARY)
-#define open _open
-#define close _close
-typedef SSIZE_T ssize_t;
-#define off_t int64_t
-static inline ssize_t pread(int fd, void* buf, size_t count, int64_t offset) {
-    if (_lseeki64(fd, offset, SEEK_SET) == -1) return -1;
-    return _read(fd, buf, (unsigned int)count);
-}
-#define posix_fadvise(fd, off, len, adv) ((void)0)
-#define MADV_WILLNEED 0
-static inline int madvise(void*, size_t, int) { return 0; }
-static inline int munmap(void*, size_t) { return 0; }
-#ifndef SIGUSR1
-#define SIGUSR1 30
-#endif
-#else
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -861,7 +839,9 @@ struct Pinned {
         for (const auto& b : blocks) {
             if (b.mapped) {
                 if (b.registered) CU(cudaHostUnregister(b.ptr));
+#ifndef _WIN32
                 ::munmap(b.ptr, b.bytes);
+#endif
             } else if (b.ptr) {
                 CU(cudaFreeHost(b.ptr));
             }
@@ -871,6 +851,13 @@ struct Pinned {
 
 void read_into_strided(const std::string& path, uint64_t off, int n_exp, size_t exp_bytes, size_t dst_stride,
                        uint8_t* dst) {
+#ifdef _WIN32
+    std::ifstream input(path, std::ios::binary);
+    if (!input.seekg(off)) die("cannot seek in " + path);
+    for (int e = 0; e < n_exp; ++e)
+        if (!input.read(reinterpret_cast<char*>(dst + size_t(e) * dst_stride), exp_bytes))
+            die("read failed: " + path);
+#else
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) die("cannot open " + path);
     const size_t chunk = 64ull << 20;
@@ -886,6 +873,7 @@ void read_into_strided(const std::string& path, uint64_t off, int n_exp, size_t 
     }
     posix_fadvise(fd, (off_t) off, (off_t) ((uint64_t) n_exp * exp_bytes), POSIX_FADV_DONTNEED);
     ::close(fd);
+#endif
 }
 
 // ---- the expert cache in VRAM: per-size-class pools, O(1) S3-FIFO with ghost history
@@ -1365,7 +1353,9 @@ uint64_t g_cnt_hist[4] = {0, 0, 0, 0};
 // IK2_STATS: a request's experts by where they came from: used and already cached / used and prefetched for this
 // pass / used and copied after the routing / prefetched and not used
 uint64_t g_src_hist[4] = {0, 0, 0, 0};
+#ifndef _WIN32
 extern "C" void on_usr1(int) { g_cancel = 1; }
+#endif
 
 // Speculative decoding: g_taps [8][g_taps_ld][C] gets the drafter's taps of every position a forward call runs (the
 // stream at the start of layers 5, 11, .., 41, the final normed hidden); with g_rec each short conv's history and
@@ -2373,7 +2363,7 @@ struct HostExpertPlan {
 HostExpertPlan host_plan;
 
 void prepare_host_experts(Model& model, size_t bytes_needed, int depth) {
-#ifdef IK2_HOST_AVX2
+#if defined(IK2_HOST_AVX2) && !defined(_MSC_VER) && (defined(__GNUC__) || defined(__clang__))
     static int threads = getenv("IK2_DEEP_CPU_THREADS") ? std::max(0, atoi(getenv("IK2_DEEP_CPU_THREADS"))) : 0;
     if (!threads || !__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma") ||
         !__builtin_cpu_supports("f16c"))
@@ -5456,10 +5446,12 @@ int main(int argc, char** argv) {
             Layer& Ly = M.L[J.l];
             const uint8_t* p = S.data(J.name);
             for (size_t i = 0; i < J.roles.size(); ++i) Ly.host[J.roles[i]] = p + i * Ly.eb[J.roles[i]];
+#ifndef _WIN32
             {   // (read ahead: a cold file otherwise comes in a page fault at a time)
                 const size_t pg = 4096, a0 = (size_t) p & ~(pg - 1);
                 ::madvise((void*) a0, (size_t) p - a0 + tensor_bytes(*S.info(J.name)), MADV_WILLNEED);
             }
+#endif
         }
         std::printf("experts: read where the files are mapped (IK2_HOST=mmap)\n");
         std::fflush(stdout);
@@ -6254,7 +6246,9 @@ int main(int argc, char** argv) {
             CU(cudaMemGetInfo(&free_bytes, &total_bytes));
             std::printf("resident server: %.0f MiB of VRAM free before graph capture\n", free_bytes / 1048576.0);
         }
+#ifndef _WIN32
         std::signal(SIGUSR1, on_usr1);
+#endif
         // Maya's protocol (serve/server.py's StrataEngine): "GEN <max_new> [key=value ...] <ids>" in; "PP ..." per
         // prompt pass, "T <id>" per token and "DONE <generated> <prompt> <prompt_ms> <decode_ms> <stop|length|cancel>
         // 0 0 <reused>" out; "STOP" mid-request ends it at the next token (or between the prompt's passes), "QUIT"
