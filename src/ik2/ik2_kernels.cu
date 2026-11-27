@@ -2902,6 +2902,21 @@ __device__ void row_dot_2(int type, const uint8_t* wg, const uint8_t* wu, const 
 __device__ __forceinline__ void row_dot_pair(int type, const uint8_t* wg, const uint8_t* wu, const float* xs, int K,
                                              float& og, float& ou) {
 #ifdef STRATA_USE_HIP
+    if (type == kQ8_0 && K == 32) {
+        // A single 34-byte block can start on a halfword. Give each lane one
+        // product and retain cancellation bits until the entire dot is reduced.
+        const int lane = threadIdx.x & 31;
+        double g = (double)decode_value(kQ8_0, wg, lane) * xs[lane];
+        double u = (double)decode_value(kQ8_0, wu, lane) * xs[lane];
+#pragma unroll
+        for (int d = 16; d; d /= 2) {
+            g += __shfl_xor(g, d, 32);
+            u += __shfl_xor(u, d, 32);
+        }
+        og = (float)g;
+        ou = (float)u;
+        return;
+    }
     if (type == kIQ4_NL) {
         float ag = 0.f, au = 0.f;
         iq4nl_rows<true>(wg, wu, xs, K, ag, au);

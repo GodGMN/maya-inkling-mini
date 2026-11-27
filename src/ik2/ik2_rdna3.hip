@@ -30,12 +30,16 @@ using Half2 = _Float16 __attribute__((ext_vector_type(2)));
 using HalfWords = uint32_t __attribute__((ext_vector_type(8)));
 
 // FP16 encodes 1024..1279 at unit spacing. Bias two signed bytes into this range, subtract 1152 exactly,
-// then multiply by the block's FP16 scale. Each packed multiply rounds once, as in dequantize-to-half.
+// yielding the two integer weights exactly.
+template <bool Upper>
+__device__ __forceinline__ Half2 unscaled_byte_pair(uint32_t bytes) {
+    const uint32_t biased = __builtin_amdgcn_perm(0x64646464u, bytes ^ 0x80808080u, Upper ? 0x04030402u : 0x04010400u);
+    return __builtin_bit_cast(Half2, biased) - (_Float16)1152;
+}
+
 template <bool Upper>
 __device__ __forceinline__ uint32_t scaled_byte_pair(uint32_t bytes, _Float16 scale) {
-    const uint32_t biased = __builtin_amdgcn_perm(0x64646464u, bytes ^ 0x80808080u, Upper ? 0x04030402u : 0x04010400u);
-    const Half2 values = __builtin_bit_cast(Half2, biased) - (_Float16)1152;
-    return __builtin_bit_cast(uint32_t, values * scale);
+    return __builtin_bit_cast(uint32_t, unscaled_byte_pair<Upper>(bytes) * scale);
 }
 
 __device__ __forceinline__ Half16 planar_fragment(const int8_t* weights, _Float16 scale) {
@@ -798,7 +802,26 @@ __global__ void rdna3_block_down_nvfp4_kernel(const uint8_t* const* __restrict__
     }
 }
 
-// Grouped block-verify 32-weight block (Q8_0 / IQ4_NL) gate/up + SwiGLU: scaled_byte_pair + v_dot2_f32_f16.
+// Each lane owns four low and four high weights of a 32-weight GGUF block.
+struct BlockDot8 {
+    uint32_t w0, w1, w2, w3;
+
+    __device__ BlockDot8(uint32_t lo, uint32_t hi)
+        : w0(__builtin_bit_cast(uint32_t, unscaled_byte_pair<false>(lo))),
+          w1(__builtin_bit_cast(uint32_t, unscaled_byte_pair<true>(lo))),
+          w2(__builtin_bit_cast(uint32_t, unscaled_byte_pair<false>(hi))),
+          w3(__builtin_bit_cast(uint32_t, unscaled_byte_pair<true>(hi))) {}
+
+    __device__ float dot(const uint16_t* x) const {
+        const uint2 lo = *(const uint2*)x, hi = *(const uint2*)(x + 16);
+        float sum = fdot2_u32(w0, lo.x, 0.f);
+        sum = fdot2_u32(w1, lo.y, sum);
+        sum = fdot2_u32(w2, hi.x, sum);
+        return fdot2_u32(w3, hi.y, sum);
+    }
+};
+
+// Grouped block-verify 32-weight block (Q8_0 / IQ4_NL) gate/up + SwiGLU.
 template <int Type, int MaxT>
 __global__ void rdna3_block_gu_32_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n,
                                          const int* __restrict__ tok, const int* __restrict__ row, size_t off_up,
@@ -835,19 +858,13 @@ __global__ void rdna3_block_gu_32_kernel(const uint8_t* const* __restrict__ blob
                 __builtin_memcpy(&gl, bg + 2 + word * 4, 4);
                 __builtin_memcpy(&gh, bg + 18 + word * 4, 4);
             }
-            const _Float16 dg = __builtin_bit_cast(_Float16, dg16);
-            const uint32_t w0 = scaled_byte_pair<false>(gl, dg), w1 = scaled_byte_pair<true>(gl, dg);
-            const uint32_t w2 = scaled_byte_pair<false>(gh, dg), w3 = scaled_byte_pair<true>(gh, dg);
+            const float dg = __builtin_bit_cast(_Float16, dg16);
+            const BlockDot8 weights(gl, gh);
 #pragma unroll
             for (int t = 0; t < MaxT; ++t) {
                 if (t >= ng) break;
                 const uint16_t* xp = x16 + (size_t)tok_g[t] * C + koff;
-                const uint2 xl = *(const uint2*)(xp);
-                const uint2 xh = *(const uint2*)(xp + 16);
-                float a = ag[t];
-                a = fdot2_u32(w0, xl.x, a); a = fdot2_u32(w1, xl.y, a);
-                a = fdot2_u32(w2, xh.x, a); a = fdot2_u32(w3, xh.y, a);
-                ag[t] = a;
+                ag[t] = fmaf(dg, weights.dot(xp), ag[t]);
             }
         }
         {
@@ -863,19 +880,13 @@ __global__ void rdna3_block_gu_32_kernel(const uint8_t* const* __restrict__ blob
                 __builtin_memcpy(&ul, bu + 2 + word * 4, 4);
                 __builtin_memcpy(&uh, bu + 18 + word * 4, 4);
             }
-            const _Float16 du = __builtin_bit_cast(_Float16, du16);
-            const uint32_t w0 = scaled_byte_pair<false>(ul, du), w1 = scaled_byte_pair<true>(ul, du);
-            const uint32_t w2 = scaled_byte_pair<false>(uh, du), w3 = scaled_byte_pair<true>(uh, du);
+            const float du = __builtin_bit_cast(_Float16, du16);
+            const BlockDot8 weights(ul, uh);
 #pragma unroll
             for (int t = 0; t < MaxT; ++t) {
                 if (t >= ng) break;
                 const uint16_t* xp = x16 + (size_t)tok_g[t] * C + koff;
-                const uint2 xl = *(const uint2*)(xp);
-                const uint2 xh = *(const uint2*)(xp + 16);
-                float a = au[t];
-                a = fdot2_u32(w0, xl.x, a); a = fdot2_u32(w1, xl.y, a);
-                a = fdot2_u32(w2, xh.x, a); a = fdot2_u32(w3, xh.y, a);
-                au[t] = a;
+                au[t] = fmaf(du, weights.dot(xp), au[t]);
             }
         }
     }
@@ -894,7 +905,7 @@ __global__ void rdna3_block_gu_32_kernel(const uint8_t* const* __restrict__ blob
     }
 }
 
-// Grouped block-verify 32-weight block (Q8_0 / IQ4_NL) down projection: scaled_byte_pair + v_dot2_f32_f16.
+// Grouped block-verify 32-weight block (Q8_0 / IQ4_NL) down projection.
 template <int Type, int MaxT>
 __global__ void rdna3_block_down_32_kernel(const uint8_t* const* __restrict__ blob, const int* __restrict__ n,
                                            const int* __restrict__ row, size_t off_down, int C, int F,
@@ -925,20 +936,14 @@ __global__ void rdna3_block_down_32_kernel(const uint8_t* const* __restrict__ bl
             __builtin_memcpy(&wl, blk + 2 + word * 4, 4);
             __builtin_memcpy(&wh, blk + 18 + word * 4, 4);
         }
-        const _Float16 d = __builtin_bit_cast(_Float16, d16);
-        const uint32_t w0 = scaled_byte_pair<false>(wl, d), w1 = scaled_byte_pair<true>(wl, d);
-        const uint32_t w2 = scaled_byte_pair<false>(wh, d), w3 = scaled_byte_pair<true>(wh, d);
+        const float d = __builtin_bit_cast(_Float16, d16);
+        const BlockDot8 weights(wl, wh);
         const int koff = b * 32 + word * 4;
 #pragma unroll
         for (int t = 0; t < MaxT; ++t) {
             if (t >= ng) break;
             const uint16_t* hp = h + (size_t)row_g[t] * F + koff;
-            const uint2 hl = *(const uint2*)(hp);
-            const uint2 hh = *(const uint2*)(hp + 16);
-            float a = acc[t];
-            a = fdot2_u32(w0, hl.x, a); a = fdot2_u32(w1, hl.y, a);
-            a = fdot2_u32(w2, hh.x, a); a = fdot2_u32(w3, hh.y, a);
-            acc[t] = a;
+            acc[t] = fmaf(d, weights.dot(hp), acc[t]);
         }
     }
 #pragma unroll

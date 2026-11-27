@@ -3893,14 +3893,29 @@ void test_q8_verify_tile() {
         auto* dx = dev(x);
         auto* dy = dev(std::vector<float>(T * ld));
         k::q8_tile(dw, ds, N, K, dx, T, dy, ld, 0);
+        bool half_weights = true;
+#ifdef STRATA_USE_HIP
+        const char* mv = std::getenv("IK2_Q8_TILE_MV");
+        half_weights = T > 8 || (mv && !std::atoi(mv));
+#endif
         std::vector<double> wanted(T * ld);
-        for (int t = 0; t < T; ++t)
-            for (int r = 0; r < N; ++r)
+        double max_weight_error = 0;
+        for (int t = 0; t < T; ++t) {
+            for (int r = 0; r < N; ++r) {
+                double rounding_error = 0;
                 for (int k = 0; k < K; ++k) {
-                    float w = h2f_host(f2h_host(weights[r * K + k] * h2f_host(scales[(r * K + k) / 32])));
-                    wanted[t * ld + r] += (double)w * h2f_host(x[t * K + k]);
+                    const int i = r * K + k;
+                    const double w = weights[i] * (double)h2f_host(scales[i / 32]);
+                    const double v = h2f_host(x[t * K + k]);
+                    wanted[t * ld + r] += w * v;
+                    if (half_weights) rounding_error += (h2f_host(f2h_host(w)) - w) * v;
                 }
-        expect("short Q8 tensor-core tile", host(dy, T * ld), wanted, 6e-4, 5e-4);
+                // Maximum change to any exact dot from rounding just its weights.
+                max_weight_error = std::max(max_weight_error, std::fabs(rounding_error));
+            }
+        }
+        expect("short Q8 tensor-core tile", host(dy, T * ld), wanted, half_weights ? 6e-4 : 2e-6,
+               max_weight_error + (half_weights ? 5e-4 : 1e-5));
         release({dx});
         release({dy});
     }

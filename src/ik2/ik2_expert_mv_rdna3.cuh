@@ -123,7 +123,7 @@ bool try_rdna3_expert(int type, const uint8_t* const* blobs, int slots, size_t o
     if (type == kIQ4_NL && iq4)
         dispatch_rdna3_expert<Gate, kIQ4_NL>(blobs, slots, offset, tokens, x, h, K, N, gates, ups,
                                              gate_cap, up_cap, hidden, output, stream);
-    else if (type == kQ8_0 && q8)
+    else if (type == kQ8_0 && q8 && !(Gate && K == 32))
         dispatch_rdna3_expert<Gate, kQ8_0>(blobs, slots, offset, tokens, x, h, K, N, gates, ups,
                                            gate_cap, up_cap, hidden, output, stream);
     else return false;

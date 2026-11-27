@@ -209,6 +209,20 @@ static void quantized_projection_test() {
     auto* scales = upload(std::vector<float>(n));
     auto* output = upload(std::vector<float>(ld*rows));
     df::quantize_rows<Bits><<<n, 256>>>(w, k, packed, scales);
+#ifdef STRATA_USE_HIP
+    const auto codes = read(packed, n*k*Bits/8);
+    const auto row_scales = read(scales, n);
+    for (int c = 0; c < n; ++c) {
+        const float scale = weights[c*k] / limit;
+        check(row_scales[c] == scale, "incorrect quantized row scale");
+        for (int j = 0; j < k; ++j) {
+            const int i = c*k + j;
+            const unsigned code = (codes[i*Bits/8] >> ((i*Bits)%8)) & ((1u<<Bits)-1);
+            const int q = scale ? int(weights[i] / scale) : 0;
+            check(int(code) == q + limit + 1, "incorrect packed projection weight");
+        }
+    }
+#endif
     for (int t : {1, 8, 15, 27, 64, rows}) {
 #ifdef STRATA_USE_HIP
         df::project_quant<Bits><<<dim3((n+63)/64,(t+15)/16),128>>>(packed, scales, x, n, k, t, output, ld);
@@ -219,7 +233,19 @@ static void quantized_projection_test() {
         for (int r = 0; r < t; ++r) for (int c = 0; c < n; ++c) {
             float expected = 0;
             for (int j = 0; j < k; ++j) expected += inputs[r*k+j] == 0x3c00 ? weights[c*k+j] : -weights[c*k+j];
-            check(actual[r*ld+c] == expected, "quantized projection differs from reference dot product");
+            float tolerance = 0;
+#ifdef STRATA_USE_HIP
+            // Mixed-sign RDNA3 FP16 WMMA dots can round even integer sums.
+            // Allow 1/32 of one quantization step across all 16 WMMA instructions.
+            tolerance = row_scales[c] / 32;
+#endif
+            if (!(std::fabs(actual[r*ld+c] - expected) <= tolerance)) {
+                char message[192];
+                std::snprintf(message, sizeof(message),
+                              "quantized projection Bits=%d t=%d r=%d c=%d actual=%.9g expected=%.9g",
+                              Bits, t, r, c, actual[r*ld+c], expected);
+                throw std::runtime_error(message);
+            }
         }
     }
     gpu(cudaFree(w)); gpu(cudaFree(x)); gpu(cudaFree(packed)); gpu(cudaFree(scales)); gpu(cudaFree(output));
