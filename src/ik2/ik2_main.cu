@@ -1306,6 +1306,7 @@ struct Work {
     const uint8_t** blob;
     int* tok;
     int* batch_group_row = nullptr;
+    bool batch_group_mma = false;
     uint8_t *pack_h[kPackRing] = {}, *pack_d[kPackRing] = {};   // ring-buffered token path tables
     uint16_t* tp_h = nullptr;   // IK2_TP: the whole h, [S][F] FP16 (each GPU fills its half, then the other's)
     uint8_t* tp_pk = nullptr;   // (the decode's tables of this layer on the device: canonical blobs at +1536)
@@ -3161,15 +3162,18 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
         if (!rows || (buf.row && S <= k::kGroupRouteSlots)) {
             k::group_route(rtop, rw, S, c.K, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], buf.blob, buf.n,
                            buf.tok, buf.row, buf.sg, buf.su, buf.wt, buf.inv, g_s);
-            if (rows) {
-                // Each expert's first group needs one pick and each extra group needs eight more.
-                const int distinct = std::min(c.E, S);
-                const int groups = distinct + (S - distinct) / k::kGroupMax;
-                k::experts_gate_up_swiglu_g(buf.blob, buf.n, buf.tok, buf.row, groups, Ly.ty[0], Ly.ty[1], Ly.eb[0],
-                                            W.xq, C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s, W.x16);
-                k::experts_down_g(buf.blob, buf.n, buf.row, groups, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F,
-                                  W.y32, g_s);
-            } else if (k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
+            // Each distinct expert needs one pick, and each additional chunk needs eight.
+            const int distinct = std::min(c.E, S);
+            const int groups = rows ? distinct + (S - distinct) / k::kGroupMax : S;
+            if ((!rows || W.batch_group_mma) && (Ly.ty[0] == k::kQ8_0 || Ly.ty[0] == k::kIQ4_NL) &&
+                Ly.ty[1] == Ly.ty[0] && Ly.ty[2] == Ly.ty[0] && C % 32 == 0 && c.F % 32 == 0) {
+                uint16_t* limbs = (uint16_t*) W.gu32;
+                k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
+                k::experts_block_gu_linear(Ly.ty[0], buf.blob, buf.n, buf.tok, buf.row, groups, T, Ly.eb[0], C, c.F, limbs,
+                                           buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
+                k::experts_block_down_linear(Ly.ty[2], buf.blob, buf.n, buf.row, groups, Ly.eb[0] + Ly.eb[1], C, c.F,
+                                             W.h16, W.y32, g_s);
+            } else if (!rows && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F)) {
                 const int mask = k::block_nvfp4_mma_mask();
                 if (mask & 1) {
                     k::experts_gate_up_swiglu_g(buf.blob, buf.n, buf.tok, buf.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0],
@@ -3184,18 +3188,10 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, BlockBufs& 
                     k::experts_down_g(buf.blob, buf.n, buf.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
                 else
                     k::experts_block_down(buf.blob, buf.n, buf.row, S, Ly.eb[0] + Ly.eb[1], C, c.F, W.h16, W.y32, g_s);
-            } else if ((Ly.ty[0] == k::kQ8_0 || Ly.ty[0] == k::kIQ4_NL) && Ly.ty[1] == Ly.ty[0] &&
-                       Ly.ty[2] == Ly.ty[0] && C % 32 == 0 && c.F % 32 == 0) {
-                uint16_t* limbs = (uint16_t*) W.gu32;
-                k::f16_limbs_rows(W.xq, T, C, limbs, g_s);
-                k::experts_block_gu_linear(Ly.ty[0], buf.blob, buf.n, buf.tok, buf.row, S, T, Ly.eb[0], C, c.F, limbs,
-                                           buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
-                k::experts_block_down_linear(Ly.ty[2], buf.blob, buf.n, buf.row, S, Ly.eb[0] + Ly.eb[1], C, c.F,
-                                             W.h16, W.y32, g_s);
             } else {
-                k::experts_gate_up_swiglu_g(buf.blob, buf.n, buf.tok, buf.row, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
-                                            C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s);
-                k::experts_down_g(buf.blob, buf.n, buf.row, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
+                k::experts_gate_up_swiglu_g(buf.blob, buf.n, buf.tok, buf.row, groups, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq,
+                                            C, c.F, buf.sg, buf.su, c.gate_cap, c.up_cap, W.h16, g_s, rows ? W.x16 : nullptr);
+                k::experts_down_g(buf.blob, buf.n, buf.row, groups, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32,
                                   g_s);
             }
 #endif
@@ -5627,7 +5623,8 @@ int main(int argc, char** argv) {
     W.ex16 = work_alloc<uint16_t>(T_buf * C),
     W.w16 = work_alloc<uint16_t>((size_t)2 * c.F * C); // (one expert's tokens)
     W.h16 = work_alloc<uint16_t>(std::max({size_t(64), T_buf, size_t(batch_width * c.K)}) * c.F);
-    W.gu32_bytes = 4 * std::max({S8 * 2 * (size_t) c.F,
+    W.gu32_bytes = 4 * std::max({Tm * C, // two FP16 limbs per input element
+                  S8 * 2 * (size_t) c.F,
                   Tm * std::max<size_t>(2 * HD + 2 * KD + (size_t) c.H * c.d_rel + c.H,
                                         (2 * HD + (size_t) c.H * c.d_rel + c.H) + 2 * (KD + (size_t) c.KV * 4)),
                   T_buf * 2 * (size_t) c.F, (W.lg_cap + 1) / 2});
@@ -5645,6 +5642,7 @@ int main(int argc, char** argv) {
 #ifndef STRATA_USE_HIP
     const char* group_moe = getenv("IK2_BATCH_GROUP_MOE");
     if (batch_width > 1 && group_moe && std::atoi(group_moe)) {
+        W.batch_group_mma = std::atoi(group_moe) == 2;
         const size_t entries = size_t(std::min(batch_width * c.K, k::kGroupRouteSlots)) * k::kGroupMax;
         token_entries = std::max(token_entries, entries);
         W.batch_group_row = work_alloc<int>(entries);
