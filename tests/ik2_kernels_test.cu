@@ -2073,8 +2073,11 @@ void test_attn_flash() {
         int Tq, qpos0, window, extent, kv_cap, n_split;
         const char* name;
         bool block = false;
+        bool fp4_only = false;
     };
     const Case cases[] = {
+        {65, 113, 71, 9, 0, 1, "fp4 sliding mask across query tiles", false, true},
+        {2, 8191, 1 << 30, 11, 0, 3, "fp4 8193 keys, final single-key tile", false, true},
         {130, 0, 1 << 30, 64, 0, 1, "attn_flash from 0"},
         {100, 300, 1 << 30, 64, 0, 3, "attn_flash at 300, 3 splits"},
         {77, 1500, 1 << 30, 200, 0, 7, "attn_flash at 1500, 7 splits"},
@@ -2089,6 +2092,7 @@ void test_attn_flash() {
 #endif
     };
     for (int fp8 : attention_formats) for (const Case& c : cases) {
+        if (c.fp4_only && fp8 != 3) continue;
         if (fp8 >= 2 && c.kv_cap) continue;
         const int n_pos = c.qpos0 + c.Tq;   // positions written so far
         const int rows = c.kv_cap > 0 ? c.kv_cap : n_pos;
@@ -2128,7 +2132,7 @@ void test_attn_flash() {
             }
         }
         const float scale = (fp8 ? 1.0f / 16.0f : 1.0f) / std::sqrt((float) D);
-        const float v_scale = fp8 ? 1.0f / 32.0f : 1.0f;
+        const float v_scale = fp8 && !c.fp4_only ? 1.0f / 32.0f : 1.0f;
         const int o_ld = H * D + (c.block ? 0 : 32);
         uint16_t* dq = dev(q16);
         float *db = dev(bias), *ds = dev(sink), *dout = dev_n<float>((size_t) c.Tq * o_ld);

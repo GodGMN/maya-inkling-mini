@@ -1224,6 +1224,61 @@ __device__ __forceinline__ uint4 kv_half8(const uint16_t* cache, size_t element)
     return __ldg(reinterpret_cast<const uint4*>(cache + element));
 }
 
+// Two adjacent E2M1 blocks occupy nine aligned words. Eight lanes copy words 1..8
+// to consecutive banks. The ninth word has its own plane and is broadcast at unpack.
+constexpr int kFaFp4Pairs = kFaBN * kFaD / 64;
+constexpr int kFaFp4Words = 9 * kFaFp4Pairs;  // one K or V tile
+constexpr int kFaFp4Raw = 2 * kFaFp4Words * sizeof(uint32_t);
+
+template<int NT>
+__device__ __forceinline__ void fa_load_fp4(uint8_t* raw, const Fp4KvBlock* kc, const Fp4KvBlock* vc,
+                                            int KV, int g, int kt, int end, int tid) {
+    auto* k = reinterpret_cast<uint32_t*>(raw);
+    auto* v = k + kFaFp4Words;
+#pragma unroll
+    for (int i = tid; i < 8 * kFaFp4Pairs; i += NT) {
+        const int pair = i / 8, lane = i % 8, row = kt + pair / 2;
+        const bool valid = row < end;
+        const size_t off = valid ? ((size_t(row) * KV + g) * 2 + pair % 2) * 9 : 0;
+        const auto* ks = reinterpret_cast<const uint32_t*>(kc) + off;
+        const auto* vs = reinterpret_cast<const uint32_t*>(vc) + off;
+        cp_async4(k + i, ks + 1 + lane, valid);
+        cp_async4(v + i, vs + 1 + lane, valid);
+        if (lane == 0) {
+            cp_async4(k + 8 * kFaFp4Pairs + pair, ks, valid);
+            cp_async4(v + 8 * kFaFp4Pairs + pair, vs, valid);
+        }
+    }
+}
+
+__device__ __forceinline__ uint32_t fa_fp4_half2(unsigned codes, uint32_t scale) {
+    uint32_t halves;
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
+    const __half2 values(__nv_cvt_fp4x2_to_halfraw2(uint8_t(codes), __NV_E2M1));
+    __builtin_memcpy(&halves, &values, sizeof(halves));
+#else
+    // Half bits for |E2M1| are 0000, 3800, 3c00, 3e00, 4000, 4200, 4400, 4600.
+    const unsigned selectors = ((codes & 7) << 4) | ((codes & 0x70) << 8);
+    halves = __byte_perm(0x3e3c3800u, 0x46444240u, selectors)
+           | ((codes & 8) << 12) | ((codes & 0x80) << 24);
+#endif
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(halves) : "r"(halves), "r"(scale));
+    return halves;
+}
+
+__device__ __forceinline__ uint4 fa_unpack_fp4(const uint32_t* raw, int i) {
+    const uint32_t word = raw[i], first = raw[8 * kFaFp4Pairs + i / 8];
+    const uint32_t previous = __shfl_up_sync(0xffffffff, word, 1, 8);
+    const uint32_t middle = __shfl_sync(0xffffffff, word, 3, 8);
+    // Word 0 starts with the first scale. Word 4 ends with the second scale.
+    const uint32_t codes = (i & 4) ? word : __funnelshift_r((i & 7) ? previous : first, word, 16);
+    const uint32_t scale = ((i & 4) ? middle >> 16 : first & 0xffff) * 0x10001u;
+    return make_uint4(fa_fp4_half2(codes, scale), fa_fp4_half2(codes >> 8, scale),
+                      fa_fp4_half2(codes >> 16, scale), fa_fp4_half2(codes >> 24, scale));
+}
+
+constexpr int kFaFp4BiasOffset = 2 * kFaBN * kFaLd + 2 * kFaFp4Raw / sizeof(uint16_t);
+
 template <int NW, bool WG, class KVT = uint16_t>   // (KVT: the cache's values, FP16 or FP8 - an FP8 tile's bytes are
 __global__ void __launch_bounds__(NW * 32, 2)        //  made FP16 in shared memory; the warpgroup path is FP16's)
 attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __restrict__ kc,
@@ -1237,7 +1292,7 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
     uint16_t* Vs = fa_sm + ((F8 || packed) ? 1 : 2) * kFaBN * kFaLd;   // [2][kFaBN][kFaLd]
     uint8_t* Rs = (uint8_t*) (fa_sm + 2 * kFaBN * kFaLd);
     constexpr int kTileLd = WG ? kWgTile : (F8 || packed) ? 0 : kFaBN * kFaLd;   // (halves from one buffer to the other)
-    float* Bw = (float*) (fa_sm + 4 * kFaBN * kFaLd) + (threadIdx.x >> 5) * 16 * kFaBld;   // this warp's [16][kFaBld]
+    float* Bw = (float*) (fa_sm + (packed ? kFaFp4BiasOffset : 4 * kFaBN * kFaLd)) + (threadIdx.x >> 5) * 16 * kFaBld;   // this warp's [16][kFaBld]
     if constexpr (WG) {   // [2][kWgTile] each, 1024-byte aligned (the swizzle's atoms), inside the same 68 KB
         uint16_t* a = (uint16_t*) (((uintptr_t) fa_sm + 1023) & ~(uintptr_t) 1023);
         Ks = a, Vs = a + 2 * kWgTile;
@@ -1281,7 +1336,8 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
     if (t0 < t1) {
         if constexpr (WG) fa_load_tile_wg<NW * 32>(Ks, Vs, kc, vc, kv_cap, KD, g, k_lo + t0 * kFaBN, k_hi, tid);
         else if constexpr (F8) fa_load_tile_raw<NW * 32>(Rs, kc, vc, kv_cap, KD, g, k_lo + t0 * kFaBN, k_hi, tid);
-        else if constexpr (!packed) fa_load_tile<NW * 32>(Ks, Vs, kc, vc, kv_cap, KD, g, k_lo + t0 * kFaBN, k_hi, tid);
+        else if constexpr (packed) fa_load_fp4<NW * 32>(Rs, kc, vc, KV, g, k_lo + t0 * kFaBN, k_hi, tid);
+        else fa_load_tile<NW * 32>(Ks, Vs, kc, vc, kv_cap, KD, g, k_lo + t0 * kFaBN, k_hi, tid);
         cp_async_commit();
     }
     for (int t = t0; t < t1; ++t) {
@@ -1312,7 +1368,9 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
             else if constexpr (F8)
                 fa_load_tile_raw<NW * 32>(Rs + (buf ^ 1) * kFaRaw, kc, vc, kv_cap, KD, g, k_lo + (t + 1) * kFaBN, k_hi,
                                           tid);
-            else if constexpr (!packed)
+            else if constexpr (packed)
+                fa_load_fp4<NW * 32>(Rs + (buf ^ 1) * kFaFp4Raw, kc, vc, KV, g, kt + kFaBN, k_hi, tid);
+            else
                 fa_load_tile<NW * 32>(Ks + (buf ^ 1) * kFaBN * kFaLd, Vs + (buf ^ 1) * kFaBN * kFaLd, kc, vc, kv_cap,
                                       KD, g, k_lo + (t + 1) * kFaBN, k_hi, tid);
         }
@@ -1321,12 +1379,12 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
         if constexpr (WG) fence_proxy_async();   // (the copies visible to the MMA's reads of shared memory)
         __syncthreads();
         if constexpr (packed) {
+            const auto* raw = reinterpret_cast<const uint32_t*>(Rs + buf * kFaFp4Raw);
+#pragma unroll
             for (int i = tid; i < kFaBN * kFaD / 8; i += NW * 32) {
-                const int row = i / (kFaD / 8), col = i % (kFaD / 8) * 8;
-                const size_t off = (size_t)(kt + row) * KD + g * kFaD + col;
-                const uint4 zero = make_uint4(0, 0, 0, 0);
-                *(uint4*)(Ks + row * kFaLd + col) = kt + row < k_hi ? kv_half8(kc, off) : zero;
-                *(uint4*)(Vs + row * kFaLd + col) = kt + row < k_hi ? kv_half8(vc, off) : zero;
+                const int dst = (i / 16) * kFaLd + (i % 16) * 8;
+                *(uint4*)(Ks + dst) = fa_unpack_fp4(raw, i);
+                *(uint4*)(Vs + dst) = fa_unpack_fp4(raw + kFaFp4Words, i);
             }
             __syncthreads();
         } else if constexpr (F8) {   // (the tile's bytes are in: FP16 of them)
@@ -1451,8 +1509,9 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
                 }
             }
         }
-        if constexpr (!F8) __syncthreads();   // (the buffer is refilled next iteration; FP8's FP16 tile is written
-    }                                         //  past the next iteration's barrier)
+        // Raw-cache paths overwrite the expanded tile after the next iteration's CTA barrier.
+        if constexpr (!F8 && !packed) __syncthreads();
+    }
     la += __shfl_xor_sync(0xffffffffu, la, 1);
     la += __shfl_xor_sync(0xffffffffu, la, 2);
     lb += __shfl_xor_sync(0xffffffffu, lb, 1);
@@ -5947,16 +6006,18 @@ template <int NW, bool WG, class KVT>
 void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc, int kv_cap, int H, int KV,
                        int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window, int n_split,
                        float* o_part, float2* ml_part, cudaStream_t s) {
+    constexpr int smem = std::is_same_v<KVT, Fp4KvBlock>
+        ? kFaFp4BiasOffset * sizeof(uint16_t) + NW * 16 * kFaBld * sizeof(float) : kFaSmem;
     static bool attr[16] = {};   // (per device: the attribute is a device's, and the layer split runs on several)
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 16 && !attr[dev]) {
-        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFaSmem);
+        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         check("attn_flash (shared memory)");
         attr[dev] = true;
     }
     const dim3 grid((unsigned) ((Tq + 16 * NW - 1) / (16 * NW)), (unsigned) H, (unsigned) n_split);
-    attn_flash_f16_kernel<NW, WG, KVT><<<grid, NW * 32, kFaSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0,
+    attn_flash_f16_kernel<NW, WG, KVT><<<grid, NW * 32, smem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0,
                                                                      qk_scale, bias, extent, window, n_split, o_part,
                                                                      ml_part);
     check("attn_flash");
