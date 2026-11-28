@@ -92,10 +92,10 @@ class DockerStartupTests(unittest.TestCase):
             cwd=self.root, env=self.env, check=True, capture_output=True, text=True, timeout=20,
         )
 
-    def start(self):
+    def start(self, *args):
         output = (self.root / "startup.log").open("w+", encoding="utf-8")
         self.addCleanup(output.close)
-        process = subprocess.Popen([ENTRYPOINT], cwd=self.root, env=self.env,
+        process = subprocess.Popen([ENTRYPOINT, *args], cwd=self.root, env=self.env,
                                    stdout=output, stderr=output, start_new_session=True)
         self.addCleanup(self.stop, process)
         return process
@@ -142,6 +142,15 @@ class DockerStartupTests(unittest.TestCase):
         self.eventually(lambda: self.probe() == 0)
         self.assertIn("using cached tokenizer", (self.root / "startup.log").read_text())
         self.assertEqual(template.stat().st_mtime_ns, mtime)
+
+    def test_bootstraps_the_preset_given_on_the_command_line(self):
+        fallback = self.root / "fallback.json"
+        fallback.write_text("{}", encoding="utf-8")
+        self.env["TINTERO_CONFIG"] = str(fallback)
+        self.gate.touch()
+        self.start("--config", str(self.original))
+        self.eventually(lambda: self.probe() == 0)
+        self.assertEqual(len(list(self.root.glob("cache/*/tokenizer"))), 1)
 
     def test_recovers_partial_cache_and_keeps_user_files(self):
         first = self.prepare()

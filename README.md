@@ -50,6 +50,8 @@ Set `TINTERO_CONFIG=docs/inkling2-mini/<preset>.json` to use another [hardware p
 
 Set `IK2_ABLATE_MODE=on` to enable runtime abliteration.
 
+For direct `docker run` launches, set `TINTERO_HOST` and `TINTERO_PORT` to change the container's bind address. The Docker health check uses those settings.
+
 <details>
 <summary>Without Docker: prebuilt release tarball or build from source</summary>
 

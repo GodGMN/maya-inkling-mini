@@ -1,4 +1,5 @@
 """Apply container overrides and prepare the tokenizer before the server starts."""
+import argparse
 import fcntl
 import hashlib
 import json
@@ -71,7 +72,7 @@ def cached_tokenizer(model, template):
     return target / "tokenizer"
 
 
-def prepare(config):
+def prepare(config, export=True, tokenizer_path=None):
     cfg = json.loads(config.read_text(encoding="utf-8-sig"))
     env = cfg.get("env") or {}
     overrides = {k: os.environ[k] for k in env if k.startswith("IK2_") and k in os.environ}
@@ -87,30 +88,39 @@ def prepare(config):
     if overrides:
         cfg["env"] = {**env, **overrides}
 
-    configured = Path(cfg.get("tokenizer") or "pack/full/tokenizer")
-    inkling = configured.resolve() == INKLING_TOKENIZER.resolve()
-    required = EXPORT_FILES + ("chat_template.jinja",) if inkling else ()
-    if usable_tokenizer(configured, required):
-        generated = False
-        print(f"[tintero] using configured tokenizer at {configured}", file=sys.stderr)
-    else:
-        if model_index is None:
-            raise ValueError(f"tokenizer at {configured} is missing or incomplete; set a valid tokenizer in {config}")
-        gguf = Path(cfg.get("cwd") or ".") / args[model_index]
-        if configured.exists():
-            print(f"[tintero] keeping incomplete tokenizer at {configured} and using the cache", file=sys.stderr)
-        cfg["tokenizer"] = str(cached_tokenizer(gguf, INKLING_TEMPLATE if inkling else None))
-        generated = True
+    tokenizer = resolve_tokenizer(cfg, config, args, model_index, tokenizer_path) if export else None
+    if tokenizer is not None:
+        cfg["tokenizer"] = str(tokenizer)
 
-    if not (model or overrides or generated):
+    if not (model or overrides or tokenizer):
         return config
     effective = Path(tempfile.mkdtemp(prefix="tintero-")) / config.name
     effective.write_text(json.dumps(cfg), encoding="utf-8")
     return effective
 
 
+def resolve_tokenizer(cfg, config, args, model_index, tokenizer_path):
+    configured = Path(cfg.get("tokenizer") or tokenizer_path or "pack/full/tokenizer")
+    inkling = configured.resolve() == INKLING_TOKENIZER.resolve()
+    required = EXPORT_FILES + ("chat_template.jinja",) if inkling else ()
+    if usable_tokenizer(configured, required):
+        print(f"[tintero] using configured tokenizer at {configured}", file=sys.stderr)
+        return None
+    if model_index is None:
+        raise ValueError(f"tokenizer at {configured} is missing or incomplete; set a valid tokenizer in {config}")
+    gguf = Path(cfg.get("cwd") or ".") / args[model_index]
+    if configured.exists():
+        print(f"[tintero] keeping incomplete tokenizer at {configured} and using the cache", file=sys.stderr)
+    return cached_tokenizer(gguf, INKLING_TEMPLATE if inkling else None)
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--config", type=Path, default=Path(sys.argv[1]))
+    parser.add_argument("--engine", default="maya")
+    parser.add_argument("--tokenizer", type=Path)
+    options, _ = parser.parse_known_args(sys.argv[2:])
     try:
-        print(prepare(Path(sys.argv[1])))
+        print(prepare(options.config, export=options.engine != "mock", tokenizer_path=options.tokenizer))
     except (OSError, ValueError, KeyError, struct.error) as exc:
         sys.exit(f"[tintero] could not prepare startup: {exc}")

@@ -8,6 +8,6 @@ for arg in "$@"; do
 done
 
 config=${TINTERO_CONFIG:?set TINTERO_CONFIG to a preset JSON path}
-config=$(python3 docker/prepare-config.py "$config")
-exec python3 serve/server.py --engine maya --config "$config" \
-    --host "${TINTERO_HOST:-0.0.0.0}" --port "${TINTERO_PORT:-8080}" "$@"
+config=$(python3 docker/prepare-config.py "$config" "$@")
+exec python3 serve/server.py --engine maya \
+    --host "${TINTERO_HOST:-0.0.0.0}" --port "${TINTERO_PORT:-8080}" "$@" --config "$config"
