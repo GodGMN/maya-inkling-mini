@@ -6140,7 +6140,7 @@ def main(argv=None) -> int:
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
     ap.add_argument("--api-key", default=os.environ.get("MAYA_API_KEY", ""),
                     help="require API keys for generation and protected routes. Send Authorization: Bearer KEY "
-                         "or x-api-key. Separate keys with commas. Also MAYA_API_KEY.")
+                         "or x-api-key. Separate keys with commas. Also TINTERO_API_KEY.")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); clients can opt in with strata_mcp (also \"mcp_servers\" in "
                                          "the config)")
