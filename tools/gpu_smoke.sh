@@ -51,12 +51,23 @@ gpu_idle() {
             skip "AMD GPU counters unavailable"
         fi
     else
-        local devices used total busy
-        if ! devices=$(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits); then
+        local devices uuid name used total busy processes available_kib
+        if ! devices=$(nvidia-smi --query-gpu=uuid,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits); then
             skip "NVIDIA GPU counters unavailable"
         fi
-        while IFS=, read -r used total busy; do
+        while IFS=, read -r uuid name used total busy; do
             echo "NVIDIA GPU: ${used}/${total} MiB VRAM, ${busy}% busy"
+            if [[ ${name# } == "NVIDIA GB10" && ${used# } == "[N/A]" && ${total# } == "[N/A]" ]]; then
+                if ! processes=$(nvidia-smi -i "$uuid" --query-compute-apps=pid --format=csv,noheader,nounits); then
+                    skip "NVIDIA compute process list unavailable"
+                fi
+                available_kib=$(awk '$1 == "MemAvailable:" {print $2}' /proc/meminfo)
+                if [[ -n $processes || ! $available_kib =~ ^[0-9]+$ ]] || (( available_kib < 32 * 1024**2 )); then
+                    echo "$busy_message: GB10 has compute clients or insufficient available unified memory"
+                    return 75
+                fi
+                used=0
+            fi
             if [[ ! $used =~ ^[[:space:]]*[0-9]+$ || ! $busy =~ ^[[:space:]]*[0-9]+$ ]]; then
                 skip "NVIDIA GPU counters unavailable"
             fi
