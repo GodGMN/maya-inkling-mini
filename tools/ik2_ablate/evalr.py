@@ -3,6 +3,7 @@
 # eval/TAG-coherence.jsonl: harmless).  Prints one JSON summary line.
 import json,sys,pathlib,re
 from urllib.request import Request,urlopen
+import pathlib as _pl, sys as _sys; _sys.path.append(str(_pl.Path(__file__).resolve().parents[1]))  # tools/ beside the lab; a copy next to the script wins
 from ablate_fit import refused
 port,tag=sys.argv[1],sys.argv[2]; nt=int(sys.argv[3]) if len(sys.argv)>3 else 256
 def ask(p,mt):

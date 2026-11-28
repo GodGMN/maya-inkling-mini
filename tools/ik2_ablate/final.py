@@ -2,6 +2,7 @@
 # {i, prompt, answer, finish} - for the user to validate.  Prints counts only; nothing of the text.
 import json,sys
 from urllib.request import Request,urlopen
+import pathlib as _pl, sys as _sys; _sys.path.append(str(_pl.Path(__file__).resolve().parents[1]))  # tools/ beside the lab; a copy next to the script wins
 from ablate_fit import refused
 port,out=sys.argv[1],sys.argv[2]
 ps=[json.loads(x) for x in open("sets/harmful_test.jsonl")]

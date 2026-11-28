@@ -2,6 +2,7 @@
 # are empty or hit the token limit.  Counts only; no text stored.
 import json,re,sys
 from urllib.request import Request,urlopen
+import pathlib as _pl, sys as _sys; _sys.path.append(str(_pl.Path(__file__).resolve().parents[1]))  # tools/ beside the lab; a copy next to the script wins
 from ablate_fit import refused
 port=sys.argv[1]; out={}
 loop=lambda t: bool(re.search(r"(.{12,}?)\1{3,}",t,re.S))

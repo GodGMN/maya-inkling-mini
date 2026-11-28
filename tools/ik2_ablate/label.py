@@ -4,6 +4,7 @@
 import json,os,sys,pathlib
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request,urlopen
+import pathlib as _pl, sys as _sys; _sys.path.append(str(_pl.Path(__file__).resolve().parents[1]))  # tools/ beside the lab; a copy next to the script wins
 from ablate_fit import refused
 port,out=sys.argv[1],pathlib.Path(sys.argv[2]); cap=sys.argv[3] if len(sys.argv)>3 else None
 out.mkdir(exist_ok=True)
