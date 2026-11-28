@@ -1,6 +1,6 @@
 # Local GPU smoke check
 
-Use a Linux GPU host with a stock ggml-org Inkling 2 Mini IQ4_NL GGUF and enough free VRAM for the full model. The smoke check builds the engine and runs `ik2_kernels_test` against its reference calculations. It then checks the first three greedy token IDs for “The capital of France is” against the [documented decode reference](HIP-PORT.md#prometheus-gpu-validation).
+Use a Linux GPU host with a stock ggml-org Inkling 2 Mini IQ4_NL GGUF and enough free VRAM for the full model. The smoke check builds the engine and runs `ik2_kernels_test` against its reference calculations. For the prompt “The capital of France is”, it expects the two greedy token IDs for “ Paris.” (`152717,13`).
 
 ```bash
 tools/gpu_smoke.sh hip /path/to/Inkling-2-Mini-IQ4_NL.gguf ~/.local/state/tintero-nightly

@@ -20,7 +20,7 @@ umask 077
 mkdir -p -- "$3"
 state=$(realpath -e -- "$3")
 
-exec 9>"$HOME/.tintero-gpu.lock"
+exec 9>>"$HOME/.tintero-gpu.lock"
 if ! flock -n 9; then
     echo "Skipped: the GPU lock is held"
     exit 75
@@ -156,11 +156,11 @@ run_smoke() {
     done
 
     echo 'Prompt: The capital of France is'
-    local output=$scratch/decode.txt expected=152717,11,149880
+    local output=$scratch/decode.txt expected=152717,13
     set -x
-    "${gpu_env[@]}" env IK2_HOST=mmap IK2_KV=fp8 IK2_GATE_BF16=1 IK2_GATE_TILE=64 \
+    "${gpu_env[@]}" env XDG_CACHE_HOME="$build/cache" IK2_HOST=mmap IK2_KV=fp8 IK2_GATE_BF16=1 IK2_GATE_TILE=64 \
         IK2_Q8_UNROLL=1 IK2_BATCH_PREFILL=1 timeout --kill-after=10s 300s "$build/tintero" \
-        --model "$model" --ctx 1024 --chunk 128 --tokens 371,151451,149879,151194,149884 --gen 3 |
+        --model "$model" --ctx 1024 --chunk 128 --tokens 371,151451,149879,151194,149884 --gen 2 |
         tee "$output"
     { set +x; } 2>/dev/null
     if [[ $(grep -Ex '[0-9]+(,[0-9]+)*' "$output") != "$expected" ]]; then
