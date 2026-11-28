@@ -7,17 +7,16 @@ Tintero is a local Linux inference server for [Inkling-2-Mini](https://huggingfa
 
 ### Tested hardware
 
-| GPU | Backend | Decode | Batched (32 streams) | Prefill | Max KV |
-|---|---|---:|---:|---:|---:|
-| RX 7900 XTX 24 GB | HIP `gfx1100` | **117.1** | 327.8 | — | 393K (FP8) |
-| A100 80 GB | CUDA `sm_80` | **98.8** | — | 2,184 | 393K (FP8) |
-| DGX Spark GB10 | CUDA `sm_121a` | **49.1** | 130.3 | 1,366 | 1M (FP8 / FP4) |
+| GPU | Workload | Throughput (tok/s) |
+| --- | --- | ---: |
+| RX 7900 XTX, gfx1100 | IQ4_NL, FP8, one stream, 4,096 input tokens, median of three | 3,459.46 prefill / 111.01 decode |
+| DGX Spark GB10, sm_121a | IQ4_NL quality preset, one stream, 512 input tokens | 45.04 median decode |
+| DGX Spark GB10, sm_121a | UD-Q4_K_XL + Q8 DFlash2 preset, eight active sampled coding streams | 121.07 and 128.71 whole-run aggregate |
+| A100-SXM4-80GB, sm_80 (historical) | IQ4_NL, FP8, one stream | 98.8 decode / 2,155–2,184 prefill across 4K–32K inputs |
 
-All figures in tok/s. Decode is one stream after a 512-token prompt. DGX Spark batched and prefill use the `UD-Q4_K_XL` GGUF; the others use `IQ4_NL`. Runtime abliteration (`v21-pc4`) costs 1.8–3.4% of decode speed.
+See [preset measurements](docs/PRESETS.md#measurements) for context reservations, workload sizes, timing intervals and historical comparisons. The [source-build examples](docs/PRESETS.md#source-only-presets) cover DFlash2 on Spark and the experimental Strix Halo target.
 
 Both backends support continuous batching, FP8/FP4-global KV cache, sparse long-context decode, graphed MTP speculative decoding, and runtime abliteration. CUDA covers `sm_80` through `sm_121a` (Ampere through Blackwell, x86_64 and ARM64). See [presets](docs/PRESETS.md) and [settings](docs/SETTINGS.md).
-
-[![RX 7900 XTX: one chat generates 117.1 tokens/s after a 512-token prompt. Total batched throughput reaches 327.8 tokens/s across 32 streams.](docs/assets/rx7900xtx-speed.svg)](docs/HIP-PORT.md#full-model-measurements-at-393216-reserved-tokens)
 
 ## Quick start
 
@@ -62,7 +61,7 @@ Each image starts with a 24 GB preset by default. For an 80 GB card or a DGX Spa
 **Prebuilt Ubuntu 24.04 tarballs** (`x86_64-cuda`, `aarch64-cuda`, `x86_64-hip-gfx1100`) are attached to each [GitHub Release](https://github.com/GodGMN/tintero/releases). Extract into an empty directory on a host with matching CUDA 13.1 or ROCm 7.2 runtime libraries, install `requirements.txt` in a Python `venv`, export the tokenizer, and run:
 
 ```sh
-TINTERO_CONFIG=docs/inkling2-mini/cuda-24gb-fp4.json ./entrypoint.sh --host 127.0.0.1 --port 8085
+TINTERO_CONFIG=docs/inkling2-mini/cuda-24gb-fp4.json TINTERO_HOST=127.0.0.1 TINTERO_PORT=8085 ./entrypoint.sh
 ```
 
 **Build from source** (requires a C++20 compiler, CMake 3.24+, Ninja, Git, Python 3.10+ with `venv`, and either ROCm under `/opt/rocm` or the NVIDIA CUDA Toolkit):
@@ -126,4 +125,4 @@ The answer is in `choices[0].message.content`. To connect a client, set its base
 
 ## Credits
 
-Tintero builds on [Maya’s Inkling engine](https://github.com/alesha-pro/maya-inkling-mini). [Project Maya](https://github.com/mw00/project-maya) grew out of [Strata](https://github.com/Niko1221/Strata). Thinking Machines released the model, and [ggml-org](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF) and [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) provide the GGUF weights. [MIT license](LICENSE)
+Tintero builds on [Maya’s Inkling engine](https://github.com/alesha-pro/maya-inkling-mini). [Project Maya](https://github.com/mw00/project-maya) grew out of [Strata](https://github.com/Niko1221/Strata). Selected RDNA 3/3.5 Wave32 HIP kernels are adapted from [CIRU](third_party/ciru/NOTICE) (Apache-2.0). Thinking Machines released the model, [incoai](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) released the DFlash2 drafter, and [ggml-org](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF) and [Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) provide the GGUF weights. [MIT license](LICENSE)
