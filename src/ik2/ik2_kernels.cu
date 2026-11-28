@@ -4691,7 +4691,7 @@ __global__ void route_token_kernel(const float* __restrict__ logits, const float
                                    float scale, const uint8_t* const* __restrict__ tab, const float* __restrict__ sg_t,
                                    const float* __restrict__ su_t, const float* __restrict__ sd_t, int* top, float* w,
                                    const uint8_t** blob, int* tok, int* inv, float* sg, float* su, float* wt,
-                                   const float* x, int width, NvInput* packed, bool q8, uint16_t* x_limbs) {
+                                   const float* x, int width, NvInput* packed, bool q8, uint16_t* x_limbs, unsigned long long* usage) {
     if (blockIdx.x) {
         const int i = (blockIdx.x - 1) * blockDim.x + threadIdx.x;
         if (x_limbs) {   // x = hi + lo in FP16, [2][width] (experts_gate_up_swiglu_mma's input)
@@ -4733,6 +4733,7 @@ __global__ void route_token_kernel(const float* __restrict__ logits, const float
     __syncthreads();
     if (pick) {
         const float wk = sl / (sig[K] + 1e-20f) * scale;
+        if (usage) ++usage[e];  // Each selected expert has one writer on the routing stream.
         top[pos] = e;
         w[pos] = wk;
         blob[pos] = tab[e];
@@ -7242,15 +7243,26 @@ void route_gather(const int* top, const float* w, const uint8_t* const* tab, con
                                                         sg, su, wt);
     check("route_gather");
 }
+__global__ void count_routes_kernel(const int* top, int picks, unsigned long long* usage) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < picks) atomicAdd(usage + top[i], 1ULL);
+}
+
+void count_routes(const int* top, int picks, unsigned long long* usage, cudaStream_t stream) {
+    count_routes_kernel<<<(picks + 255) / 256, 256, 0, stream>>>(top, picks, usage);
+    check("count_routes");
+}
+
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
                  const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
                  int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s, const float* x, int width,
-                 void* packed, bool q8, uint16_t* x_limbs) {
+                 void* packed, bool q8, uint16_t* x_limbs, unsigned long long* usage) {
 #ifdef STRATA_USE_HIP
     if (E == 128 && K == 8 && !packed && !x_limbs) {
         const RouteGather gather{tab, sg_t, su_t, sd_t, blob, tok, inv, sg, su, wt};
         rdna3_route_eight<true><<<1, 128, 0, s>>>(logits, bias, scale, top, w, gather);
         check("rdna3_route_token");
+        if (usage) count_routes(top, K, usage, s);
         return;
     }
 #endif
@@ -7259,13 +7271,14 @@ void route_token(const float* logits, const float* bias, int E, int K, float sca
         if (x_limbs) to_f16_limbs(x, (size_t) width, x_limbs, s);
         route(logits, bias, 1, E, K, scale, top, w, s);
         route_gather(top, w, tab, sg_t, su_t, sd_t, K, K, blob, tok, inv, sg, su, wt, s);
+        if (usage) count_routes(top, K, usage, s);
         return;
     }
     const unsigned nt = (unsigned) ((E + 31) / 32 * 32);
     const unsigned blocks = 1 + (x_limbs ? (width + nt - 1) / nt : packed ? (width / 16 + nt - 1) / nt : 0);
     route_token_kernel<<<blocks, nt, (size_t)(E + nt / 32 + K + 1) * sizeof(float), s>>>(
         logits, bias, E, K, scale, tab, sg_t, su_t, sd_t, top, w, blob, tok, inv, sg, su, wt, x, width,
-        (NvInput*)packed, q8, x_limbs);
+        (NvInput*)packed, q8, x_limbs, usage);
     check("route_token");
 }
 

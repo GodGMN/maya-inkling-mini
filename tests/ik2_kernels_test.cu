@@ -523,6 +523,8 @@ void test_route(int E) {
         const uint8_t** dtab = dev(tab);
         float *dsg = dev(sgt), *dsu = dev(sut), *dsd = dev(sdt);
         bool same = true;
+        std::vector<unsigned long long> usage(E);
+        auto* device_usage = dev(usage);
         for (int t = 0; t < 40; ++t) {
             std::vector<float> row(lg.begin() + (size_t) t * E, lg.begin() + (size_t) (t + 1) * E);
             if (t >= 30)   // ties: a handful of equal logits and biases among the largest
@@ -538,7 +540,8 @@ void test_route(int E) {
             const uint8_t **b1 = dev_n<const uint8_t*>(K), **bb2 = dev_n<const uint8_t*>(K);
             k::route(dr, db2, 1, E, K, 8.0f, t1, w1, 0);
             k::route_gather(t1, w1, dtab, dsg, dsu, dsd, K, K, b1, k1, i1, g1, u1, x1, 0);
-            k::route_token(dr, db2, E, K, 8.0f, dtab, dsg, dsu, dsd, t2, w2, bb2, k2, i2, g2, u2, x2, 0);
+            k::route_token(dr, db2, E, K, 8.0f, dtab, dsg, dsu, dsd, t2, w2, bb2, k2, i2, g2, u2, x2, 0, nullptr, 0, nullptr, false, nullptr, device_usage);
+            for (int e : host(t1, K)) ++usage[e];
             same &= host(t1, K) == host(t2, K) && host(k1, K) == host(k2, K) && host(i1, K) == host(i2, K);
             same &= host(b1, K) == host(bb2, K);
             const auto a1 = host(w1, K), a2 = host(w2, K), c1 = host(g1, K), c2 = host(g2, K), d1 = host(u1, K),
@@ -550,7 +553,11 @@ void test_route(int E) {
             release({b1, bb2});
         }
         expect_true("route_token: route and route_gather's values to the bit (40 tokens, ties among them)", same);
-        release({dtab, dsg, dsu, dsd});
+        expect_true("route_token: per-expert usage", usage == host(device_usage, E));
+        k::count_routes(dt, T * K, device_usage, 0);
+        for (int e : top) ++usage[e];
+        expect_true("batched per-expert usage", usage == host(device_usage, E));
+        release({device_usage, dtab, dsg, dsu, dsd});
     }
     release({dl, db, dw, dt});
 }
