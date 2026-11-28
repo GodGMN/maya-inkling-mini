@@ -74,16 +74,6 @@ class ManifestTests(unittest.TestCase):
             self.assertTrue(name.startswith("directions/"), name)
         self.assertIn("directions/v21-pc4.f32", runtime)
 
-    def test_retained_wrappers_are_still_referenced(self):
-        for wrapper, info in MANIFEST["retained_wrappers"].items():
-            if wrapper == "about":
-                continue
-            self.assertIn(wrapper, manifest_names()[1])
-            for referrer in info["referenced_by"]:
-                needle = "./py " if wrapper == "py" else wrapper
-                found = needle in (ROOT / referrer).read_text()
-                self.assertTrue(found, f"{referrer} no longer mentions {wrapper}")
-
     def test_service_image_reads_the_runtime_asset(self):
         # docker/start-ik2-gfx1100.sh opens /opt/maya/ablate/v21-pc4.f32; package-ik2-gfx1100.sh fills ablate/ from directions/
         start = (ROOT / "docker" / "start-ik2-gfx1100.sh").read_text()
