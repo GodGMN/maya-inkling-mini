@@ -2,7 +2,7 @@
 
 `tintero` runs Inkling-2-Mini on AMD RDNA 3 and RDNA 3.5 GPUs through HIP. The 24 GiB profile keeps the quantized text weights and every routed expert resident, then scales the KV cache from FP8 down to FP4 to fit long conversations.
 
-This page has two parts. The first is a portable build, run and verification guide that uses repository-relative paths. The second is the [measurement history](#measurement-history), which preserves dated results, commands and hardware notes from the development of the port. Measurements are historical; hardware testing is owned by the GPU worker and was not repeated for this guide.
+For benchmark results and the commands used to collect them, see the [measurement history](#measurement-history).
 
 ## Which GPUs and models can run it?
 
@@ -81,6 +81,7 @@ Use identical prompt and forced token IDs in each run. The CLI writes its first 
 This example exercises token alignment only. For quality measurements, use tokenized real text and the same cache format, prompt and forced file in both runs.
 
 ```sh
+MODEL=models/Inkling-2-Mini-IQ4_NL.gguf  # Set this to your downloaded GGUF.
 printf '%s\n' '101,102,103' > force.csv
 for graph in 0 1; do
   IK2_KV=fp8 IK2_GRAPH="$graph" IK2_FORCE=force.csv IK2_LOGITS_OUT="graph-$graph.f32" \
