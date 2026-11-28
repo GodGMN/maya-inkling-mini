@@ -4,6 +4,21 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v0.1.0 - 2026-11-27
+
+First Tintero release: the CUDA and HIP Docker images and the release tarballs (see the release notes on GitHub). The
+`VERSION` file now reads `0.1.0`, the number of the published release, instead of Project Maya's `1.1.70`, so an
+installed copy (a Docker image or a tarball has no `.git`) compares itself with Tintero's releases and not with
+Project Maya's.
+
+- **Fix: About > Updates in installed copies:** without a git checkout the update check asked `mw00/project-maya` for its
+  latest release, with the user agent `project-maya/<version>`, and compared it with Project Maya's numbering. It now asks
+  `GodGMN/tintero` with `tintero/<version>`. A git checkout still asks its own `origin`, so a fork checks its own
+  releases. `TINTERO_UPDATE_CHECK=0` turns the check off, as `MAYA_UPDATE_CHECK=0` always did; if both are set,
+  `TINTERO_UPDATE_CHECK` decides.
+
+The entries below are Project Maya's history, from which Tintero's engine descends; their version numbers are Maya's.
+
 ## v1.1.70 - 2026-11-20
 
 Hy4-Flash decodes faster where the CPU computes experts (small cards, one GPU with a big model, and tensor parallel
