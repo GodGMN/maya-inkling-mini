@@ -665,11 +665,11 @@ def model_management_setting(cfg: dict | None, env=None) -> bool:
 
 
 def loop_guard_setting(cfg: dict | None, env=None) -> bool:
-    """The loop guard (serve/loop_guard.py), on unless MAYA_LOOP_GUARD (MAYA_LOOP_GUARD) says 0 / off / false / no
+    """The loop guard (serve/loop_guard.py), on unless TINTERO_LOOP_GUARD says 0 / off / false / no
     or the run config has "loop_guard": false; the environment, when set, wins over the config."""
     off = ("0", "off", "false", "no", "none")
     env = os.environ if env is None else env
-    v = maya_names.lookup(env, "MAYA_LOOP_GUARD")   # (main: MAYA_* aliased, the config's env applied)
+    v = maya_names.lookup(env, "MAYA_LOOP_GUARD")
     if v is not None and str(v).strip():
         return str(v).strip().lower() not in off
     v = (cfg or {}).get("loop_guard")
@@ -5013,7 +5013,7 @@ def make_handler(svc: Service):
                     if total > limit:
                         self.close_connection = True
                         raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
-                                           "(MAYA_MAX_BODY_MIB raises the limit)")
+                                           "(TINTERO_MAX_BODY_MIB raises the limit)")
                     piece = self.rfile.read(size)
                     if len(piece) != size or self.rfile.read(2) != b"\r\n":
                         raise BadBody(400, "malformed chunked request body")
@@ -5027,7 +5027,7 @@ def make_handler(svc: Service):
             if length > limit:
                 self.close_connection = True                 # not read: the connection ends with the answer
                 raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
-                                   "(MAYA_MAX_BODY_MIB raises the limit)")
+                                   "(TINTERO_MAX_BODY_MIB raises the limit)")
             return self.rfile.read(length)
 
         def _json(self, code, obj):
@@ -5042,7 +5042,7 @@ def make_handler(svc: Service):
             """llama.cpp's /models/load and /models/unload: Open WebUI's Models page (load / switch)."""
             if not getattr(svc, "model_management", False):
                 self._json(404, {"error": {"message": "model management is off (remove \"model_management\": false, or "
-                                                      "MAYA_MODEL_MANAGEMENT=1, turns it on)"}})
+                                                      "TINTERO_MODEL_MANAGEMENT=1, turns it on)"}})
                 return
             try:
                 body = json.loads(self._body().decode() or "{}")
@@ -5080,7 +5080,7 @@ def make_handler(svc: Service):
             """llama.cpp's /models/sse: the Models page's live state, a snapshot every few seconds."""
             if not getattr(svc, "model_management", False):
                 self._json(404, {"error": {"message": "model management is off (remove \"model_management\": false, or "
-                                                      "MAYA_MODEL_MANAGEMENT=1, turns it on)"}})
+                                                      "TINTERO_MODEL_MANAGEMENT=1, turns it on)"}})
                 return
             if not self._authorized():
                 return
