@@ -73,6 +73,8 @@ for name in strata_tokenizer gguf_reader gguf_writer maya_names ablate_fit needl
     cp "$root/tools/$name.py" "$context/tools/"
 done
 cp "$root/third_party/ggml/LICENSE" "$context/LICENSE.ggml"
+cp "$root/third_party/ciru/LICENSE" "$context/LICENSE.ciru"
+cp "$root/third_party/ciru/NOTICE" "$context/NOTICE.ciru"
 find "$context" -name __pycache__ -type d -prune -exec rm -rf '{}' +
 docker buildx build --load --resource memory=6g --resource memory-swap=6g \
     --resource cpu-period=100000 --resource cpu-quota=400000 \
