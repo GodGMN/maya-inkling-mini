@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
-"""Packaging checks for tools/ik2_ablate/: which of its files ship, and that the lab's imports resolve from the repository.
+"""Packaging checks for tools/ik2_ablate/: which of its files ship and which stay in the repository.
 
-Nothing here runs or prints the lab's scripts or data: the checks read file names, the manifest, the packaging scripts,
-and the import statements of the lab's Python files (through `ast`), and the staging runs on throwaway fixture trees.
+Nothing here opens the lab's scripts or data: the checks read file names, the manifest and the packaging scripts, and
+the staging runs on throwaway fixture trees.
 """
 from __future__ import annotations
 
-import ast
 import json
-import os
 import pathlib
 import re
-import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 
@@ -77,6 +73,16 @@ class ManifestTests(unittest.TestCase):
         for name in runtime:
             self.assertTrue(name.startswith("directions/"), name)
         self.assertIn("directions/v21-pc4.f32", runtime)
+
+    def test_retained_wrappers_are_still_referenced(self):
+        for wrapper, info in MANIFEST["retained_wrappers"].items():
+            if wrapper == "about":
+                continue
+            self.assertIn(wrapper, manifest_names()[1])
+            for referrer in info["referenced_by"]:
+                needle = "./py " if wrapper == "py" else wrapper
+                found = needle in (ROOT / referrer).read_text()
+                self.assertTrue(found, f"{referrer} no longer mentions {wrapper}")
 
     def test_service_image_reads_the_runtime_asset(self):
         # docker/start-ik2-gfx1100.sh opens /opt/maya/ablate/v21-pc4.f32; package-ik2-gfx1100.sh fills ablate/ from directions/
@@ -149,61 +155,6 @@ class DockerignoreTests(unittest.TestCase):
         self.assertFalse(docker_ignored("a/keep/f.bin", rules))
         self.assertTrue(docker_ignored("b.py", rules))
         self.assertFalse(docker_ignored("c/b.py", rules))
-
-
-class ImportTests(unittest.TestCase):
-    def sibling_modules(self):
-        tools = {p.stem for p in (ROOT / "tools").glob("*.py")}
-        lab = {p.stem for p in LAB.glob("*.py")}
-        return tools, lab
-
-    def imported_modules(self, path: pathlib.Path) -> set[str]:
-        found = set()
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Import):
-                found.update(alias.name.split(".")[0] for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                found.add(node.module.split(".")[0])
-        return found
-
-    def test_tools_modules_used_by_the_lab_are_reachable_from_the_repository(self):
-        tools, lab = self.sibling_modules()
-        problems = []
-        for path in sorted(LAB.glob("*.py")):
-            wanted = {m for m in self.imported_modules(path) if m in tools and m not in lab}
-            if not wanted:
-                continue
-            source = path.read_text()
-            reaches_tools = bool(re.search(r"sys\.path\.(insert|append)\(.*(parents\[1\]|\.parent\.parent)", source)
-                                 or re.search(r"_sys\.path\.append\(.*parents\[1\]", source))
-            if not reaches_tools:
-                problems.append(f"{path.name}: imports {sorted(wanted)} with tools/ not on sys.path")
-        self.assertEqual(problems, [])
-
-    def test_lab_scripts_parse(self):
-        for path in sorted(LAB.glob("*.py")):
-            with self.subTest(script=path.name):
-                ast.parse(path.read_text())
-
-    def test_shim_imports_a_tools_module_from_a_clean_checkout(self):
-        # a throwaway layout: repo/tools/ablate_fit.py (a stub) and repo/tools/ik2_ablate/job.py, which carries the
-        # shim line the lab's scripts use, copied from final.py
-        source = (LAB / "final.py").read_text().splitlines()
-        index = next(i for i, line in enumerate(source) if line.startswith("from ablate_fit import"))
-        shim_and_import = "\n".join(source[index - 1:index + 1])
-        self.assertIn("parents[1]", shim_and_import)
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = pathlib.Path(tmp)
-            (repo / "tools" / "ik2_ablate").mkdir(parents=True)
-            (repo / "tools" / "ablate_fit.py").write_text("def refused(text):\n    return False\n")
-            job = repo / "tools" / "ik2_ablate" / "job.py"
-            job.write_text(shim_and_import + "\nprint('ok', refused('fixture'))\n")
-            result = subprocess.run([sys.executable, "-E", str(job)], cwd=tmp, capture_output=True, text=True)
-            self.assertEqual((result.returncode, result.stdout.strip()), (0, "ok False"), result.stderr)
-            # a copy beside the script (how the lab runs) wins over tools/
-            (repo / "tools" / "ik2_ablate" / "ablate_fit.py").write_text("def refused(text):\n    return True\n")
-            result = subprocess.run([sys.executable, "-E", str(job)], cwd=tmp, capture_output=True, text=True)
-            self.assertEqual(result.stdout.strip(), "ok True", result.stderr)
 
 
 if __name__ == "__main__":

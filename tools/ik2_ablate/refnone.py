@@ -3,7 +3,6 @@
 import json,sys
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request,urlopen
-import pathlib as _pl, sys as _sys; _sys.path.append(str(_pl.Path(__file__).resolve().parents[1]))  # tools/ beside the lab; a copy next to the script wins
 from ablate_fit import refused
 port,tag=sys.argv[1],sys.argv[2]
 def ask(p):

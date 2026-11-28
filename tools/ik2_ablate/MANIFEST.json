@@ -49,5 +49,29 @@
     "notebooks": [
       "colab_inkling_lora.ipynb"
     ]
+  },
+  "retained_wrappers": {
+    "about": "lab.sh and py carry machine-specific paths and stay because other lab wrappers call them; they are development-only and not shipped. Retire them together with the wrappers below.",
+    "lab.sh": {
+      "referenced_by": [
+        "tools/ik2_ablate/bench-q.sh",
+        "tools/ik2_ablate/bench.sh",
+        "tools/ik2_ablate/final-bench.sh",
+        "tools/ik2_ablate/model-q.sh",
+        "tools/ik2_ablate/stock-q.sh",
+        "tools/ik2_ablate/sweep.sh",
+        "docs/HIP-PORT.md"
+      ]
+    },
+    "py": {
+      "referenced_by": [
+        "tools/ik2_ablate/bench-q.sh",
+        "tools/ik2_ablate/bench.sh",
+        "tools/ik2_ablate/final-bench.sh",
+        "tools/ik2_ablate/model-q.sh",
+        "tools/ik2_ablate/stock-q.sh",
+        "tools/ik2_ablate/sweep.sh"
+      ]
+    }
   }
 }
