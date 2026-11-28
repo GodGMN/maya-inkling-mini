@@ -18,7 +18,7 @@ The engine, HTTP server, native launchers and quantization tools. The model weig
 ## How Tintero behaves by default
 
 - The server listens on `127.0.0.1` by default. Set `--host 0.0.0.0` or `"host"` in the config to listen on other devices. Set an API key when exposing the server.
-- Set `--api-key` or `"api_key"` in the config to require `Authorization: Bearer KEY` or `x-api-key: KEY`. Health remains public.
+- Set `TINTERO_API_KEY`, `--api-key`, or `"api_key"` in the config to require `Authorization: Bearer KEY` or `x-api-key: KEY`. Health remains public.
 - The server grants browser CORS on `/v1/*` only to origins listed in `"cors_origins"`.
 - `GET /api/update` checks GitHub for the latest release. Set `TINTERO_UPDATE_CHECK=0` (legacy alias `MAYA_UPDATE_CHECK=0`) to disable the lookup.
 - The server connects to HTTP image URLs from clients and to MCP servers named in its config.

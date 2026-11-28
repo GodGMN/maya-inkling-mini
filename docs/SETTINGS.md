@@ -36,7 +36,7 @@ that setting, including when the two sources use different spellings.
 | `TINTERO_LOOP_GUARD_COLLAPSE_MAX` | | 32000 | Character threshold for repeated message collapse. Zero removes the limit. |
 | `TINTERO_PROMPT_MEMO` | Yes | On | Reuses tokenization work for repeated parts of prompts. Set to `0` to disable it. |
 | `TINTERO_SERVER_LOG` | Yes | The run config's `log` path, if present | Mirrors server output to this file. Empty or `0` keeps output on the terminal. |
-| `TINTERO_UPDATE_CHECK` | Yes | On | Set to `0` to disable the dashboard's update check. |
+| `TINTERO_UPDATE_CHECK` | Yes | On | Set to `0` to disable release lookups from `GET /api/update`. |
 | `TINTERO_GLM_RESPONSES_*` | Yes | [Responses limits](RESPONSES.md#settings-and-metrics) | Sets storage, job and event retention limits for `/v1/responses`. The `GLM` part of the name is historical. |
 
 `TINTERO_CONFIG`, `TINTERO_MODEL`, `TINTERO_HOST` and `TINTERO_PORT` are
@@ -57,7 +57,6 @@ Legacy model tuning and packing variables, including `MAYA_DS4_*`,
 existing spellings where the legacy code still reads them. `MAYA_PAR_MAX`
 caps the legacy `--parallel` flag. Inkling uses `--cache-slots`.
 `MAYA_VIDEO_MAX_FRAMES` belongs to the legacy external vision path.
-`MAYA_SAVINGS_PATH` belongs to the legacy dashboard's savings ledger.
 Removed native engine settings in the changelog have no Tintero alias.
 `MAYA_VERSION` is read from the `VERSION` file, and `MAYA_TOKENIZER` occurs
 only in tests.

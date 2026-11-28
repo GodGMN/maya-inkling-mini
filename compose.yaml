@@ -23,6 +23,7 @@ services:
     environment:
       - TINTERO_CONFIG=${TINTERO_CONFIG:-docs/inkling2-mini/cuda-24gb-fp4.json}
       - TINTERO_MODEL
+      - TINTERO_API_KEY
       - IK2_ABLATE_MODE
 
   hip:
@@ -37,6 +38,7 @@ services:
     environment:
       - TINTERO_CONFIG=${TINTERO_CONFIG:-docs/inkling2-mini/ik2-mini-gfx1100.json}
       - TINTERO_MODEL
+      - TINTERO_API_KEY
       - IK2_ABLATE_MODE
 
 volumes:

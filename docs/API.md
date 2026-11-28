@@ -31,6 +31,7 @@ To exercise the API with canned responses, run
 | POST | `/v1/messages` | yes | yes | [Anthropic Messages](#anthropic-messages) |
 | POST | `/tokenize`, `/detokenize` | yes | no | [Token ids](#tokenize-and-detokenize) |
 | GET | `/v1/status` | yes | no | Uptime, context, concurrency, Responses cache and job counters |
+| GET | `/status` | yes | no | Current request state and recent output |
 | GET | `/metrics` | yes | no | Monitor-style JSON: live request, recent requests, totals, hardware |
 | GET | `/metrics/prometheus` | yes | no | [Prometheus text format](#metrics) |
 | GET | `/props`, `/slots` | yes | no | llama.cpp-compatible server properties and slots |
@@ -42,17 +43,16 @@ To exercise the API with canned responses, run
 Unknown paths return 404 (`{"error": {"message": "not found"}}`); for POST and DELETE the key is
 checked first, so a missing key on an unknown path is a 401.
 
-Browser-page and dashboard routes that the server also answers are not part of this API.
-
 ## Authentication
 
-Set a key with `--api-key`, the `MAYA_API_KEY` environment variable, or `"api_key"` in the
-config JSON. The flag, then the variable, then the config decide which one is used. A flag
-shows up in the process list; prefer the variable or the config.
+Set a key with `--api-key`, the `TINTERO_API_KEY` environment variable, or `"api_key"` in the
+config JSON. The server uses the flag, then the environment, then the config. For supported
+environment settings it looks up the `TINTERO_*`, `MAYA_*` and `STRATA_*` names in that order.
+Use the environment variable or config to keep the key out of the process list.
 
 ```sh
-docker run ... -e MAYA_API_KEY=your-key ghcr.io/godgmn/tintero:v0.1.0-cuda       # Docker image
-MAYA_API_KEY=your-key python3 serve/server.py --engine maya --config docs/inkling2-mini/cuda-24gb-fp4.json
+TINTERO_API_KEY=your-key docker compose --profile cuda up --build --wait
+TINTERO_API_KEY=your-key python3 serve/server.py --engine maya --config docs/inkling2-mini/cuda-24gb-fp4.json
 ```
 
 Several keys: separate them with commas (`k1,k2`), or use a list in the config
@@ -73,7 +73,7 @@ Precedence, as the server implements it:
    `x-api-key` is used.
 3. A key in the query string is never read.
 
-A missing or wrong key returns HTTP 401 with the same body on every route, including
+A missing or wrong key returns HTTP 401 with the same body on protected routes, including
 `/v1/messages`:
 
 ```sh
@@ -94,8 +94,8 @@ The server listens on `127.0.0.1` by default, which only this machine can reach.
 | How you run it | Setting |
 |---|---|
 | `serve/server.py` | `--host 0.0.0.0`, or `"host": "0.0.0.0"` in the config. The flag wins over the config. |
-| `docker/entrypoint.sh` (the Docker image's entrypoint) | `TINTERO_HOST` (default `0.0.0.0`) and `TINTERO_PORT` (default `8080`); arguments after the script, such as `--host`, are appended and win. |
-| Docker image | The container listens on `0.0.0.0:8080`, so what the host exposes is the `-p` mapping. The README's `-p 127.0.0.1:8085:8080` is loopback only; `-p 8085:8080` publishes the port on every host interface. |
+| `docker/entrypoint.sh` (the Docker image's entrypoint) | `TINTERO_HOST` (default `0.0.0.0`) and `TINTERO_PORT` (default `8080`). The health check uses the same variables. |
+| Docker image | Compose publishes the port to host loopback. With `docker run`, use `-p 127.0.0.1:8085:8080` for loopback or `-p 8085:8080` for every host interface. |
 
 Before exposing the port, set an API key. On a non-loopback `--host`, the server prints the
 address other devices should use and a warning when no key is set. The server does not speak
@@ -115,21 +115,23 @@ lists it:
   refused with 403, even with a valid key. `curl` and the SDKs send no `Origin` and are not
   affected.
 
-Request bodies over 256 MiB return 413 (`MAYA_MAX_BODY_MIB` changes the limit). A connection
-that waits 300 seconds on one socket read or write is dropped (`MAYA_REQUEST_TIMEOUT_S`).
+Request bodies over 256 MiB return 413 (`TINTERO_MAX_BODY_MIB` changes the limit). A connection
+that waits 300 seconds on one socket read or write is dropped (`TINTERO_REQUEST_TIMEOUT_S`).
 
 ## Readiness
 
-The port stays closed while the model loads (a minute or two on the first start), so a client
-sees connection refused rather than an error. Once the port answers, `/health` needs no key:
+The port opens after the initial model load. Poll the public `/health` endpoint and check
+that `ready` is true. Docker Compose checks the same field.
 
 ```sh
-until curl -fsS "$BASE/health" >/dev/null; do sleep 2; done
+until curl -fsS "$BASE/health" | python3 -c 'import json, sys; sys.exit(json.load(sys.stdin)["ready"] is not True)' 2>/dev/null; do
+  sleep 2
+done
 curl -fsS "$BASE/health"
 ```
 
 ```json
-{"status": "ok", "max_context": 32768, "model": "inkling-2-mini", "version": "1.1.70",
+{"status": "ok", "ready": true, "max_context": 32768, "model": "inkling-2-mini", "version": "0.1.0",
  "api_key": true, "images": false, "videos": false, "unloaded": false, "mcp_tools": false,
  "defaults": {}, "history_thinking": true, "ablate": {"available": false, "default": false}}
 ```
@@ -138,7 +140,7 @@ curl -fsS "$BASE/health"
 little with the model and config.)
 
 - `status` is `ok`, `reloading` (the model is restarting after a context change) or `updating`.
-  The HTTP status stays 200 in all three.
+  The HTTP status stays 200 in all three. `ready` is false during reload, update, unload or engine failure.
 - `unloaded: true` means idle unload freed the GPU. The next generation request loads the model
   again, which takes about as long as a start.
 - While `reloading` or `updating`, `/v1/chat/completions`, `/v1/responses` and `/v1/messages`
@@ -307,7 +309,9 @@ Scope and limits:
 
 ## Model state
 
-Enabled by `"model_management"` in the config or `MAYA_MODEL_MANAGEMENT=1`, in llama.cpp's form:
+These llama.cpp-compatible routes are enabled by default. Set `TINTERO_MODEL_MANAGEMENT=0`
+or `"model_management": false` in the config to disable them. A nonempty environment setting
+wins over the config.
 
 - `POST /models/unload` frees the GPU and RAM (409 while a request is running). The next
   generation request reloads the model.
@@ -325,7 +329,7 @@ automatically after a quiet period.
 - `GET /api/thinking-budget` reports the budget; `POST` with `{"budget": N}` changes it without a
   restart (`"supported": false` when the engine has no cap).
 - `GET /api/update` reports the running version and whether a newer release exists
-  (`"enabled": false` when `MAYA_UPDATE_CHECK=0`).
+  (`"enabled": false` when `TINTERO_UPDATE_CHECK=0`).
 
 Both POSTs need `application/json` and no foreign `Origin`, the same rule as MCP. They change the
 server for everyone, so protect them with a key.

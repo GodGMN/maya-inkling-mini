@@ -36,6 +36,7 @@ ROUTES = {
     "/health": (False, "GET"), "/v1/models": (True, "GET"), "/models": (True, "GET"),
     "/v1/chat/completions": (True, "POST"), "/v1/responses": (True, "POST"), "/v1/messages": (True, "POST"),
     "/tokenize": (True, "POST"), "/detokenize": (True, "POST"), "/v1/status": (True, "GET"),
+    "/status": (True, "GET"),
     "/metrics": (True, "GET"), "/metrics/prometheus": (True, "GET"), "/props": (True, "GET"),
     "/slots": (True, "GET"), "/mcp": (True, "GET"), "/models/load": (True, "POST"),
     "/models/unload": (True, "POST"), "/models/sse": (True, "GET"), "/api/context": (True, "GET"),
@@ -117,6 +118,7 @@ class Guide(unittest.TestCase):
         status, body, _ = self.call("GET", "/health?x=1")
         health = json.loads(body)
         self.assertEqual((status, health["status"], health["api_key"], health["model"]), (200, "ok", True, "inkling-2-mini"))
+        self.assertIs(health["ready"], True)
         for field in ("max_context", "version", "images", "videos", "unloaded", "mcp_tools"):
             self.assertIn(field, health)
 

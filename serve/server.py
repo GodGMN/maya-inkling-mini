@@ -2533,8 +2533,7 @@ class Service:
         self.think_budget = 0
         # GLM-5.3 (glm-dsa), a request that asks for Max itself (the owner, 2026-11-07): up to this budget in
         # think_budget's place (run(): as far as its room allows, THINK_LONG_RESERVE) while think_budget is the default
-        # (main sets it: maya_quants.GLM53_MAX_THINK_BUDGET); a budget the user sets on the dashboard clears it.  0 = the
-        # same budget at every level (every other model)
+        # Zero uses the same budget at every level.
         self.think_budget_max = 0
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
         # (Hy4-flash with its suffixed </think:..>, which the pack's tokenizer names </think> in what the server reads)
