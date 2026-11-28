@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -79,7 +80,7 @@ def fake_release(tag):
 
 class ReleaseIdentity(unittest.TestCase):
     """An installed distribution (a Docker image or a release tarball) has no .git: its identity is this repository's
-    VERSION file and the Tintero releases, never Project Maya's."""
+    VERSION file and the Tintero releases, never another project's."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -102,9 +103,14 @@ class ReleaseIdentity(unittest.TestCase):
             info = u.check(force=True)
         return info, net.call_args.args[0]
 
-    def test_version_file_is_a_release_version(self):
-        self.assertIsNotNone(U.vtuple(self.version(REPO_ROOT)), "VERSION must read as MAJOR.MINOR.PATCH")
-        self.assertLess(U.vtuple(self.version(REPO_ROOT)), (1, 0, 0), "Project Maya's 1.1.x numbering is not Tintero's")
+    def test_version_file_is_the_latest_released_version(self):
+        version = self.version(REPO_ROOT)
+        self.assertRegex(version, r"^\d+\.\d+\.\d+$", "VERSION must be MAJOR.MINOR.PATCH")
+        self.assertIsNotNone(U.vtuple(version))
+        headings = re.findall(r"^## v(\d+\.\d+\.\d+) - ", (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8"), re.M)
+        self.assertTrue(headings, "CHANGELOG.md lists no release")
+        self.assertEqual(version, headings[0], "VERSION is the newest release in CHANGELOG.md (Unreleased is not one)")
+        self.assertFalse(any(U.vtuple(h) > U.vtuple(version) for h in headings))
 
     def test_the_fallback_repository_is_tintero(self):
         self.assertEqual(U.REPO, "GodGMN/tintero")
