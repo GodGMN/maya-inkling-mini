@@ -97,6 +97,37 @@ void expect_true(const char* what, bool ok) {
     std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
 }
 
+#ifndef STRATA_USE_HIP
+#include "../src/ik2/ik2_served_kernels.cuh"
+
+void test_served_copy() {
+    constexpr size_t bytes = 4112; // One vector beyond a full 256-thread block.
+    uint8_t *pinned, *mapped;
+    CU(cudaHostAlloc(&pinned, 2 * bytes, cudaHostAllocMapped));
+    CU(cudaHostGetDevicePointer(&mapped, pinned, 0));
+    for (size_t i = 0; i < 2 * bytes; ++i) pinned[i] = uint8_t(i % 251 + 1);
+    auto cache = dev_n<uint8_t>(3 * bytes);
+    auto table = dev<const uint8_t*>({cache, mapped + bytes});
+    auto reserve = dev<const uint8_t*>({cache + bytes, cache + 2 * bytes});
+    auto picks = dev<int>({0, 1});
+    auto selected = dev<const uint8_t*>({cache, mapped + bytes});
+    auto records = dev_n<int>(2);
+    copy_served_experts<<<dim3(1, 2), 256>>>(picks, table, mapped, reserve, bytes, records);
+    publish_served_experts<<<1, 2>>>(records, 2, table, reserve, selected);
+    expect_true("publish only the missed expert", host(records, 2) == std::vector<int>{0, ~1} &&
+                host(table, 2) == std::vector<const uint8_t*>{cache, cache + 2 * bytes} &&
+                host(selected, 2) == host(table, 2));
+    auto weights = host(cache, 3 * bytes);
+    expect_true("copy the complete mapped blob", std::equal(weights.begin() + 2 * bytes, weights.end(), pinned + bytes));
+    expect_true("preserve resident and unused slots", std::all_of(weights.begin(), weights.begin() + 2 * bytes,
+                                                                  [](uint8_t x) { return x == 0; }));
+    copy_served_experts<<<dim3(1, 2), 256>>>(picks, table, mapped, reserve, bytes, records);
+    expect_true("later visit reuses published slot", host(records, 2) == std::vector<int>{0, 1});
+    release({cache, table, reserve, picks, selected, records});
+    CU(cudaFreeHost(pinned));
+}
+#endif
+
 float h2f_host(uint16_t h) {
     const uint32_t sign = (uint32_t) (h >> 15) << 31, e = (h >> 10) & 31, m = h & 1023;
     if (e == 0) return (sign ? -1.0f : 1.0f) * std::ldexp((float) m, -24);
@@ -4599,6 +4630,9 @@ int main(int argc, char** argv) {
         test_blackwell_prefill_routes();
         return g_fail ? 1 : 0;
     }
+#endif
+#ifndef STRATA_USE_HIP
+    test_served_copy();
 #endif
     test_rms();
     test_project_out();

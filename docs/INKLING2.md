@@ -206,6 +206,9 @@ as an option); the drafter (`--draft`: 2.4-2.7 tokens a step, but verifying 8 co
 
 ## 8. Inkling-2-Mini: the looped model, whole on one 24 GB card
 
+For CUDA decode with a partial expert cache, set `IK2_GPU_SERVED=1` and pass an explicit expert budget such as `--cache-gb 6`. Each visit has eight reserve slots. A graph replay copies missing experts from mapped host memory into those slots. Layers 6–17 can reuse a copy on either later pass. Between tokens the host keeps the most frequently selected experts and makes the other slots available for the next replay.
+
+
 [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (26 B, Apache 2.0) is the family's small
 model with a loop in it: 24 layers of weights, of which layers 6..17 run three times - 48 layer visits a token.
 Width 2304, 24 heads on 8 K / V heads (D 128), 128 experts a layer (8 a token, F 1152), a window of 1024 keys in all

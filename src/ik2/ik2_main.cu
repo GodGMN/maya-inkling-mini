@@ -80,6 +80,7 @@ static inline cudaError_t cudaMemAdvise_compat(const void* devPtr, size_t count,
 #include <cstring>
 #include <map>
 #include <numeric>
+#include "ik2_served_policy.hpp"
 #include <memory>
 #include <string>
 #include <thread>
@@ -2369,6 +2370,8 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
 // dense weights are the GGUF's blocks (IK2_DENSE=q8, the default when the experts fit), one product a launch.
 bool g_fast = false;        // set at load: every expert resident, one GPU, the dense weights as blocks (IK2_FAST=0: no)
 bool g_fast_want = false;
+bool gpu_served = false;
+#include "ik2_served_experts.cuh"
 bool g_sparse_decode = false;
 bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by one
 bool g_block = true;        // IK2_BLOCK=0: a verify window through forward() instead of the block path
@@ -2728,6 +2731,14 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode, int attention_buck
                        Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
                        fast_gate ? W.gu32 : nullptr, q8_gate || iq4_gate, exp_tc ? (uint16_t*) W.gu32 : nullptr, device_counts(l));
 
+        if (gpu_served) {
+            const auto& layer = served.layers[l];
+            auto reserve = Ly.tab_blob + c.E + M.V[vis].pass * c.K;
+            int* records = served.records + vis * c.K;
+            copy_served_experts<<<dim3(64, c.K), 256, 0, g_s>>>(rtop, Ly.tab_blob, layer.cold, reserve, layer.bytes, records);
+            publish_served_experts<<<1, c.K, 0, g_s>>>(records, c.K, Ly.tab_blob, reserve, W.blob);
+        }
+
 #ifdef IK2_HOST_AVX2
         if ((tier_active || host_plan.forced) && !host_plan.active.empty() && host_plan.active[l]) {
             auto& buf = host_plan.buffers;
@@ -2843,7 +2854,10 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
         }
         CU(cudaGraphLaunch(G.exec, g_s));
     }
+    if (gpu_served)
+        CU(cudaMemcpyAsync(served.published, served.records, c.n_visit * c.K * sizeof(int), cudaMemcpyDeviceToHost, g_s));
     CU(cudaStreamSynchronize(g_s));
+    if (gpu_served) served.finish(M, W);
     if (out_mode == OutMode::kArgmax) {
         argmax_out->assign(1, W.argmax_h[0]);
     } else if (out_mode == OutMode::kLogits) {
@@ -5140,6 +5154,12 @@ int main(int argc, char** argv) {
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
     const bool resident_only = getenv("IK2_RESIDENT_ONLY") && atoi(getenv("IK2_RESIDENT_ONLY"));
+    gpu_served = getenv("IK2_GPU_SERVED") && atoi(getenv("IK2_GPU_SERVED"));
+    if (gpu_served && (resident_only || n_gpu != 1 || g_pool))
+        die("IK2_GPU_SERVED requires one GPU, pinned experts and a partial cache");
+#ifdef STRATA_USE_HIP
+    if (gpu_served) die("IK2_GPU_SERVED requires CUDA");
+#endif
     if (resident_only && n_gpu != 1) die("IK2_RESIDENT_ONLY requires one GPU");
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
     g_block = !(getenv("IK2_BLOCK") && !std::atoi(getenv("IK2_BLOCK")));
@@ -5178,11 +5198,12 @@ int main(int argc, char** argv) {
         // With resident-only loading the actual post-workspace budget decides how many experts fit.
         const size_t reserve = resident_only ? size_t{256} << 20 : size_t{3} << 29;
         const bool fits = exp_b + dense_b + kv_b + reserve <= fr0 && exp_b <= cache_limit;
-        if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
-        g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
+        if ((fits || gpu_served) && !getenv("IK2_DENSE")) g_dense_q8 = true;
+        g_fast_want = (fits || gpu_served) && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
+        if (gpu_served && !g_fast_want) die("IK2_GPU_SERVED requires planar dense weights and fast decode");
         if (resident_only && !g_fast_want) die("resident-only loading: the model, KV cache and requested expert budget must fit on the GPU with planar dense weights");
         stage_cold = getenv("IK2_STAGE_COLD") && atoi(getenv("IK2_STAGE_COLD"));
-        g_managed_experts = g_fast_want && g_kv_managed && getenv("IK2_TIER") && atoi(getenv("IK2_TIER"));
+        g_managed_experts = !gpu_served && g_fast_want && g_kv_managed && getenv("IK2_TIER") && atoi(getenv("IK2_TIER"));
         std::printf("experts %.1f GiB, dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
                     exp_b / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0, fr0 / 1073741824.0,
                     fits ? "every expert stays in VRAM" : "the experts in host memory, a cache of them in VRAM");
@@ -5497,7 +5518,8 @@ int main(int argc, char** argv) {
     // (the resident path keeps every expert in VRAM, so no pinned host copy is needed: the experts go from where the
     //  files are mapped straight to their slots, and stay in the page cache for the next load - IK2_HOST=pinned: as
     //  for the other models)
-    const bool host_mmap = getenv("IK2_HOST") ? std::string(getenv("IK2_HOST")) == "mmap" : g_fast_want;
+    const bool host_mmap = getenv("IK2_HOST") ? std::string(getenv("IK2_HOST")) == "mmap" : g_fast_want && !gpu_served;
+    if (gpu_served && host_mmap) die("IK2_GPU_SERVED requires IK2_HOST=pinned");
     if (host_mmap) {
         if (g_pool) die("IK2_HOST=mmap with the CPU lane");
         for (const auto& J : exp_jobs) {
@@ -5579,7 +5601,7 @@ int main(int argc, char** argv) {
                         if (l >= c.n_layer) return;
                         const size_t layer_bytes = (size_t) c.E * M.L[l].slot_bytes;
                         void* p = nullptr;
-                        CU(cudaHostAlloc(&p, layer_bytes, cudaHostAllocPortable));
+                        CU(cudaHostAlloc(&p, layer_bytes, cudaHostAllocPortable | (gpu_served ? cudaHostAllocMapped : 0)));
                         pin.blocks[l] = {p, layer_bytes, false, false};
                         ready[l].store(1, std::memory_order_release);
                         if (--alloc_left == 0) t_alloc_end = now();
@@ -5612,7 +5634,7 @@ int main(int argc, char** argv) {
                         l = reg_q.front();
                         reg_q.pop_front();
                     }
-                    if (cudaHostRegister(pin.blocks[l].ptr, pin.blocks[l].bytes, cudaHostRegisterPortable) == cudaSuccess)
+                    if (cudaHostRegister(pin.blocks[l].ptr, pin.blocks[l].bytes, cudaHostRegisterPortable | (gpu_served ? cudaHostRegisterMapped : 0)) == cudaSuccess)
                         pin.blocks[l].registered = true;
                     else
                         (void)cudaGetLastError(), ++reg_fail;
@@ -5656,6 +5678,7 @@ int main(int argc, char** argv) {
             const double tp0 = now();
             reg_th.join();   // (the layers read last are still registering)
             t_pin = now() - tp0;
+            if (gpu_served && reg_fail) die("could not map expert memory");
             if (reg_fail > 0)
                 std::fprintf(stderr, "tintero: warning: cudaHostRegister failed on %d layers (running pageable)\n",
                              reg_fail);
@@ -5935,7 +5958,13 @@ int main(int argc, char** argv) {
     const size_t room = g_fast_want ? (size_t) 256 << 20 : (size_t) 2 << 30;
     const size_t budget = std::min(cache_limit, fr > room ? fr - room : (size_t) 0);
     EC.tp = g_tp ? d : -1;
-    EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
+    size_t prefill_budget = budget;
+    if (gpu_served) {
+        size_t largest = 0;
+        for (const Layer& ly : M.L) largest = std::max(largest, (ly.slot_bytes + 255) / 256 * 256);
+        prefill_budget = std::min(budget, largest * c.E);
+    }
+    EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, prefill_budget);
     if (resident_only && EC.total_slots() != c.n_layer * c.E)
         die("resident-only loading: insufficient VRAM after workspace allocation; reduce --ctx or --chunk");
     std::printf("expert cache, GPU %d: %d slots across %zu pools (%.1f GiB); load %.1f s in all\n", d, EC.total_slots(),
@@ -5994,7 +6023,11 @@ int main(int argc, char** argv) {
         for (const auto& P : EC.pools) all = all && P.n_active >= P.n_layers * c.E;
         for (const auto& Ly : M.L)
             raw = raw && blocks(Ly.wo) && (Ly.sliding ? blocks(Ly.wqkvrg) : (blocks(Ly.wqrg) && blocks(Ly.wk) && blocks(Ly.wv)));
-        if (all && raw) {
+        if (gpu_served) {
+            if (!raw) die("GPU-served expert decode requires dense block weights");
+            served.init(M, budget - EC.total_bytes());
+            g_fast = true;
+        } else if (all && raw) {
             const double tw = now();
             const uint64_t m0 = EC.misses, b0 = EC.bytes_up;
             int n = 0;
@@ -7125,6 +7158,10 @@ int main(int argc, char** argv) {
         std::printf("generation: %d tokens in %.2f s (%.2f tok/s); cache %llu hits, %llu misses in it\n",
                     (int) out.size() - 1, gen_s, (out.size() - 1) / gen_s, (unsigned long long) (ec_sum([](ExpertCache& e) { return e.hits; }) - h0),
                     (unsigned long long) (ec_sum([](ExpertCache& e) { return e.misses; }) - m0));
+    if (gpu_served)
+        std::printf("GPU-served expert misses=%llu copies=%llu reserve_refills=%llu loop_reuses=%llu\n",
+                    (unsigned long long)served.misses, (unsigned long long)served.copies, (unsigned long long)served.refills,
+                    (unsigned long long)served.loop_reuses);
     std::printf("generated:");
     for (int t : out) std::printf(" %d", t);
     std::printf("\n");
