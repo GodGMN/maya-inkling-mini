@@ -12,13 +12,10 @@ BASE=http://127.0.0.1:8085
 KEY=your-key   # leave out the Authorization header when the server has no key
 ```
 
-**GPU requirements.** Every route that generates text needs the model loaded on a
-**24 GB+ GPU** (see the [README](../README.md)). The server does not open its port until the
-model has loaded, so a running server always has one. To try a client without a GPU, start the
-scripted mock engine: `python3 serve/server.py --engine mock --port 8085`. It serves every
-route in this guide with canned text. The examples are checked against that engine
-(`python -m unittest serve.test_api_guide`), which proves routes, authentication and response
-shapes, not model output or speed.
+Text generation requires a loaded model. The [quick start](../README.md#quick-start) uses a
+24 GB GPU. The HTTP server can continue answering status requests after a model unload.
+To exercise the API with canned responses, run
+`python3 serve/server.py --engine mock --port 8085`.
 
 ## Routes
 
@@ -28,7 +25,8 @@ shapes, not model output or speed.
 | GET | `/v1/models`, `/models` | yes | no | The loaded model and its context size |
 | POST | `/v1/chat/completions` | yes | yes | [Chat Completions](#chat-completions), streamed or not |
 | POST | `/v1/responses` | yes | yes | [Responses](#responses), see [RESPONSES.md](RESPONSES.md) |
-| GET, DELETE | `/v1/responses/{id}`, `/v1/responses/{id}/input_items` | yes | no | Stored and background responses |
+| GET, DELETE | `/v1/responses/{id}` | yes | no | Retrieve or delete a stored response |
+| GET | `/v1/responses/{id}/input_items` | yes | no | List the input items for a response |
 | POST | `/v1/responses/{id}/cancel` | yes | no | Cancel a background response |
 | POST | `/v1/messages` | yes | yes | [Anthropic Messages](#anthropic-messages) |
 | POST | `/tokenize`, `/detokenize` | yes | no | [Token ids](#tokenize-and-detokenize) |
