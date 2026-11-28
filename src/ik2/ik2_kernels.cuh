@@ -375,7 +375,9 @@ void route_gather(const int* top, const float* w, const uint8_t* const* tab, con
 void route_token(const float* logits, const float* bias, int E, int K, float scale, const uint8_t* const* tab,
                  const float* sg_t, const float* su_t, const float* sd_t, int* top, float* w, const uint8_t** blob,
                  int* tok, int* inv, float* sg, float* su, float* wt, cudaStream_t s, const float* x = nullptr,
-                 int width = 0, void* packed = nullptr, bool q8 = false, uint16_t* x_limbs = nullptr);
+                 int width = 0, void* packed = nullptr, bool q8 = false, uint16_t* x_limbs = nullptr,
+                 unsigned long long* usage = nullptr);
+void count_routes(const int* top, int picks, unsigned long long* usage, cudaStream_t stream);
 /// prep_qkv_r_f16 / _fp8 of one token whose position is at pos (device): the cache slot from it, and with log_scale
 /// (a full layer) q's and r's tau.  q16 (given): an FP16 copy of the clipped q, [H][D] (attn_decode_mma's).
 /// sink_w (given): the token's sinks in the same launch, sink_y [H] = sink_w [H][sink_k] (FP16) . sink_x (mv_f16's).

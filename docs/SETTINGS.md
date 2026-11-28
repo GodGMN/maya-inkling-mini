@@ -134,14 +134,26 @@ tokenizer folder and the run config, then `python serve/server.py --engine maya 
 (0.9 - "high"). The template is thinkingmachines' (`tools/ik2/chat_template.jinja`), which takes every level by name:
 none, low (0.2), medium (0.7), high (0.9), xhigh and max (0.99); Off is none.
 
-Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's most, less if VRAM is short),
+The engine sizes the expert cache after allocating weights, KV for the requested context and scratch buffers.
+Streaming reserves another 2 GiB. On one GPU, `--vram-gb N` simulates a device budget in GiB. The cache is
+limited by both actual free memory and the simulated budget after device allocations. Pinned host experts
+are outside the simulated budget.
+
+The engine saves a binary profile for each canonical model path under
+`$XDG_CACHE_HOME/tintero` (default `~/.cache/tintero` on Unix, `%LOCALAPPDATA%/tintero` on Windows).
+On the next launch, each pool loads its most frequently selected experts with an initial eviction frequency
+of at most two. Counts accumulate across launches and halve together when a counter would overflow.
+Concurrent sessions publish complete snapshots; the last clean shutdown supplies the next profile.
+
+Engine flags: `--max-context N` (262144), `--cache-gb N` (optional expert-cache ceiling in GiB),
 `--gpus 1|2`, `--threads N` (8: the loading and the CPU lane), `--eos a,b`. Environment:
 
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `IK2_FUSED_ROUTER` | `0` | HIP only. Fuse FP16 router projection, biased sigmoid top-8 selection and weight normalization for 128 experts and 16–64 batched rows. Single-token decode keeps the wider `mv_f16` + `route_token` path. |
 | `IK2_KV` | `f16` | `fp8`: the KV cache in FP8 E4M3, half the bytes (the full layers' 32 KB a token -> 16 KB); against the reference it changed 5 of 48 top-1 tokens where FP16 changed none (docs/INKLING2.md 6.1). On CUDA (SM 80 and newer) and HIP (RDNA 3/3.5, including gfx1100 and gfx1151), `fp4-global` stores global keys and values in E2M1 blocks and keeps sliding layers in E4M3. Each 128-channel global head uses 72 bytes for K and 72 for V, including scales. On HIP, `fp4` also packs the sliding-window ring in E2M1. Both modes require 128-wide heads and dense attention. HIP accepts `IK2_PAGED_KV=1` for 16-token global pages. |
-| `IK2_WARM` | off | a profile of how often each expert is picked (written by `IK2_POP_OUT=FILE` over some prompts): the cache filled with the most picked at load, and the prompts' prefetch seeded with the counts. The first requests then do not start from an empty cache (a 600-token first request 7.0 -> 4.2 s on an H200) |
+| `IK2_WARM` | model profile | Read expert counts from this file at startup. An empty value starts cold. |
+| `IK2_POP_OUT` | model profile | Save the updated counts here on clean shutdown. An empty value disables saving. The resident decoder normally counts on the GPU. An explicit output path selects the existing host profiling path. |
 | `IK2_EP` | off | `1` with `--gpus 2`: expert parallel - each layer's experts dealt to both GPUs by how often they are picked, each GPU its own cache and link; attention and the KV cache on GPU 0. Decode 22 -> 42 tok/s on two RTX PRO 6000s. Off, `--gpus 2` splits the layers |
 | `IK2_EP_SPLIT` | `0.55` | GPU 1's share of the picks under `IK2_EP` (GPU 0 also holds the dense weights and the cache of the KV) |
 | `IK2_TP` | off | `1` with `--gpus 2`: the experts tensor parallel instead (each GPU half of every expert): decode 42.8 vs EP's 41.3 tok/s, prompts slower |
@@ -171,4 +183,4 @@ Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's
 | `IK2_FLASH`, `IK2_MV`, `IK2_GROUP`, `IK2_OVERLAP`, `IK2_PREFETCH`, `IK2_SCAN`, `IK2_RELB`, `IK2_BORROW` | on | A/B switches (`0`): the paths these replaced - the attention through logits in memory, few tokens' experts through the GEMMs, no grouping, copies on the compute stream, no prefetch, plain LRU in prompt passes, no relative-bias table, no scratch lent from the cache for long prompts |
 | `IK2_DENSE` | FP16; `q8` when every expert stays in VRAM | `q8`: the dense weights kept as the GGUF's Q8_0 blocks (half an FP16 copy's bytes), a token's products straight over them, planar (`mv_q8p`); a prompt chunk decodes a matrix to FP16 for its GEMM. `f16`: the FP16 copy |
 | `IK2_PROF`, `IK2_STATS` | off | each request's time by phase; where its experts came from (cached, prefetched, copied on a miss, the CPU) |
-| `IK2_TRACE`, `IK2_POP_OUT`, `IK2_FORCE`, `IK2_LOGITS_OUT`, `IK2_MARGIN`, `IK2_VERIFY_CHECK`, `IK2_UP_MS`, `IK2_ALLOC_THREADS` | off | measurement: every layer's picks to a file; the pick counts (for `IK2_WARM`); fixed tokens fed (`--tokens` runs: two builds compared on the same text, and how often each one's pick agrees); every generated token's logits to a file (with `IK2_FORCE`: two builds' logits over the same tokens); the drafter's checks (`--draft`); the CPU lane's estimate of an expert's copy time; threads allocating host memory |
+| `IK2_TRACE`, `IK2_FORCE`, `IK2_LOGITS_OUT`, `IK2_MARGIN`, `IK2_VERIFY_CHECK`, `IK2_UP_MS`, `IK2_ALLOC_THREADS` | off | measurement: every layer's picks to a file; fixed tokens fed (`--tokens` runs: two builds compared on the same text, and how often each one's pick agrees); every generated token's logits to a file (with `IK2_FORCE`: two builds' logits over the same tokens); the drafter's checks (`--draft`); the CPU lane's estimate of an expert's copy time; threads allocating host memory |
