@@ -24,6 +24,14 @@ python3 tools/strata_tokenizer.py --gguf models/Inkling-2-Mini-IQ4_NL.gguf \
   --out ik2 --chat-template tools/ik2/chat_template.jinja
 ```
 
+The single-user DGX Spark preset uses adaptive MTP. Download the drafter beside the GGUF before starting this preset.
+
+```sh
+hf download thinkingmachines/Inkling-2-Mini mtp.safetensors --local-dir models
+```
+
+The default verification window has room for the current token and up to four guesses. Set `IK2_DRAFT_WIDTH` (2–8) to change the maximum window. For plain decoding, use a copy of the preset with `--draft` and its filename removed from `args`.
+
 For CUDA containers, mount both directories under `/opt/tintero`.
 
 ```sh
