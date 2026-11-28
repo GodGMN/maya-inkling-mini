@@ -32,6 +32,7 @@ skip() {
 }
 
 gpu_idle() {
+    local busy_message=${1:-Skipped}
     if [[ $backend == hip ]]; then
         local card busy used total found=0
         for card in /sys/class/drm/card[0-9]*/device; do
@@ -41,7 +42,8 @@ gpu_idle() {
             read -r busy < "$card/gpu_busy_percent"
             echo "AMD $(basename "$(realpath "$card")"): ${used}/${total} bytes VRAM, ${busy}% busy"
             if (( used > 1024**3 || busy != 0 )); then
-                skip "AMD GPU in use"
+                echo "$busy_message: AMD GPU in use"
+                return 75
             fi
             found=1
         done
@@ -59,7 +61,8 @@ gpu_idle() {
                 skip "NVIDIA GPU counters unavailable"
             fi
             if (( used > 1024 || busy != 0 )); then
-                skip "NVIDIA GPU in use"
+                echo "$busy_message: NVIDIA GPU in use"
+                return 75
             fi
         done <<< "$devices"
     fi
@@ -141,8 +144,16 @@ run_smoke() {
     set -x
     "${gpu_env[@]}" timeout --kill-after=10s 300s "$build/ik2_kernels_test"
     { set +x; } 2>/dev/null
-    sleep 2
-    gpu_idle
+    local attempt
+    for attempt in {1..6}; do
+        sleep 2
+        if (gpu_idle "Waiting for idle GPU after parity"); then
+            break
+        fi
+        if (( attempt == 6 )); then
+            skip "GPU did not become idle after parity"
+        fi
+    done
 
     echo 'Prompt: The capital of France is'
     local output=$scratch/decode.txt expected=152717,11,149880
