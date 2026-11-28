@@ -36,8 +36,7 @@ H, FF, NE, HC = 2560, 640, 512, 4
 
 
 def q2_0(w: np.ndarray) -> np.ndarray:
-    """tools/mtp_pack.py's Q2_0 (64-value blocks, grid {-1,0,1,2} x d, the scale chosen per block for the least squared
-    error) - kept here so this tool needs no BF16 checkpoint."""
+    """Quantize 64-value blocks to {-1, 0, 1, 2} times the scale that minimizes squared error."""
     x = w.reshape(-1, 64).astype(np.float32)
     amax = np.abs(x).max(axis=1, keepdims=True)
     best_err = np.full((x.shape[0], 1), np.inf, dtype=np.float32)
